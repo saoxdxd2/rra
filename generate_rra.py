@@ -31,8 +31,10 @@ def load_master_checkpoint(model, path="checkpoints/latest.pt"):
                 del state_dict[k]
                 
         model.load_state_dict(state_dict, strict=False)
+        model.current_phase = int(ckpt.get('current_phase', getattr(model, 'current_phase', 0)))
+        model.omega = float(ckpt.get('omega', getattr(model, 'omega', 0.0)))
         model.eval()
-        print(f">>> Loaded Successfully. Omega: {model.omega:.2f}")
+        print(f">>> Loaded Successfully. Phase: {model.current_phase} | Omega: {model.omega:.2f}")
         return True
     except Exception as e:
         print(f"Failed to load: {e}")

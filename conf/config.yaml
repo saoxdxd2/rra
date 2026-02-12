@@ -13,6 +13,14 @@ model:
   neural_cache_enabled: false # Disable reflex pattern cache for reasoning-first training
   use_fused_cognitive_cycle: false # Keep default off; fused mode needs more stabilization before production training.
   use_forward_stack: true # Enabled for C++ stacked reasoning path.
+  lgh_enabled: true # Enable Liquid Geometric Hypernetwork path.
+  lgh_replace_forward_stack: true # Prefer LGH kernel over legacy forward_stack_io.
+  lgh_curve_length: 96 # Number of Morton-ordered nodes in a reasoning trajectory.
+  lgh_curve_wrap: true # Allow curve trajectories to wrap around manifold end.
+  lgh_mask_min_keep: 0.10 # Lower bound on active mDNA gate ratio.
+  lgh_mask_max_keep: 0.90 # Upper bound on active mDNA gate ratio.
+  lgh_morton_depth: 1 # Z-depth for Morton buffer (LxRxdepth).
+  lgh_prefetch_distance: 2 # Prefetch distance (segments ahead) for LGH kernel.
   mes_super_kernel: true # Use C++ MES super-step when available.
   audit_period_steps: 25 # Less frequent deterministic audit cadence.
   audit_random_prob: 0.01 # Small stochastic audit probability.
@@ -47,9 +55,9 @@ training:
   epochs: 50
   batch_size: 64
   seq_len: 512
-  # Optional epoch sizing to avoid huge overlapping-window epochs.
-  # train_samples_per_epoch: 40000
-  # val_samples_per_epoch: 4000
+  # Epoch sizing tuned for faster iteration on 4GB corpus.
+  train_samples_per_epoch: 40000
+  val_samples_per_epoch: 4000
   max_epochs_per_phase: 1000 # Safety timeout to prevent infinite loops.
   improve_streak_needed: 0 # Required streak of improvements for phase transition.
   improve_min_delta: 1e-4 # Minimum improvement to count towards a streak.
@@ -80,6 +88,9 @@ runtime:
   genome_step_update_every: 5000 # Keep genome evolution infrequent (it is heavier than Omega updates).
   train_loss_ema_decay: 0.98 # Smooth proxy signal used for step-level adaptation.
   sparsity_log_every: 50 # Log true gate sparsity cadence (steps).
+  lgh_thermal_freq_min_ghz: 3.0 # Penalize genomes that trigger downclock below this target.
+  lgh_thermal_ema_decay: 0.95 # EMA smoothing for thermal pressure signal.
+  lgh_thermal_penalty_weight: 0.25 # Weight of thermal penalty in evolution fitness.
   strict_cpu_only: true # This codebase uses CPU C++ kernels as the production path.
   virtual_lab_enabled: false # Disable heavy benchmark/event logging by default for training runs.
   preflight_enabled: true # Run a startup smoke-check before long training.
