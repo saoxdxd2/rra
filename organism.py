@@ -819,6 +819,24 @@ class CognitiveOrganism(BaseCognitiveModule):
             self.max_batch_size, L, R, self.d_s2, C, 
             device=device
         ).contiguous()
+        self._lgh_shape3d = (self.L, self.R, self.lgh_cfg.morton_depth)
+        self._lgh_morton = MortonBuffer(self._lgh_shape3d, device=self.device)
+        if self.cfg_lgh_enabled:
+            self.lgh_manifold = nn.Parameter(
+                torch.randn(self.L, self.R, self.lgh_cfg.morton_depth, self.d_s2 * self.C, device=self.device) * 0.01
+            )
+            curve_len = min(self.lgh_cfg.curve_length, self._lgh_morton.size)
+            self.register_buffer(
+                '_lgh_curve_indices',
+                self._lgh_morton.curve_segment(0, curve_len, wrap=self.lgh_cfg.curve_wrap).to(dtype=torch.long),
+            )
+            self.register_buffer('_lgh_mdna_mask', torch.ones(self.L, self.R, dtype=torch.float32, device=self.device))
+        else:
+            self.lgh_manifold = None
+            self.register_buffer('_lgh_curve_indices', torch.empty(0, dtype=torch.long, device=self.device))
+            self.register_buffer('_lgh_mdna_mask', torch.empty(0, dtype=torch.float32, device=self.device))
+        self.register_buffer('_lgh_thermal_penalty_ema', torch.tensor(0.0, dtype=torch.float32, device=self.device))
+        self.register_buffer('_lgh_last_freq_ghz', torch.tensor(0.0, dtype=torch.float32, device=self.device))
         
         self.rope = RotaryEmbedding(self.d_s2 * C, device=device)
         self.survival = SurvivalController(L, R, device=self.device)
