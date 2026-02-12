@@ -1166,8 +1166,9 @@ class CognitiveOrganism(BaseCognitiveModule):
         
         # FKBP5 -> Target Sparsity Pressure (Metabolic Hunger) & Resonance Error Sensitivity
         fkbp5 = self.genome.fkbp5
+        metabolic_efficiency = getattr(self.genome, 'metabolic_efficiency', 0.5)
         # Map FKBP5 to lambda_sparsity
-        self.lambda_sparsity = 0.01 * fkbp5 
+        self.lambda_sparsity = (0.01 * fkbp5) / max(0.25, metabolic_efficiency)
         
         # --- COGNITIVE RESONANCE: FKBP5 controls error amplification ---
         # High FKBP5 = High stress = High sensitivity to prediction error
@@ -1178,6 +1179,9 @@ class CognitiveOrganism(BaseCognitiveModule):
         gaba = self.genome.gaba
         # Higher GABA = more inhibitory = higher engagement threshold = more bypasses
         self.gaba_inhibition = gaba
+        self.curve_trajectory_gene = float(getattr(self.genome, 'curve_trajectory', 0.5))
+        self.mask_sparsity_bias = float(getattr(self.genome, 'mask_sparsity_bias', 0.5))
+        self.metabolic_efficiency = float(metabolic_efficiency)
         
         # BDNF: Learning Rate proxy
         bdnf_expression = self.genome.bdnf
@@ -1196,8 +1200,9 @@ class CognitiveOrganism(BaseCognitiveModule):
         # --- Energy-Aware Learning Rate ---
         # If sparsity pressure is high (FKBP5), effectively "energy is low"
         # Reduce LR to prevent burnout/instability under high pressure
-        energy_factor = 1.0 / (1.0 + self.lambda_sparsity * 10.0)
+        energy_factor = self.metabolic_efficiency / (1.0 + self.lambda_sparsity * 10.0)
         self.suggested_lr = self.suggested_lr * energy_factor
+        self._refresh_lgh_curve_from_genome()
         
         # --- BDNF-Scaled Omega Momentum ---
         # Omega changes faster when BDNF is high (higher plasticity)
@@ -1206,7 +1211,11 @@ class CognitiveOrganism(BaseCognitiveModule):
         print(f">>> Phenotype Updated (Gen {self.genome.generation}): CREB={creb:.2f} (Stab={self.survival.gamma:.3f}), "
               f"DRD2={drd2:.2f} (Conf={self.confidence_multiplier:.2f}), "
               f"FKBP5={fkbp5:.2f} (Sparsity={self.lambda_sparsity:.6f}, Thresh={self.metabolic_threshold:.6f})")
-        print(f">>> GABA={gaba:.2f} (Inhibition) | Energy Factor={energy_factor:.2f} -> LR={self.suggested_lr:.2e} | Omega_mom={self.omega_momentum:.4f}")
+        print(
+            f">>> GABA={gaba:.2f} | mEff={self.metabolic_efficiency:.2f} | "
+            f"Curve={self.curve_trajectory_gene:.2f} | MaskBias={self.mask_sparsity_bias:.2f} | "
+            f"Energy Factor={energy_factor:.2f} -> LR={self.suggested_lr:.2e} | Omega_mom={self.omega_momentum:.4f}"
+        )
 
     def get_engagement_rate(self):
         """Returns current engagement rate for efficiency bonus calculation."""
@@ -1651,6 +1660,111 @@ class CognitiveOrganism(BaseCognitiveModule):
         )
         z_L = out_fused.view(B, 1, self.R, self.d_s2, self.C).expand(-1, T, -1, -1, -1)
         return True, z_L, H_next_fused, halt_probs_cycle
+
+    def _lgh_morton_manifold(self):
+        if (not self.cfg_lgh_enabled) or (self.lgh_manifold is None):
+            return None
+        rows = self.lgh_manifold.reshape(self._lgh_morton.size, self.d_s2 * self.C)
+        return self._lgh_morton.reorder_rows(rows).contiguous()
+
+    def _refresh_lgh_curve_from_genome(self):
+        if (not self.cfg_lgh_enabled) or self._lgh_curve_indices.numel() == 0:
+            return
+        curve_gene = float(getattr(self, 'curve_trajectory_gene', 0.5))
+        curve_gene = max(0.0, min(1.0, curve_gene))
+        start = int(round(curve_gene * max(0, self._lgh_morton.size - 1)))
+        new_curve = self._lgh_morton.curve_segment(
+            start,
+            int(self._lgh_curve_indices.numel()),
+            wrap=self.lgh_cfg.curve_wrap
+        )
+        self._lgh_curve_indices.copy_(new_curve.to(self._lgh_curve_indices.device, dtype=torch.long))
+
+    def _refresh_lgh_mdna_mask(self, gate):
+        if (not self.cfg_lgh_enabled) or self._lgh_mdna_mask.numel() == 0:
+            return
+        gate_2d = gate.reshape(self.L, self.R) if gate.dim() > 2 else gate
+        gate_2d = torch.nan_to_num(gate_2d.float(), nan=0.0, posinf=1.0, neginf=0.0)
+        min_keep = max(0.01, min(1.0, self.lgh_cfg.mask_min_keep))
+        max_keep = max(min_keep, min(1.0, self.lgh_cfg.mask_max_keep))
+        sparsity_bias = float(getattr(self, 'mask_sparsity_bias', 0.5))
+        sparsity_bias = max(0.0, min(1.0, sparsity_bias))
+        keep_ratio = max_keep - ((max_keep - min_keep) * sparsity_bias)
+        keep_count = max(1, int(round(gate_2d.numel() * keep_ratio)))
+        threshold = torch.topk(gate_2d.flatten(), keep_count).values.min()
+        mdna = (gate_2d >= threshold).to(dtype=torch.float32)
+        self._lgh_mdna_mask.copy_(mdna)
+
+    def _update_thermal_penalty(self):
+        freq_ghz = 0.0
+        try:
+            freq = psutil.cpu_freq()
+            if freq is not None and getattr(freq, 'current', None) is not None:
+                freq_ghz = max(0.0, float(freq.current) / 1000.0)
+        except Exception:
+            freq_ghz = 0.0
+        self._lgh_last_freq_ghz.fill_(freq_ghz)
+
+        target_ghz = max(0.1, float(self.lgh_cfg.thermal_freq_min_ghz))
+        raw_penalty = 0.0 if freq_ghz <= 0.0 else max(0.0, (target_ghz - freq_ghz) / target_ghz)
+        decay = max(0.0, min(0.999, float(self.lgh_cfg.thermal_ema_decay)))
+        self._lgh_thermal_penalty_ema.mul_(decay).add_(float(raw_penalty) * (1.0 - decay))
+        return float(self._lgh_thermal_penalty_ema.item())
+
+    def get_thermal_penalty(self):
+        return float(self._update_thermal_penalty())
+
+    def _run_lgh_cycle(self, p_brain, H, gate, B, T, h_cycles, l_cycles, dyn_threshold):
+        if not (self.cfg_lgh_enabled and self.lgh_cfg.replace_forward_stack):
+            return False, None, None, None
+        if self.lgh_manifold is None or self._lgh_curve_indices.numel() == 0:
+            return False, None, None, None
+
+        manifold_morton = self._lgh_morton_manifold()
+        if manifold_morton is None or manifold_morton.numel() == 0:
+            return False, None, None, None
+        gate_cpp = gate.reshape(self.L, self.R) if gate.dim() > 2 else gate
+        gate_cpp = gate_cpp.float().contiguous()
+        self._refresh_lgh_mdna_mask(gate_cpp)
+        thermal_penalty = self.get_thermal_penalty()
+
+        if not _cpp_has(
+            'geometric_manifold_forward_avx512',
+            p_brain, H, gate_cpp, manifold_morton, self._lgh_curve_indices, self._lgh_mdna_mask
+        ):
+            return False, None, None, None
+
+        out = _cpp_try(
+            'geometric_manifold_forward_avx512',
+            p_brain.float().contiguous(),
+            H.contiguous(),
+            gate_cpp,
+            manifold_morton.float().contiguous(),
+            self._lgh_curve_indices.contiguous(),
+            self._lgh_mdna_mask.contiguous(),
+            int(h_cycles),
+            int(l_cycles),
+            float(dyn_threshold),
+            int(self.lgh_cfg.prefetch_distance),
+            float(thermal_penalty),
+            tensors=(p_brain, H, gate_cpp, manifold_morton, self._lgh_curve_indices, self._lgh_mdna_mask)
+        )
+        if not isinstance(out, (list, tuple)) or len(out) != 3:
+            return False, None, None, None
+
+        z_lgh, h_next_lgh, halt_lgh = out
+        if z_lgh.dim() == 2 and z_lgh.size(1) == (self.R * self.d_s2 * self.C):
+            z_lgh = z_lgh.view(B, 1, self.R, self.d_s2, self.C)
+        elif z_lgh.dim() == 3 and z_lgh.size(-1) == (self.R * self.d_s2 * self.C):
+            z_lgh = z_lgh.view(B, z_lgh.size(1), self.R, self.d_s2, self.C)
+        if z_lgh.dim() == 5 and z_lgh.size(1) == 1 and T > 1:
+            z_lgh = z_lgh.expand(-1, T, -1, -1, -1)
+
+        if halt_lgh.dim() == 1:
+            halt_lgh = halt_lgh.view(B, 1, 1)
+        elif halt_lgh.dim() == 2:
+            halt_lgh = halt_lgh.unsqueeze(-1)
+        return True, z_lgh, h_next_lgh, halt_lgh
 
 
     def regulate_sensory_noise(self, val_loss):
