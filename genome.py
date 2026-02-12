@@ -15,6 +15,7 @@ class MutationConfig:
     base_rate: float = 0.1
     stress_multiplier: float = 0.3
     max_intensity: float = 0.2
+    thermal_penalty_weight: float = 0.25
     
 class EventLogger:
     """Basic observability implementation."""
@@ -103,6 +104,9 @@ class GenomeState:
         "sparsity_pressure": "fkbp5",
         "engagement_threshold": "drd2",
         "inhibition": "gaba",
+        "curve_trajectory": "curve_trajectory",
+        "mask_sparsity": "mask_sparsity_bias",
+        "thermal_efficiency": "metabolic_efficiency",
     }
 
     def __init__(self, seed: Optional[int] = None):
@@ -121,6 +125,9 @@ class GenomeState:
             'drd2': BrainGene('DRD2', baseline=0.5, min_val=0.1, max_val=0.9, rng=self.rng),
             'fkbp5': BrainGene('FKBP5', baseline=0.3, min_val=0.1, max_val=5.0, rng=self.rng),
             'gaba': BrainGene('GABA', baseline=0.5, min_val=0.1, max_val=1.0, rng=self.rng),
+            'curve_trajectory': BrainGene('CURVE_TRAJECTORY', baseline=0.5, min_val=0.0, max_val=1.0, rng=self.rng),
+            'mask_sparsity_bias': BrainGene('MASK_SPARSITY_BIAS', baseline=0.5, min_val=0.05, max_val=0.95, rng=self.rng),
+            'metabolic_efficiency': BrainGene('METABOLIC_EFFICIENCY', baseline=0.5, min_val=0.1, max_val=1.5, rng=self.rng),
         }
         
         # Static Linkage Map (Could be dynamic in future)
@@ -129,6 +136,8 @@ class GenomeState:
             'fkbp5': {'drd2': 0.3, 'gaba': 0.6},
             'creb': {'bdnf': 0.2},
             'gaba': {'drd2': 0.4},
+            'metabolic_efficiency': {'fkbp5': -0.4, 'mask_sparsity_bias': 0.2},
+            'curve_trajectory': {'mask_sparsity_bias': 0.1},
         }
 
     def state_dict(self):
@@ -165,8 +174,10 @@ class EvolutionPolicy:
         """Categorize failure mode."""
         val_loss = metrics.get('val_loss', 1.0)
         cost_step = metrics.get('cost_step', 0.0)
+        thermal_penalty = metrics.get('thermal_penalty', 0.0)
         
         if val_loss > 1.5: return "TASK_FAILURE"
+        if thermal_penalty > 0.25: return "THERMAL_FAILURE"
         # Enterprise tuning: Lower threshold for energy failure to force efficiency early?
         if cost_step > 0.5: return "ENERGY_FAILURE" 
         return "STAGNATION"
@@ -178,6 +189,8 @@ class EvolutionPolicy:
         """
         if stress_dir == "TASK_FAILURE":
             return 'bdnf', 1.0
+        elif stress_dir == "THERMAL_FAILURE":
+            return 'metabolic_efficiency', 1.0
         elif stress_dir == "ENERGY_FAILURE":
             return 'fkbp5', 1.0
         else:
@@ -226,6 +239,12 @@ class Genome: # Renamed from GenomeEngine to maintain compat with organism.py
     def fkbp5(self): return self.get_expression('fkbp5')
     @property
     def gaba(self): return self.get_expression('gaba')
+    @property
+    def curve_trajectory(self): return self.get_expression('curve_trajectory')
+    @property
+    def mask_sparsity_bias(self): return self.get_expression('mask_sparsity_bias')
+    @property
+    def metabolic_efficiency(self): return self.get_expression('metabolic_efficiency')
 
     def get_expression(self, name):
         if name in self.state.genes:
@@ -297,10 +316,12 @@ class Genome: # Renamed from GenomeEngine to maintain compat with organism.py
         assert 0.0 <= self.state.health <= 1.5, "Health invariant violated"
         
         val_loss = performance_metrics.get('val_loss', 100.0)
+        thermal_penalty = max(0.0, float(performance_metrics.get('thermal_penalty', 0.0)))
+        effective_loss = val_loss + self.policy.config.thermal_penalty_weight * thermal_penalty
         
         # 1. Improvement Branch
-        if val_loss < self.state.best_loss:
-            self.state.best_loss = val_loss
+        if effective_loss < self.state.best_loss:
+            self.state.best_loss = effective_loss
             self.state.health = min(1.0, self.state.health * 1.1)
             
             # Checkpoint
@@ -310,8 +331,8 @@ class Genome: # Renamed from GenomeEngine to maintain compat with organism.py
                 torch.save(model.state_dict(), self.best_checkpoint_path)
             
             self.patience_counter = 0
-            self.logger.emit("improvement", {"loss": val_loss, "health": self.state.health})
-            print(f">>> GENOME: Improvement! Gen {self.state.generation} | Loss: {val_loss:.4f}")
+            self.logger.emit("improvement", {"loss": val_loss, "effective_loss": effective_loss, "thermal_penalty": thermal_penalty, "health": self.state.health})
+            print(f">>> GENOME: Improvement! Gen {self.state.generation} | Loss: {val_loss:.4f} | Effective: {effective_loss:.4f} | Thermal: {thermal_penalty:.4f}")
             return True
             
         # 2. Stagnation Branch

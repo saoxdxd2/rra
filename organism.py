@@ -10,6 +10,7 @@ import yaml
 import os
 from memory import HybridEpisodicMemory, MemoryGovernor, NeuralCache
 from genome import Genome
+from morton import MortonBuffer
 import math
 from types import SimpleNamespace
 from optimizers import AdEMAMix
@@ -618,6 +619,19 @@ class CognitiveOrganism(BaseCognitiveModule):
             ttfs_enabled=bool(Config.TTFS_ENABLED),
             ttfs_slope_threshold=float(Config.TTFS_SLOPE_THRESHOLD),
         )
+        self.lgh_cfg = SimpleNamespace(
+            enabled=bool(Config.LGH_ENABLED),
+            replace_forward_stack=bool(Config.LGH_REPLACE_FORWARD_STACK),
+            curve_length=max(1, int(Config.LGH_CURVE_LENGTH)),
+            curve_wrap=bool(Config.LGH_CURVE_WRAP),
+            mask_min_keep=float(Config.LGH_MASK_MIN_KEEP),
+            mask_max_keep=float(Config.LGH_MASK_MAX_KEEP),
+            morton_depth=max(1, int(Config.LGH_MORTON_DEPTH)),
+            prefetch_distance=max(1, int(Config.LGH_PREFETCH_DISTANCE)),
+            thermal_freq_min_ghz=float(Config.LGH_THERMAL_FREQ_MIN_GHZ),
+            thermal_ema_decay=float(Config.LGH_THERMAL_EMA_DECAY),
+            thermal_penalty_weight=float(Config.LGH_THERMAL_PENALTY_WEIGHT),
+        )
         self.hpc_cfg = SimpleNamespace(
             enabled=bool(Config.HPC_ENABLED),
             hidden=int(Config.HPC_HIDDEN),
@@ -712,7 +726,7 @@ class CognitiveOrganism(BaseCognitiveModule):
         # We replace the Byte Embedding with a Bit-to-Latent projection
         # Raw Bits: [B, T, 8] -> Latent: [B, T, d_s1 * C]
         self.bit_to_latent = nn.Linear(8, self.d_s1 * C).to(self.device)
-        self.register_buffer('byte_bit_shifts', torch.arange(7, -1, -1, dtype=torch.long, device=self.device))
+        self.register_buffer('byte_bit_shifts', torch.arange(7, -1, -1, dtype=torch.long, device=self.device).view(1, 1, -1))
         if self.cfg.MES_ENABLED:
             self.s1_optimizer = torch.optim.SGD(self.bit_to_latent.parameters(), lr=self.cfg.LEARNING_RATE * self.cfg.LOCAL_LR_RATIO)
             
@@ -797,6 +811,7 @@ class CognitiveOrganism(BaseCognitiveModule):
         self.cfg_param_cost_scale = float(Config.PARAM_COST_SCALE)
         self.cfg_lif_decay = float(Config.LIF_DECAY)
         self.cfg_lif_threshold = float(Config.LIF_THRESHOLD)
+        self.cfg_lgh_enabled = bool(self.lgh_cfg.enabled)
         
         # Pre-allocate contiguous state buffer (System 2 States)
         self.max_batch_size = Config.BATCH_SIZE
@@ -804,7 +819,6 @@ class CognitiveOrganism(BaseCognitiveModule):
             self.max_batch_size, L, R, self.d_s2, C, 
             device=device
         ).contiguous()
-        self.register_buffer('byte_bit_shifts', torch.arange(8, device=device).view(1, 1, -1))
         
         self.rope = RotaryEmbedding(self.d_s2 * C, device=device)
         self.survival = SurvivalController(L, R, device=self.device)
