@@ -818,12 +818,24 @@ class RRATrainer:
 
         genome_every = int(self.cfg.genome_step_update_every)
         if genome_every > 0 and (step % genome_every) == 0:
-            evolved = bool(self.model.genome.evolutionary_step(self.model, {'val_loss': float(ema)}))
+            thermal_penalty = 0.0
+            if hasattr(self.model, 'get_thermal_penalty'):
+                thermal_penalty = float(self.model.get_thermal_penalty())
+            evolved = bool(
+                self.model.genome.evolutionary_step(
+                    self.model,
+                    {
+                        'val_loss': float(ema),
+                        'thermal_penalty': thermal_penalty,
+                        'tps_pressure': float(self.model._get_tps_pressure()) if hasattr(self.model, '_get_tps_pressure') else 0.0,
+                    }
+                )
+            )
             self._update_lr_from_genome()
             logger.info(
                 f">>> STEP GENOME UPDATE @step={step}: evolved={evolved} "
                 f"(proxy_val={ema:.4f}, FKBP5={self.model.genome.fkbp5:.4f}, "
-                f"lambda_sparsity={self.model.lambda_sparsity:.6f})"
+                f"lambda_sparsity={self.model.lambda_sparsity:.6f}, thermal_penalty={thermal_penalty:.4f})"
             )
 
     def _sanitize_optimizer_state(self):
@@ -1155,7 +1167,7 @@ class RRATrainer:
                 # Cache lookup only needs the latest token context.
                 xb_in = self._get_input(xb)
                 last_latent = self.model.bit_to_latent(xb_in[:, -1, :])
-                reflex_out, hit_mask = cache.lookup(last_latent)
+                _, hit_mask, _, _, _ = cache.lookup(last_latent)
             self.metrics['hits'] += hit_mask.sum().item()
             self.metrics['misses'] += (~hit_mask).sum().item()
         else:
@@ -1513,7 +1525,15 @@ class RRATrainer:
              self._tb_add_scalar("Omega/epoch_value", new_omega, step=self.current_epoch)
 
         # Meta-Evolutionary Loop
-        self.model.genome.evolutionary_step(self.model, {'val_loss': val_loss})
+        thermal_penalty = float(self.model.get_thermal_penalty()) if hasattr(self.model, 'get_thermal_penalty') else 0.0
+        self.model.genome.evolutionary_step(
+            self.model,
+            {
+                'val_loss': val_loss,
+                'thermal_penalty': thermal_penalty,
+                'tps_pressure': float(self.model._get_tps_pressure()) if hasattr(self.model, '_get_tps_pressure') else 0.0,
+            }
+        )
         
         # --- ANTI-CHEATING: Dynamic Sensory Noise ---
         # Adjust input noise based on validation performance
