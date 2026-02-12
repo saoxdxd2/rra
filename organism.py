@@ -1228,7 +1228,7 @@ class CognitiveOrganism(BaseCognitiveModule):
             return None
         return self.neural_cache
 
-    def set_runtime_toggles(self, *, mes_enabled=None, cache_enabled=None, episodic_enabled=None, pruning_enabled=None):
+    def set_runtime_toggles(self, *, mes_enabled=None, cache_enabled=None, episodic_enabled=None, pruning_enabled=None, lgh_enabled=None):
         if mes_enabled is not None:
             enabled = bool(mes_enabled)
             self.mes_cfg.enabled = enabled
@@ -1245,6 +1245,9 @@ class CognitiveOrganism(BaseCognitiveModule):
             enabled = bool(pruning_enabled)
             self.pruning_enabled = enabled
             self.cfg_pruning_enabled = enabled
+        if lgh_enabled is not None:
+            enabled = bool(lgh_enabled)
+            self.cfg_lgh_enabled = enabled
 
     def _clear_cache_trace(self):
         self._last_cache_bits = None
@@ -1815,6 +1818,7 @@ class CognitiveOrganism(BaseCognitiveModule):
 
         # --- PERFORMANCE CONTROL: TPS Pressure ---
         tps_pressure = self._get_tps_pressure()
+        thermal_penalty = self._update_thermal_penalty()
         
         if not self.pruning_enabled:
             gate = torch.ones(self.L, self.R, 1, 1, dtype=torch.float32, device=self.device)
@@ -1902,14 +1906,22 @@ class CognitiveOrganism(BaseCognitiveModule):
             halting_probability = torch.zeros(B, 1, 1, dtype=torch.float32, device=self.device)
             h_cycles_used = 0.0
         else:
-            fused_ok, z_L_fused, H_next_fused, halting_probability_fused = self._run_fused_cycle(
+            lgh_ok, z_L_lgh, H_next_lgh, halting_probability_lgh = self._run_lgh_cycle(
                 p_brain, H, gate, B, T, h_cycles_cfg, l_cycles_cfg, dyn_threshold
             )
-            if fused_ok:
+            if lgh_ok:
+                z_L = z_L_lgh
+                H_next = H_next_lgh
+                halting_probability = halting_probability_lgh
+            else:
+                fused_ok, z_L_fused, H_next_fused, halting_probability_fused = self._run_fused_cycle(
+                    p_brain, H, gate, B, T, h_cycles_cfg, l_cycles_cfg, dyn_threshold
+                )
+            if (not lgh_ok) and fused_ok:
                 z_L = z_L_fused
                 H_next = H_next_fused
                 halting_probability = halting_probability_fused
-            else:
+            elif not lgh_ok:
                 cos_sin = self.rope(T, self.device)
                 z_L, H_next, halting_probability = self._step_inner(
                     z_L, z_H, cos_sin, gate, mode, learning_brain, l_cycles=l_cycles_cfg, dyn_threshold=dyn_threshold
@@ -2007,6 +2019,8 @@ class CognitiveOrganism(BaseCognitiveModule):
                 'hpc_temporal_scale': float(self._last_temporal_cycle_scale.item()),
                 'engagement_rate': self._current_engagement_rate,
                 'bypass_rate': 1.0 - self._current_engagement_rate,
+                'thermal_penalty': float(thermal_penalty),
+                'cpu_freq_ghz': float(self._lgh_last_freq_ghz.item()),
                 't': T,
                 'B': B
             })

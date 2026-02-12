@@ -10,6 +10,10 @@
 #include <atomic>
 #include <pybind11/pybind11.h>
 
+#ifdef __AVX512F
+#include <immintrin.h>
+#endif
+
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -186,6 +190,7 @@ namespace Perf {
     static std::atomic<uint64_t> g_survival_mask_calls{0};
     static std::atomic<uint64_t> g_survival_losses_calls{0};
     static std::atomic<uint64_t> g_fused_cognitive_calls{0};
+    static std::atomic<uint64_t> g_lgh_calls{0};
 
     inline uint64_t sat_from_ld(long double v) {
         if (!(v > 0.0L)) {
@@ -233,6 +238,7 @@ namespace Perf {
         g_survival_mask_calls.store(0ULL, std::memory_order_relaxed);
         g_survival_losses_calls.store(0ULL, std::memory_order_relaxed);
         g_fused_cognitive_calls.store(0ULL, std::memory_order_relaxed);
+        g_lgh_calls.store(0ULL, std::memory_order_relaxed);
     }
 
     py::dict snapshot() {
@@ -259,6 +265,7 @@ namespace Perf {
         out["survival_mask_calls"] = py::int_(g_survival_mask_calls.load(std::memory_order_relaxed));
         out["survival_losses_calls"] = py::int_(g_survival_losses_calls.load(std::memory_order_relaxed));
         out["fused_cognitive_calls"] = py::int_(g_fused_cognitive_calls.load(std::memory_order_relaxed));
+        out["lgh_calls"] = py::int_(g_lgh_calls.load(std::memory_order_relaxed));
         return out;
     }
 }

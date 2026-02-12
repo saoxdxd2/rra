@@ -1561,6 +1561,7 @@ class RRATrainer:
             'cache_enabled': bool(getattr(self.model, 'cache_enabled', False)),
             'episodic_enabled': bool(getattr(self.model, 'episodic_enabled', True)),
             'pruning_enabled': bool(getattr(self.model, 'pruning_enabled', True)),
+            'lgh_enabled': bool(getattr(self.model, 'cfg_lgh_enabled', False)),
         }
 
     def _apply_runtime_toggles(self, toggles):
@@ -1571,6 +1572,7 @@ class RRATrainer:
             'cache_enabled': bool(toggles.get('cache_enabled', getattr(self.model, 'cache_enabled', False))),
             'episodic_enabled': bool(toggles.get('episodic_enabled', getattr(self.model, 'episodic_enabled', True))),
             'pruning_enabled': bool(toggles.get('pruning_enabled', getattr(self.model, 'pruning_enabled', True))),
+            'lgh_enabled': bool(toggles.get('lgh_enabled', getattr(self.model, 'cfg_lgh_enabled', False))),
         }
         self.cfg.mes_enabled = clean['mes_enabled']
         if hasattr(self.model, 'set_runtime_toggles'):
@@ -1579,6 +1581,7 @@ class RRATrainer:
                 cache_enabled=clean['cache_enabled'],
                 episodic_enabled=clean['episodic_enabled'],
                 pruning_enabled=clean['pruning_enabled'],
+                lgh_enabled=clean['lgh_enabled'],
             )
         else:
             if hasattr(self.model, 'cache_enabled'):
@@ -1693,6 +1696,7 @@ class RRATrainer:
         baseline_toggles = self._runtime_toggle_state()
         variants = [
             ("baseline", {}),
+            ("no_lgh", {'lgh_enabled': False}),
             ("no_cache", {'cache_enabled': False}),
             ("no_episodic", {'episodic_enabled': False}),
             ("no_pruning", {'pruning_enabled': False}),
