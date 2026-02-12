@@ -76,6 +76,10 @@ runtime:
   cpp_omp_threads: 8 # Favor custom C++ kernels on this 8-core CPU.
   torch_num_threads: 2 # Keep PyTorch intra-op low to reduce contention.
   torch_interop_threads: 1 # Avoid extra inter-op scheduling overhead.
+  omega_step_update_every: 250 # Update Omega using train-loss EMA during epoch.
+  genome_step_update_every: 5000 # Keep genome evolution infrequent (it is heavier than Omega updates).
+  train_loss_ema_decay: 0.98 # Smooth proxy signal used for step-level adaptation.
+  sparsity_log_every: 50 # Log true gate sparsity cadence (steps).
   strict_cpu_only: true # This codebase uses CPU C++ kernels as the production path.
   virtual_lab_enabled: false # Disable heavy benchmark/event logging by default for training runs.
   preflight_enabled: true # Run a startup smoke-check before long training.

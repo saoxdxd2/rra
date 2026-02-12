@@ -13,6 +13,7 @@ from torch.utils.tensorboard import SummaryWriter
 import traceback
 import queue
 import random
+import copy
 
 import logging
 import datetime
@@ -107,9 +108,15 @@ def configure_runtime_threading():
     omp_threads = runtime_cfg.omp_threads
     torch_threads = runtime_cfg.torch_threads
     interop_threads = runtime_cfg.interop_threads
+    try:
+        torch.set_flush_denormal(True)
+    except Exception:
+        pass
 
     if omp_threads > 0:
         os.environ['OMP_NUM_THREADS'] = str(omp_threads)
+        os.environ.setdefault('MKL_NUM_THREADS', str(omp_threads))
+        os.environ.setdefault('KMP_AFFINITY', 'granularity=fine,compact,1,0')
         logger.info(f">>> Runtime Threading: OMP_NUM_THREADS={omp_threads}")
 
     if torch_threads > 0:
@@ -125,6 +132,18 @@ def configure_runtime_threading():
             logger.info(f">>> Runtime Threading: torch_interop_threads={interop_threads}")
         except Exception as e:
             logger.warning(f">>> Failed to set torch_interop_threads={interop_threads}: {e}")
+
+    if omp_threads > 0:
+        try:
+            proc = psutil.Process()
+            if hasattr(proc, 'cpu_affinity'):
+                affinity = proc.cpu_affinity()
+                if affinity:
+                    target = affinity[:max(1, min(len(affinity), omp_threads))]
+                    proc.cpu_affinity(target)
+                    logger.info(f">>> Runtime Threading: cpu_affinity={target}")
+        except Exception as e:
+            logger.warning(f">>> Failed to set CPU affinity: {e}")
 
 
 def set_global_seed(seed: int):
@@ -159,13 +178,40 @@ def run_preflight_checks(model, device):
 
     tiny_b, tiny_t = 2, 16
     xb = torch.randint(0, 2, (tiny_b, tiny_t, 8), device=device, dtype=torch.float32)
-    H = init_state(model.L, model.R, model.d_s2, model.C, device=device)
-    model.eval()
-    with torch.no_grad():
-        out, H_next, cost, gate = model(xb, H)
 
-    tensors = {'out': out, 'H_next': H_next, 'cost': cost, 'gate': gate}
-    bad = [name for name, t in tensors.items() if isinstance(t, torch.Tensor) and not torch.isfinite(t).all()]
+    def run_once(H_seed):
+        with torch.no_grad():
+            out_t, H_next_t, cost_t, gate_t = model(xb, H_seed)
+        tensors_t = {'out': out_t, 'H_next': H_next_t, 'cost': cost_t, 'gate': gate_t}
+        bad_t = [name for name, t in tensors_t.items() if isinstance(t, torch.Tensor) and not torch.isfinite(t).all()]
+        return bad_t
+
+    model.eval()
+    H = init_state(model.L, model.R, model.d_s2, model.C, device=device)
+    bad = run_once(H)
+    if bad:
+        logger.warning(
+            f">>> Preflight non-finite tensors detected ({', '.join(bad)}). "
+            "Applying stabilization retry (parameter sanitize + minimal cycles)."
+        )
+        with torch.no_grad():
+            for p in model.parameters():
+                if torch.is_floating_point(p):
+                    p.data = torch.nan_to_num(p.data, nan=0.0, posinf=1.0, neginf=-1.0).clamp(-10.0, 10.0)
+        old_h = getattr(model, 'H_cycles', None)
+        old_l = getattr(model, 'L_cycles', None)
+        try:
+            if old_h is not None:
+                model.H_cycles = 1
+            if old_l is not None:
+                model.L_cycles = 1
+            H_retry = torch.zeros(tiny_b, model.L, model.R, model.d_s2, model.C, device=device, dtype=torch.float32)
+            bad = run_once(H_retry)
+        finally:
+            if old_h is not None:
+                model.H_cycles = old_h
+            if old_l is not None:
+                model.L_cycles = old_l
     if bad:
         raise RuntimeError(f"Preflight produced non-finite tensors: {', '.join(bad)}")
     logger.info(">>> Preflight checks passed (C++ ops + finite forward).")
@@ -287,6 +333,143 @@ class ByteDataset(Dataset):
         return xb, yb
 
 
+def _record_to_text(value):
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (list, tuple)):
+        parts = [str(v) for v in value if v is not None]
+        return "\n".join(parts)
+    if isinstance(value, dict):
+        for key in ("text", "content", "value"):
+            if key in value and value[key] is not None:
+                return str(value[key])
+        return str(value)
+    return str(value)
+
+
+def prepare_dataset_txt_from_hf(
+    data_dir,
+    dataset_name,
+    dataset_config=None,
+    split="train",
+    text_column="text",
+    max_gb=4.0,
+    max_rows=0,
+    shuffle_buffer=20000,
+    seed=1337,
+    overwrite=False,
+):
+    """
+    Streams a Hugging Face dataset and materializes it into data_dir/dataset.txt.
+    This keeps the training pipeline unchanged (byte-level dataset.txt input).
+    """
+    out_path = os.path.join(data_dir, "dataset.txt")
+    if os.path.exists(out_path) and not overwrite:
+        logger.info(f">>> HF dataset prepare skipped (dataset.txt already exists): {out_path}")
+        return out_path
+
+    try:
+        from datasets import load_dataset
+    except Exception as e:
+        raise RuntimeError(
+            "Hugging Face dataset preparation requires the 'datasets' package. "
+            "Install with: pip install datasets"
+        ) from e
+
+    logger.info(
+        f">>> Preparing dataset.txt from Hugging Face: dataset={dataset_name}"
+        + (f", config={dataset_config}" if dataset_config else "")
+        + f", split={split}, text_column={text_column}"
+    )
+
+    max_bytes = 0
+    if max_gb is not None and float(max_gb) > 0:
+        max_bytes = int(float(max_gb) * (1024 ** 3))
+    max_rows = int(max_rows or 0)
+    shuffle_buffer = max(0, int(shuffle_buffer or 0))
+
+    if os.path.exists(out_path):
+        os.remove(out_path)
+
+    load_args = [dataset_name]
+    if dataset_config:
+        load_args.append(dataset_config)
+
+    try:
+        dataset = load_dataset(*load_args, split=split, streaming=True)
+    except Exception as e:
+        raise RuntimeError(
+            f"Failed to stream dataset '{dataset_name}' from Hugging Face Hub. "
+            "Check internet access, firewall/proxy rules, and HF auth if required."
+        ) from e
+    if shuffle_buffer > 0:
+        dataset = dataset.shuffle(seed=int(seed), buffer_size=shuffle_buffer)
+
+    rows_seen = 0
+    rows_written = 0
+    bytes_written = 0
+    missing_text = 0
+    empty_text = 0
+    first_missing_keys = None
+
+    with open(out_path, "wb") as f:
+        for sample in dataset:
+            rows_seen += 1
+
+            if text_column not in sample:
+                missing_text += 1
+                if first_missing_keys is None:
+                    first_missing_keys = list(sample.keys())
+                continue
+
+            text = _record_to_text(sample.get(text_column))
+            if not text:
+                empty_text += 1
+                continue
+
+            chunk = text.replace("\r\n", "\n").replace("\r", "\n").encode("utf-8", errors="ignore")
+            if not chunk.endswith(b"\n"):
+                chunk += b"\n"
+
+            if max_bytes > 0 and (bytes_written + len(chunk)) > max_bytes:
+                remaining = max_bytes - bytes_written
+                if remaining <= 0:
+                    break
+                chunk = chunk[:remaining]
+
+            f.write(chunk)
+            bytes_written += len(chunk)
+            rows_written += 1
+
+            if rows_written % 100000 == 0:
+                logger.info(
+                    f">>> HF materialization progress: rows={rows_written}, bytes={bytes_written / (1024 ** 2):.1f} MiB"
+                )
+
+            if max_rows > 0 and rows_written >= max_rows:
+                break
+            if max_bytes > 0 and bytes_written >= max_bytes:
+                break
+
+    if bytes_written <= (Config.SEQ_LEN + 1):
+        details = ""
+        if first_missing_keys is not None:
+            details = f" Available keys in samples include: {first_missing_keys}"
+        raise RuntimeError(
+            f"HF materialization produced too little data ({bytes_written} bytes). "
+            f"Check dataset/text column '{text_column}'.{details}"
+        )
+
+    logger.info(
+        f">>> HF materialization complete: rows_seen={rows_seen}, rows_written={rows_written}, "
+        f"missing_text={missing_text}, empty_text={empty_text}, size={bytes_written / (1024 ** 3):.2f} GiB, "
+        f"output={out_path}"
+    )
+    return out_path
+
+
 def create_dataloaders(data_dir, batch_size, seq_len, val_split=0.1):
     data_cfg = SimpleNamespace(
         train_samples_per_epoch=Config.TRAIN_SAMPLES_PER_EPOCH,
@@ -396,6 +579,12 @@ class RRATrainer:
             seq_len=int(Config.SEQ_LEN),
             ram_critical_threshold=float(Config.RAM_CRITICAL_THRESHOLD),
             ram_prune_fraction=float(Config.RAM_PRUNE_FRACTION),
+            global_pulse_every=max(1, int(getattr(Config, 'GLOBAL_PULSE_EVERY', 250))),
+            global_pulse_weight=float(getattr(Config, 'GLOBAL_PULSE_WEIGHT', 0.25)),
+            omega_step_update_every=max(0, int(getattr(Config, 'OMEGA_STEP_UPDATE_EVERY', 250))),
+            genome_step_update_every=max(0, int(getattr(Config, 'GENOME_STEP_UPDATE_EVERY', 5000))),
+            train_loss_ema_decay=float(getattr(Config, 'TRAIN_LOSS_EMA_DECAY', 0.98)),
+            sparsity_log_every=max(1, int(getattr(Config, 'SPARSITY_LOG_EVERY', 50))),
         )
         
         # Use AdEMAMix optimizer with Omega-linked dual-momentum
@@ -406,6 +595,13 @@ class RRATrainer:
         
         self.metrics = {'hits': 0, 'misses': 0, 'imprints': 0}
         self.global_step = 0
+        self._omega_nonfinite_streak = 0
+        self._mes_cooldown_steps = 0
+        self._lr_cap = None
+        self._train_loss_ema = None
+        self._last_gate_density = 1.0
+        self._last_gate_sparsity = 0.0
+        self._gate_density_ema = None
         
         # Adaptive Curriculum Tracking
         self.streak_counter = 0
@@ -439,7 +635,13 @@ class RRATrainer:
     
     def _update_lr_from_genome(self):
         """Dynamically adjust learning rate based on genome expression."""
-        new_lr = self.model.suggested_lr
+        base_lr = float(self.model.suggested_lr)
+        if self._lr_cap is None:
+            new_lr = base_lr
+        else:
+            # Gradually relax emergency cap when training is stable.
+            self._lr_cap = min(base_lr, self._lr_cap * 1.02)
+            new_lr = min(base_lr, self._lr_cap)
         for param_group in self.optimizer.param_groups:
             old_lr = param_group['lr']
             param_group['lr'] = new_lr
@@ -462,21 +664,43 @@ class RRATrainer:
             return None
         return getattr(self.model, 'neural_cache', None)
 
-    def _cache_write(self, keys, values, learning_rate=1.0, mask=None):
+    def _cache_write(
+        self,
+        keys,
+        values,
+        learning_rate=1.0,
+        mask=None,
+        confidence=None,
+        surprise=None,
+        min_confidence=None,
+        min_surprise=None,
+        max_write_fraction=None,
+    ):
         cache = self._cache()
         if cache is None:
             return 0
-        if mask is not None:
-            if mask.dtype != torch.bool:
-                mask = mask.bool()
-            if mask.numel() == 0 or (not bool(mask.any().item())):
-                return 0
-            keys = keys[mask]
-            values = values[mask]
         if keys.numel() == 0 or values.numel() == 0:
             return 0
-        cache.write(keys, values, learning_rate=float(learning_rate))
-        return int(keys.size(0))
+        if mask is not None:
+            if not isinstance(mask, torch.Tensor):
+                mask = torch.as_tensor(mask, dtype=torch.bool, device=keys.device)
+            mask = mask.to(keys.device, dtype=torch.bool)
+            if mask.numel() == 0 or (not bool(mask.any().item())):
+                return 0
+        written = cache.write(
+            keys,
+            values,
+            learning_rate=float(learning_rate),
+            mask=mask,
+            confidence=confidence,
+            surprise=surprise,
+            min_confidence=min_confidence,
+            min_surprise=min_surprise,
+            max_write_fraction=max_write_fraction,
+        )
+        if written is None:
+            return int(mask.sum().item()) if mask is not None else int(keys.size(0))
+        return int(written)
 
     def _tb_add_scalar(self, tag, value, step=None):
         if (not self.model.virtual_lab.enabled) or (self.model.virtual_lab.writer is None):
@@ -544,6 +768,169 @@ class RRATrainer:
             if not torch.isfinite(param.grad).all():
                 param.grad.data = self._finite(param.grad.data, nan=0.0, posinf=1.0, neginf=-1.0)
 
+    def _record_gate_sparsity(self, gate):
+        """Track true gate sparsity from current forward pass."""
+        if not isinstance(gate, torch.Tensor) or gate.numel() == 0:
+            return
+        with torch.no_grad():
+            density = float(torch.nan_to_num(gate.float().mean(), nan=1.0, posinf=1.0, neginf=0.0).item())
+        density = max(0.0, min(1.0, density))
+        self._last_gate_density = density
+        self._last_gate_sparsity = 1.0 - density
+        decay = max(0.0, min(0.999, float(self.cfg.train_loss_ema_decay)))
+        if self._gate_density_ema is None:
+            self._gate_density_ema = density
+        else:
+            self._gate_density_ema = (decay * self._gate_density_ema) + ((1.0 - decay) * density)
+
+    def _update_train_loss_ema(self, loss_value):
+        if loss_value is None or (not math.isfinite(float(loss_value))):
+            return None
+        loss_f = float(loss_value)
+        decay = max(0.0, min(0.999, float(self.cfg.train_loss_ema_decay)))
+        if self._train_loss_ema is None:
+            self._train_loss_ema = loss_f
+        else:
+            self._train_loss_ema = (decay * self._train_loss_ema) + ((1.0 - decay) * loss_f)
+        return self._train_loss_ema
+
+    def _maybe_stepwise_adaptation(self, step, latest_loss):
+        """
+        Lightweight in-epoch adaptation:
+        - Frequent Omega updates from train-loss EMA.
+        - Infrequent genome evolutionary ticks (heavier path).
+        """
+        if step < 1:
+            return
+        ema = self._update_train_loss_ema(latest_loss)
+        if ema is None:
+            return
+
+        omega_every = int(self.cfg.omega_step_update_every)
+        if omega_every > 0 and (step % omega_every) == 0:
+            old_omega = float(self.model.omega)
+            new_omega = float(self.model.update_omega(ema, ema))
+            if abs(new_omega - old_omega) > 1e-6:
+                logger.info(
+                    f">>> STEP OMEGA UPDATE @step={step}: {old_omega:.4f} -> {new_omega:.4f} "
+                    f"(loss_ema={ema:.4f})"
+                )
+
+        genome_every = int(self.cfg.genome_step_update_every)
+        if genome_every > 0 and (step % genome_every) == 0:
+            evolved = bool(self.model.genome.evolutionary_step(self.model, {'val_loss': float(ema)}))
+            self._update_lr_from_genome()
+            logger.info(
+                f">>> STEP GENOME UPDATE @step={step}: evolved={evolved} "
+                f"(proxy_val={ema:.4f}, FKBP5={self.model.genome.fkbp5:.4f}, "
+                f"lambda_sparsity={self.model.lambda_sparsity:.6f})"
+            )
+
+    def _sanitize_optimizer_state(self):
+        """Replace non-finite optimizer state values in-place."""
+        state = getattr(self.optimizer, 'state', None)
+        if not isinstance(state, dict):
+            return 0
+        fixed_count = 0
+        for _, bucket in state.items():
+            if not isinstance(bucket, dict):
+                continue
+            for key, value in list(bucket.items()):
+                if not isinstance(value, torch.Tensor) or not torch.is_floating_point(value):
+                    continue
+                bad_mask = ~torch.isfinite(value)
+                if bad_mask.any():
+                    fixed_count += int(bad_mask.sum().item())
+                    bucket[key] = self._finite(value, nan=0.0, posinf=1.0, neginf=-1.0)
+        if fixed_count > 0:
+            logger.warning(f">>> Sanitized {fixed_count} non-finite optimizer-state values.")
+        return fixed_count
+
+    def _decay_lr(self, factor=0.8, min_lr=1e-6):
+        """Decays optimizer learning rate and sets emergency cap."""
+        old_lr = None
+        new_lr = None
+        for group in self.optimizer.param_groups:
+            current = float(group.get('lr', 0.0))
+            if old_lr is None:
+                old_lr = current
+            target = max(float(min_lr), current * float(factor))
+            group['lr'] = target
+            if new_lr is None:
+                new_lr = target
+        if new_lr is not None:
+            self._lr_cap = new_lr if self._lr_cap is None else min(self._lr_cap, new_lr)
+        return old_lr, new_lr
+
+    def _recover_from_nonfinite_omega(self, reason="unknown"):
+        """
+        Recovery path for repeated non-finite Omega losses.
+        Sanitizes model+optimizer, decays LR, and optionally cools down MES updates.
+        """
+        self._omega_nonfinite_streak += 1
+        self.optimizer.zero_grad(set_to_none=True)
+        fixed_params = self.sanitize_model_parameters()
+        fixed_opt = self._sanitize_optimizer_state()
+
+        if hasattr(self, '_h_buffer') and isinstance(self._h_buffer, torch.Tensor):
+            self._h_buffer = self._finite(self._h_buffer, nan=0.0, posinf=1e3, neginf=-1e3).clamp(-1e3, 1e3)
+
+        if self._omega_nonfinite_streak >= 12:
+            lr_factor = 0.5
+        elif self._omega_nonfinite_streak >= 6:
+            lr_factor = 0.7
+        else:
+            lr_factor = 0.85
+        old_lr, new_lr = self._decay_lr(factor=lr_factor, min_lr=1e-6)
+
+        if self._omega_nonfinite_streak >= 8 and self._mes_cooldown_steps <= 0:
+            self._mes_cooldown_steps = 64
+            old_omega = float(self.model.omega)
+            self.model.omega = max(0.01, min(old_omega, 0.15))
+            self.model.current_phase = max(1, int(getattr(self.model, 'current_phase', 1)))
+            logger.warning(
+                f">>> Omega recovery: entering MES cooldown for {self._mes_cooldown_steps} steps "
+                f"(omega {old_omega:.3f} -> {self.model.omega:.3f})."
+            )
+
+        lr_text = "nan" if old_lr is None else f"{old_lr:.2e}"
+        logger.warning(
+            f">>> Omega recovery[{reason}] step={self.global_step} streak={self._omega_nonfinite_streak} "
+            f"fixed_params={fixed_params} fixed_opt={fixed_opt} lr={lr_text}"
+        )
+        if old_lr is not None and new_lr is not None:
+            logger.warning(f">>> Omega recovery: LR decayed {old_lr:.2e} -> {new_lr:.2e}.")
+
+    def _maybe_long_credit_pulse(self, H_next, targets):
+        if not self.cfg.mes_enabled:
+            return None
+        pulse_every = max(1, int(self.cfg.global_pulse_every))
+        if self.global_step <= 0 or (self.global_step % pulse_every) != 0:
+            return None
+        if not isinstance(H_next, torch.Tensor) or H_next.numel() == 0:
+            return None
+        if not isinstance(targets, torch.Tensor) or targets.numel() == 0:
+            return None
+
+        self.optimizer.zero_grad(set_to_none=True)
+        h_avg = H_next.detach().mean(dim=1)
+        h_flat = h_avg.reshape(h_avg.size(0), 1, self.model.R * self.model.d_s2 * self.model.C)
+        pulse_logits = self.model.readout(h_flat)
+        if targets.dim() == 3:
+            target_last = targets[:, -1:].float()
+        else:
+            target_last = targets.unsqueeze(1).float()
+        pulse_loss = F.binary_cross_entropy_with_logits(pulse_logits, target_last)
+        scaled_loss = pulse_loss * float(max(0.0, self.cfg.global_pulse_weight))
+        if not torch.isfinite(scaled_loss):
+            self.optimizer.zero_grad(set_to_none=True)
+            return None
+        scaled_loss.backward()
+        self._sanitize_gradients()
+        adaptive_gradient_clip(self.model, clip_factor=self.cfg.agc_clip_factor)
+        self._optimizer_step()
+        return float(scaled_loss.item())
+
     def _step_phase_0_stability(self, xb, yb):
         self.optimizer.zero_grad()
         inp, H, out, H_next, cost, gate = self._forward_with_state(
@@ -553,6 +940,7 @@ class RRATrainer:
         H_next = self._finite(H_next, nan=0.0, posinf=1e4, neginf=-1e4)
         cost = self._finite(cost, nan=0.0, posinf=1e4, neginf=0.0)
         gate = self._finite(gate, nan=0.0, posinf=1.0, neginf=0.0)
+        self._record_gate_sparsity(gate)
 
         
         # Stability losses from SurvivalController
@@ -594,16 +982,22 @@ class RRATrainer:
         Modified to handle both teacher distillation and direct ground-truth training.
         If tb contains probabilities, it distills. If it contains bits, it trains toward them.
         """
-        B = xb.size(0)
-        omega = self.model.omega
-        self.optimizer.zero_grad()
-        
+        omega = float(self.model.omega)
+        if self._mes_cooldown_steps > 0:
+            self._mes_cooldown_steps -= 1
+            if self._mes_cooldown_steps == 0:
+                logger.info(">>> MES cooldown ended. Re-enabling MES local updates.")
+        mes_active = bool(self.cfg.mes_enabled and self._mes_cooldown_steps <= 0)
+
+        self.optimizer.zero_grad(set_to_none=True)
+
         # 1. FORWARD PASS
-        inp, H, out, H_next, cost, gate = self._forward_with_state(xb, require_grad=(not self.cfg.mes_enabled))
+        inp, H, out, H_next, cost, gate = self._forward_with_state(xb, require_grad=(not mes_active))
         out = self._finite(out, nan=0.0, posinf=20.0, neginf=-20.0)
         H_next = self._finite(H_next, nan=0.0, posinf=1e4, neginf=-1e4)
         cost = self._finite(cost, nan=0.0, posinf=1e4, neginf=0.0)
         gate = self._finite(gate, nan=0.0, posinf=1.0, neginf=0.0)
+        self._record_gate_sparsity(gate)
         
         # 2. CALC TEACHER LOSS
         if is_ground_truth:
@@ -616,9 +1010,13 @@ class RRATrainer:
         
         # 3. EXECUTE LEARNING STEP
         loss_info = {'L_task': float('nan'), 'L_teacher': float('nan')}
-        if self.cfg.mes_enabled:
+        if mes_active:
             # MES: Decentralized Descent
             mes_info = self.model.mes_step(xb, yb, precomputed_H_next=H_next)
+            mes_loss = float(mes_info.get('mes_loss', 0.0)) if isinstance(mes_info, dict) else 0.0
+            if not math.isfinite(mes_loss):
+                self._recover_from_nonfinite_omega(reason="mes_local_loss")
+                return None
             if self.model.virtual_lab.enabled:
                 self._tb_add_scalar("MES/local_loss", mes_info.get('mes_loss', 0.0))
                 self._tb_add_scalar("HPC/local_loss", mes_info.get('hpc_loss', 0.0))
@@ -626,8 +1024,15 @@ class RRATrainer:
             # Reuse current forward results to avoid a second full model forward in MES mode.
             with torch.no_grad():
                 loss_task = self.learning_brain.calculate_task_loss(out, yb)
+                loss_task = self._finite(loss_task, nan=10.0, posinf=10.0, neginf=10.0)
                 l_stab, l_eng, l_coh = self.model.survival.calculate_losses(H_next, gate=gate, H_prev=H)
+                l_stab = self._finite(l_stab, nan=0.0, posinf=1e4, neginf=0.0)
+                l_eng = self._finite(l_eng, nan=0.0, posinf=1e4, neginf=0.0)
+                l_coh = self._finite(l_coh, nan=0.0, posinf=1e4, neginf=0.0)
                 l_myelin = self.model.survival.calculate_myelin_cost(self.model)
+                if not isinstance(l_myelin, torch.Tensor):
+                    l_myelin = torch.tensor(float(l_myelin), device=out.device, dtype=out.dtype)
+                l_myelin = self._finite(l_myelin, nan=0.0, posinf=1e4, neginf=0.0)
                 l_teacher_eff = loss_task if L_teacher is None else L_teacher
                 total_loss, loss_info = self.learning_brain.calculate_unified_loss(
                     L_task=loss_task,
@@ -638,13 +1043,22 @@ class RRATrainer:
                 total_loss = total_loss + (self.cfg.dynamic_energy_scale * (cost + l_eng))
                 if hasattr(self.model, 'get_engagement_rate'):
                     engagement_rate = self.model.get_engagement_rate()
+                    if isinstance(engagement_rate, torch.Tensor):
+                        engagement_rate = float(
+                            torch.nan_to_num(
+                                engagement_rate.detach(), nan=1.0, posinf=1.0, neginf=0.0
+                            ).item()
+                        )
+                    elif not math.isfinite(float(engagement_rate)):
+                        engagement_rate = 1.0
                     efficiency_bonus = min((1.0 - engagement_rate) * 0.1, self.cfg.efficiency_bonus_cap)
                     total_loss = total_loss - efficiency_bonus
+                total_loss = self._finite(total_loss, nan=10.0, posinf=1e4, neginf=-1e4)
             L_total_val = float(total_loss.item())
             loss_info['L_task'] = float(loss_info.get('L_task', float('nan')))
             loss_info['L_teacher'] = float(loss_info.get('L_teacher', float('nan')))
             if not math.isfinite(L_total_val):
-                logger.warning(f">>> Non-finite Omega-mode loss at global_step={self.global_step}. Skipping this batch.")
+                self._recover_from_nonfinite_omega(reason="omega_mes_total_loss")
                 return None
         else:
             # Global Backprop: Centralized Orchestration
@@ -652,14 +1066,20 @@ class RRATrainer:
             results = self.learning_brain.learning_step(
                 self.model, inp, yb, H, self.optimizer, L_teacher=L_teacher, omega=self.model.omega
             )
-            L_total_val = results['total_loss']
+            L_total_val = float(results['total_loss'])
             H_next = results['H_next']
             loss_info['L_task'] = results.get('loss_task', float('nan'))
             if L_teacher is not None and hasattr(L_teacher, 'item'):
                 loss_info['L_teacher'] = L_teacher.item()
             if not math.isfinite(L_total_val):
-                logger.warning(f">>> Non-finite Omega-mode loss at global_step={self.global_step}. Skipping this batch.")
+                self._recover_from_nonfinite_omega(reason="omega_global_total_loss")
                 return None
+
+        if self._omega_nonfinite_streak > 0:
+            logger.info(
+                f">>> Omega recovery stabilized after {self._omega_nonfinite_streak} consecutive non-finite batches."
+            )
+            self._omega_nonfinite_streak = 0
         
         # 6. OMEGA-MODULATED MEMORY
         with torch.no_grad():
@@ -667,22 +1087,58 @@ class RRATrainer:
             if cache is not None:
                 # Project last bit vector to latent space for NeuralCache
                 last_latent = self._last_latent(inp)
+                bit_probs = torch.sigmoid(out[:, -1, :])
+                confidence = (bit_probs - 0.5).abs().mean(dim=-1)
+                if isinstance(yb, torch.Tensor) and yb.dim() >= 2 and yb.size(-1) == bit_probs.size(-1):
+                    target_last = yb[:, -1, :] if yb.dim() == 3 else yb
+                    surprise = (bit_probs - target_last.float()).abs().mean(dim=-1)
+                else:
+                    surprise = None
                 if omega < 0.3:  # SPONGE: Aggressive write
-                    self._cache_write(last_latent, out[:, -1, :], learning_rate=1.0)
+                    self._cache_write(
+                        last_latent,
+                        out[:, -1, :],
+                        learning_rate=1.0,
+                        confidence=confidence,
+                        surprise=surprise,
+                        min_confidence=0.08,
+                        min_surprise=0.20,
+                        max_write_fraction=0.85,
+                    )
                 elif omega < 0.7:  # STUDENT: Balanced
-                    self._cache_write(last_latent, out[:, -1, :], learning_rate=0.5)
+                    self._cache_write(
+                        last_latent,
+                        out[:, -1, :],
+                        learning_rate=0.5,
+                        confidence=confidence,
+                        surprise=surprise,
+                        min_confidence=0.14,
+                        min_surprise=0.24,
+                        max_write_fraction=0.65,
+                    )
                 else:  # MASTER: Read-only (high confidence only)
-                    probs = torch.sigmoid(out[:, -1, :]) # out is [B, 8] bits
-                    # Bit-wise confidence (entropy check is harder for bits, using average confidence)
-                    confidence = (probs - 0.5).abs().mean(dim=-1)
-                    confident = confidence > 0.4 # High confidence threshold
-                    self._cache_write(last_latent, out[:, -1, :], learning_rate=0.1, mask=confident)
+                    confident = confidence > 0.40
+                    self._cache_write(
+                        last_latent,
+                        out[:, -1, :],
+                        learning_rate=0.1,
+                        mask=confident,
+                        confidence=confidence,
+                        surprise=surprise,
+                        min_confidence=0.32,
+                        min_surprise=0.30,
+                        max_write_fraction=0.35,
+                    )
+
+        pulse_loss = self._maybe_long_credit_pulse(H_next, yb) if mes_active else None
         
         # 6. LOGGING
         if self.model.virtual_lab.enabled and batch_idx % 50 == 0:
             self._tb_add_scalar("Omega/value", omega)
             self._tb_add_scalar("Omega/L_task", loss_info['L_task'])
             self._tb_add_scalar("Omega/L_teacher", loss_info['L_teacher'])
+            if pulse_loss is not None:
+                self._tb_add_scalar("Omega/long_credit_pulse", pulse_loss)
         
         return float(L_total_val)
 
@@ -746,6 +1202,7 @@ class RRATrainer:
         preds = (probs > 0.5).float()
         correct_mask = (preds == targets).all(dim=-1)
         final_mask = confident_mask & correct_mask
+        surprise = (probs - targets).abs().mean(dim=-1)
         
         if batch_idx % 100 == 0:
             logger.info(
@@ -755,7 +1212,17 @@ class RRATrainer:
             
         if final_mask.any():
             # NeuralCache.write now handles normalization internally
-            imprinted = self._cache_write(context_embeddings, logits, learning_rate=1.0, mask=final_mask)
+            imprinted = self._cache_write(
+                context_embeddings,
+                logits,
+                learning_rate=1.0,
+                mask=final_mask,
+                confidence=confidence,
+                surprise=surprise,
+                min_confidence=dynamic_threshold,
+                min_surprise=0.20,
+                max_write_fraction=0.60,
+            )
             self.metrics['imprints'] += imprinted
 
     def _enter_sleep_cycle(self, dataloader, force=False):
@@ -792,14 +1259,27 @@ class RRATrainer:
                     xb = torch.stack(xb_list, dim=0).to(self.device)
                     inp, _, out, _, _, _ = self._forward_with_state(xb)
                     last_latent = self._last_latent(inp)
-                    self._cache_write(last_latent, out[:, -1, :], learning_rate=0.05)
+                    dream_probs = torch.sigmoid(out[:, -1, :])
+                    dream_conf = (dream_probs - 0.5).abs().mean(dim=-1)
+                    self._cache_write(
+                        last_latent,
+                        out[:, -1, :],
+                        learning_rate=0.05,
+                        confidence=dream_conf,
+                        min_confidence=0.22,
+                        max_write_fraction=0.25,
+                    )
                     dream_count += 1
             self.model.eval()
         logger.info(f">>> Dream replay complete: {dream_count} batches")
 
         # 3. CACHE PRUNING: Remove bottom 30% of stale entries
         cache = self._cache()
-        if cache is not None and hasattr(cache, 'prune_lru'):
+        if (
+            bool(getattr(self.model, 'pruning_enabled', True))
+            and cache is not None
+            and hasattr(cache, 'prune_lru')
+        ):
             cache.prune_lru(fraction=0.3)
             logger.info(">>> Cache pruned (bottom 30% removed)")
         
@@ -924,18 +1404,31 @@ class RRATrainer:
                 
             total_loss += loss
             processed_batches += 1
+            self._maybe_stepwise_adaptation(step=step, latest_loss=loss)
             if batch_idx % 50 == 0: self._check_ram_health()
             
             # Periodic TensorBoard Logging for Hit Rate
             if self.model.virtual_lab.enabled and batch_idx % 10 == 0:
                 self._tb_add_scalar("VirtualLab/hit_rate", self._get_hit_rate())
                 self._tb_add_scalar("VirtualLab/loss_total", loss)
+                self._tb_add_scalar("Sparsity/gate_density", self._last_gate_density)
+                self._tb_add_scalar("Sparsity/gate_sparsity", self._last_gate_sparsity)
+                if self._gate_density_ema is not None:
+                    self._tb_add_scalar("Sparsity/gate_density_ema", self._gate_density_ema)
 
                 # --- Monitor Biological Variables ---
                 self._tb_add_scalar("Genome/BDNF", self.model.genome.bdnf)
                 self._tb_add_scalar("Genome/CREB", self.model.genome.creb)
                 self._tb_add_scalar("Genome/DRD2", self.model.genome.drd2)
                 self._tb_add_scalar("Genome/FKBP5", self.model.genome.fkbp5)
+            
+            if batch_idx % int(self.cfg.sparsity_log_every) == 0:
+                density_ema = self._gate_density_ema if self._gate_density_ema is not None else self._last_gate_density
+                logger.info(
+                    f">>> TRUE SPARSITY @step={step}: gate_density={self._last_gate_density:.4f} "
+                    f"gate_sparsity={self._last_gate_sparsity:.4f} gate_density_ema={density_ema:.4f} "
+                    f"lambda_sparsity={self.model.lambda_sparsity:.6f}"
+                )
 
             # Adaptive Logging: Log at least 5 times per epoch, or every step if tiny
             log_freq = max(1, len(dataloader) // 5)
@@ -945,7 +1438,8 @@ class RRATrainer:
                 omega_state = self._omega_state(self.model.omega)
                 logger.info(f"Epoch {epoch_idx} | Step {batch_idx} | "
                             f"Omega={self.model.omega:.2f} ({omega_state}) | Loss: {loss:.4f} | "
-                            f"Hit Rate: {self._get_hit_rate():.1%} | Time: {elapsed_str}")
+                            f"Hit Rate: {self._get_hit_rate():.1%} | "
+                            f"GateSparse: {self._last_gate_sparsity:.4f} | Time: {elapsed_str}")
             
             # Periodic Auto-Save (Every 100 steps)
             if batch_idx > 0 and batch_idx % 100 == 0:
@@ -1032,12 +1526,248 @@ class RRATrainer:
         # -----------------------------------------------
 
     def _check_ram_health(self):
+        if not bool(getattr(self.model, 'pruning_enabled', True)):
+            return
         cache = self._cache()
         if cache is None:
             return
         usage_gb = cache.memory_usage_gb()
         if usage_gb > (self.max_ram_gb * self.cfg.ram_critical_threshold):
             cache.prune_lru(fraction=self.cfg.ram_prune_fraction)
+
+    def _runtime_toggle_state(self):
+        return {
+            'mes_enabled': bool(self.cfg.mes_enabled),
+            'cache_enabled': bool(getattr(self.model, 'cache_enabled', False)),
+            'episodic_enabled': bool(getattr(self.model, 'episodic_enabled', True)),
+            'pruning_enabled': bool(getattr(self.model, 'pruning_enabled', True)),
+        }
+
+    def _apply_runtime_toggles(self, toggles):
+        if toggles is None:
+            return
+        clean = {
+            'mes_enabled': bool(toggles.get('mes_enabled', self.cfg.mes_enabled)),
+            'cache_enabled': bool(toggles.get('cache_enabled', getattr(self.model, 'cache_enabled', False))),
+            'episodic_enabled': bool(toggles.get('episodic_enabled', getattr(self.model, 'episodic_enabled', True))),
+            'pruning_enabled': bool(toggles.get('pruning_enabled', getattr(self.model, 'pruning_enabled', True))),
+        }
+        self.cfg.mes_enabled = clean['mes_enabled']
+        if hasattr(self.model, 'set_runtime_toggles'):
+            self.model.set_runtime_toggles(
+                mes_enabled=clean['mes_enabled'],
+                cache_enabled=clean['cache_enabled'],
+                episodic_enabled=clean['episodic_enabled'],
+                pruning_enabled=clean['pruning_enabled'],
+            )
+        else:
+            if hasattr(self.model, 'cache_enabled'):
+                self.model.cache_enabled = clean['cache_enabled']
+            if hasattr(self.model, 'mes_cfg'):
+                self.model.mes_cfg.enabled = clean['mes_enabled']
+
+    def _perf_reset(self):
+        if cpp_loader is None:
+            return
+        try:
+            if hasattr(cpp_loader, 'set_perf_counters_enabled'):
+                cpp_loader.set_perf_counters_enabled(True)
+            if hasattr(cpp_loader, 'reset_perf_counters'):
+                cpp_loader.reset_perf_counters()
+        except Exception as e:
+            logger.warning(f">>> Perf counter reset failed: {e}")
+
+    def _perf_snapshot(self):
+        if cpp_loader is None or (not hasattr(cpp_loader, 'get_perf_counters')):
+            return {}
+        try:
+            snap = cpp_loader.get_perf_counters()
+            return dict(snap) if isinstance(snap, dict) else {}
+        except Exception as e:
+            logger.warning(f">>> Perf counter snapshot failed: {e}")
+            return {}
+
+    def _snapshot_for_ablation(self):
+        model_state = {}
+        for name, tensor in self.model.state_dict().items():
+            # Neural cache can be huge; keep ablation snapshots lightweight.
+            if name.startswith('neural_cache.'):
+                continue
+            # Skip volatile index caches whose shapes grow with runtime activity.
+            if name.endswith('_index_cache') or name.endswith('batch_index_cache'):
+                continue
+            model_state[name] = tensor.detach().cpu().clone()
+        return {
+            'model_state': model_state,
+            'optimizer_state': copy.deepcopy(self.optimizer.state_dict()),
+            'global_step': int(self.global_step),
+            'current_phase': int(self.model.current_phase),
+            'omega': float(self.model.omega),
+            'runtime_toggles': self._runtime_toggle_state(),
+            'torch_rng': torch.get_rng_state().cpu(),
+            'numpy_rng': np.random.get_state(),
+            'python_rng': random.getstate(),
+        }
+
+    def _restore_from_ablation(self, snapshot):
+        if snapshot is None:
+            return
+        current_state = self.model.state_dict()
+        loadable = {}
+        dropped_shape = []
+        for k, v in snapshot['model_state'].items():
+            if k not in current_state:
+                continue
+            cv = current_state[k]
+            if isinstance(v, torch.Tensor) and isinstance(cv, torch.Tensor):
+                if tuple(v.shape) != tuple(cv.shape):
+                    dropped_shape.append((k, tuple(v.shape), tuple(cv.shape)))
+                    continue
+            loadable[k] = v
+        if dropped_shape:
+            preview = "; ".join([f"{k}: {old}->{new}" for k, old, new in dropped_shape[:6]])
+            extra = "" if len(dropped_shape) <= 6 else f" (+{len(dropped_shape) - 6} more)"
+            logger.warning(
+                f">>> Ablation restore: dropped {len(dropped_shape)} shape-mismatched state keys. "
+                f"{preview}{extra}"
+            )
+        self.model.load_state_dict(loadable, strict=False)
+        try:
+            self.optimizer.load_state_dict(snapshot['optimizer_state'])
+        except Exception as e:
+            logger.warning(f">>> Ablation restore: optimizer state reload failed ({e}). Using fresh optimizer state.")
+        self.global_step = int(snapshot.get('global_step', self.global_step))
+        self.model.current_phase = int(snapshot.get('current_phase', self.model.current_phase))
+        self.model.omega = float(snapshot.get('omega', self.model.omega))
+        if 'torch_rng' in snapshot:
+            torch.set_rng_state(snapshot['torch_rng'])
+        if 'numpy_rng' in snapshot:
+            np.random.set_state(snapshot['numpy_rng'])
+        if 'python_rng' in snapshot:
+            random.setstate(snapshot['python_rng'])
+        self._apply_runtime_toggles(snapshot.get('runtime_toggles', {}))
+
+    def _quick_val_loss(self, dataloader, max_batches=8):
+        if dataloader is None:
+            return float('inf')
+        self.model.eval()
+        total = 0.0
+        count = 0
+        with torch.no_grad():
+            for xb, tb in dataloader:
+                xb = xb.to(self.device)
+                tb = tb.to(self.device)
+                _, _, out, _, _, _ = self._forward_with_state(xb, require_grad=False)
+                total += float(self.learning_brain.calculate_task_loss(out, tb).item())
+                count += 1
+                if count >= max_batches:
+                    break
+        self.model.train()
+        if count == 0:
+            return float('inf')
+        return total / count
+
+    def run_subsystem_ablations(self, train_loader, val_loader, max_steps=12, val_batches=8):
+        max_steps = max(1, int(max_steps))
+        val_batches = max(1, int(val_batches))
+        baseline_toggles = self._runtime_toggle_state()
+        variants = [
+            ("baseline", {}),
+            ("no_cache", {'cache_enabled': False}),
+            ("no_episodic", {'episodic_enabled': False}),
+            ("no_pruning", {'pruning_enabled': False}),
+            ("no_mes", {'mes_enabled': False}),
+        ]
+        snapshot = self._snapshot_for_ablation()
+        results = []
+
+        logger.info(
+            f">>> Running subsystem ablations: variants={len(variants)}, "
+            f"train_steps={max_steps}, val_batches={val_batches}"
+        )
+
+        for variant_name, override in variants:
+            trial_toggles = dict(baseline_toggles)
+            trial_toggles.update(override)
+            self._restore_from_ablation(snapshot)
+            self._apply_runtime_toggles(trial_toggles)
+            self._perf_reset()
+
+            losses = []
+            step_count = 0
+            start = time.time()
+            trial_failed = None
+
+            for batch_idx, (xb, tb) in enumerate(train_loader):
+                if step_count >= max_steps:
+                    break
+                try:
+                    xb = xb.to(self.device)
+                    tb = tb.to(self.device)
+                    _, _, out, H_next, _, _ = self._forward_with_state(xb, require_grad=False)
+                    loss = float(self.learning_brain.calculate_task_loss(out, tb).item())
+                    if math.isfinite(loss):
+                        losses.append(loss)
+                    if self.cfg.mes_enabled and hasattr(self.model, 'mes_step'):
+                        self.model.mes_step(xb, tb, precomputed_H_next=H_next, dry_run=True)
+                    step_count += 1
+                    self.global_step += 1
+                except Exception as e:
+                    trial_failed = str(e)
+                    logger.warning(f">>> Ablation '{variant_name}' failed at batch {batch_idx}: {e}")
+                    break
+
+            elapsed = max(1e-6, time.time() - start)
+            perf = self._perf_snapshot()
+            total_flops = int(perf.get('total_flops', 0)) if perf else 0
+            val_loss = self._quick_val_loss(val_loader, max_batches=val_batches)
+            avg_train_loss = (sum(losses) / len(losses)) if losses else float('inf')
+            quality = 1.0 / max(val_loss, 1e-8)
+            qpf = quality / max(1.0, float(total_flops))
+            if total_flops <= 0:
+                # Fallback metric if counters are unavailable.
+                qpf = quality / elapsed
+
+            result = {
+                'name': variant_name,
+                'toggles': trial_toggles,
+                'train_loss': avg_train_loss,
+                'val_loss': val_loss,
+                'elapsed_s': elapsed,
+                'flops': total_flops,
+                'quality_per_flop': qpf,
+                'steps': step_count,
+                'failed': trial_failed,
+            }
+            results.append(result)
+            logger.info(
+                f">>> Ablation[{variant_name}] steps={step_count} train_loss={avg_train_loss:.4f} "
+                f"val_loss={val_loss:.4f} flops={total_flops} qpf={qpf:.6e}"
+            )
+
+        baseline = next((r for r in results if r['name'] == 'baseline' and not r['failed']), None)
+        viable = [r for r in results if not r['failed']]
+        if not viable:
+            logger.warning(">>> Ablation: no viable variant. Restoring baseline toggles.")
+            self._restore_from_ablation(snapshot)
+            self._apply_runtime_toggles(baseline_toggles)
+            return {'best': 'baseline', 'results': results}
+
+        if baseline is not None and math.isfinite(baseline['val_loss']):
+            val_cap = baseline['val_loss'] * 1.05
+            filtered = [r for r in viable if math.isfinite(r['val_loss']) and r['val_loss'] <= val_cap]
+            candidates = filtered if filtered else viable
+        else:
+            candidates = viable
+        best = max(candidates, key=lambda r: r['quality_per_flop'])
+
+        self._restore_from_ablation(snapshot)
+        self._apply_runtime_toggles(best['toggles'])
+        logger.info(
+            f">>> Ablation winner: {best['name']} | val_loss={best['val_loss']:.4f} "
+            f"| qpf={best['quality_per_flop']:.6e} | toggles={best['toggles']}"
+        )
+        return {'best': best['name'], 'toggles': best['toggles'], 'results': results}
 
     def _get_hit_rate(self):
         total = self.metrics['hits'] + self.metrics['misses']
@@ -1133,6 +1863,24 @@ class RRATrainer:
                 logger.info(f"Checkpoint Sanitizer: Removing {len(keys_to_remove)} quantization keys (w_q/scale_w)")
                 for k in keys_to_remove:
                     del state_dict[k]
+
+            # Shape sanitizer: skip keys whose tensor shapes no longer match current architecture.
+            model_state = self.model.state_dict()
+            shape_mismatch_keys = []
+            for k in list(state_dict.keys()):
+                if k in model_state:
+                    v = state_dict[k]
+                    mv = model_state[k]
+                    if isinstance(v, torch.Tensor) and isinstance(mv, torch.Tensor) and tuple(v.shape) != tuple(mv.shape):
+                        shape_mismatch_keys.append((k, tuple(v.shape), tuple(mv.shape)))
+                        del state_dict[k]
+            if shape_mismatch_keys:
+                preview = "; ".join([f"{k}: {old}->{new}" for k, old, new in shape_mismatch_keys[:8]])
+                extra = "" if len(shape_mismatch_keys) <= 8 else f" (+{len(shape_mismatch_keys) - 8} more)"
+                logger.warning(
+                    f">>> Checkpoint Sanitizer: Dropping {len(shape_mismatch_keys)} shape-mismatched keys. "
+                    f"{preview}{extra}"
+                )
             
             self.model.load_state_dict(state_dict, strict=False) # tolerate missing legacy keys
             
@@ -1181,12 +1929,95 @@ def parse_args():
         action="store_true",
         help="Run startup preflight checks and exit."
     )
+    parser.add_argument(
+        "--run_ablations",
+        action="store_true",
+        help="Run subsystem ablations (MES/cache/episodic/pruning) and keep the best quality-per-FLOP profile."
+    )
+    parser.add_argument(
+        "--ablation_steps",
+        type=int,
+        default=12,
+        help="Training micro-steps per ablation variant."
+    )
+    parser.add_argument(
+        "--ablation_val_batches",
+        type=int,
+        default=8,
+        help="Validation batches per ablation variant."
+    )
+    parser.add_argument(
+        "--hf_prepare_dataset",
+        action="store_true",
+        help="Prepare data_dir/dataset.txt from a Hugging Face dataset before training."
+    )
+    parser.add_argument(
+        "--hf_dataset",
+        type=str,
+        default="EleutherAI/SmolLM2-135M-10B",
+        help="Hugging Face dataset ID used when --hf_prepare_dataset is enabled."
+    )
+    parser.add_argument(
+        "--hf_dataset_config",
+        type=str,
+        default=None,
+        help="Optional Hugging Face dataset config/subset name."
+    )
+    parser.add_argument(
+        "--hf_split",
+        type=str,
+        default="train",
+        help="Hugging Face split name to stream (default: train)."
+    )
+    parser.add_argument(
+        "--hf_text_column",
+        type=str,
+        default="text",
+        help="Column name containing text to write into dataset.txt."
+    )
+    parser.add_argument(
+        "--hf_max_gb",
+        type=float,
+        default=4.0,
+        help="Target size of generated dataset.txt in GiB (<=0 means no byte cap)."
+    )
+    parser.add_argument(
+        "--hf_max_rows",
+        type=int,
+        default=0,
+        help="Optional row cap while materializing dataset.txt (0 means no row cap)."
+    )
+    parser.add_argument(
+        "--hf_shuffle_buffer",
+        type=int,
+        default=20000,
+        help="Streaming shuffle buffer size for HF materialization (0 disables shuffle)."
+    )
+    parser.add_argument(
+        "--hf_overwrite_dataset",
+        action="store_true",
+        help="Overwrite existing dataset.txt during --hf_prepare_dataset."
+    )
     args, unknown = parser.parse_known_args()
     if unknown:
         logger.warning(f">>> Ignoring unknown CLI arguments: {unknown}")
     if args.max_steps is not None and args.max_steps <= 0:
         logger.warning(">>> --max_steps must be > 0. Ignoring provided value.")
         args.max_steps = None
+    if args.ablation_steps <= 0:
+        logger.warning(">>> --ablation_steps must be > 0. Resetting to 12.")
+        args.ablation_steps = 12
+    if args.ablation_val_batches <= 0:
+        logger.warning(">>> --ablation_val_batches must be > 0. Resetting to 8.")
+        args.ablation_val_batches = 8
+    if args.hf_max_gb is None:
+        args.hf_max_gb = 0.0
+    if args.hf_max_rows < 0:
+        logger.warning(">>> --hf_max_rows must be >= 0. Resetting to 0 (unbounded).")
+        args.hf_max_rows = 0
+    if args.hf_shuffle_buffer < 0:
+        logger.warning(">>> --hf_shuffle_buffer must be >= 0. Resetting to 0.")
+        args.hf_shuffle_buffer = 0
     return args
 
 
@@ -1204,6 +2035,20 @@ def main():
             f"strict_cpu_only is enabled but resolved device is '{DEVICE}'. Check conf/config.yaml runtime.device."
         )
     
+    if args.hf_prepare_dataset:
+        prepare_dataset_txt_from_hf(
+            data_dir=DATA_PATH,
+            dataset_name=args.hf_dataset,
+            dataset_config=args.hf_dataset_config,
+            split=args.hf_split,
+            text_column=args.hf_text_column,
+            max_gb=args.hf_max_gb,
+            max_rows=args.hf_max_rows,
+            shuffle_buffer=args.hf_shuffle_buffer,
+            seed=args.seed,
+            overwrite=args.hf_overwrite_dataset,
+        )
+
     # 1. Dataset Initialization
     train_loader, val_loader = create_dataloaders(DATA_PATH, Config.BATCH_SIZE, Config.SEQ_LEN)
     logger.info(f">>> Loaded dataset from {DATA_PATH} | Train Batches: {len(train_loader)} | Val Batches: {len(val_loader)}")
@@ -1255,6 +2100,17 @@ def main():
     else:
         logger.info(">>> No checkpoint found. Starting from Phase 0 (Stability).")
     trainer.sanitize_model_parameters()
+    if args.run_ablations:
+        ablation_info = trainer.run_subsystem_ablations(
+            train_loader=train_loader,
+            val_loader=val_loader,
+            max_steps=args.ablation_steps,
+            val_batches=args.ablation_val_batches
+        )
+        logger.info(
+            f">>> Ablation complete. Best profile={ablation_info.get('best')} "
+            f"toggles={ablation_info.get('toggles', {})}"
+        )
 
     # 4. Training Loop
     start_epoch = trainer.current_epoch

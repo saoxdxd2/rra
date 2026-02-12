@@ -1527,21 +1527,33 @@ std::vector<torch::Tensor> mes_super_step(
     float* gt_ptr = grad_tables.data_ptr<float>();
     float* loss_ptr = loss_tensor.data_ptr<float>();
 
+    int max_threads = 1;
+    #ifdef _OPENMP
+    max_threads = std::max(1, omp_get_max_threads());
+    #endif
+    const int64_t layer_table_elems = M * RAM;
+    std::vector<float> grad_thread_accum(
+        static_cast<size_t>(std::max(1, max_threads)) * static_cast<size_t>(std::max<int64_t>(1, layer_table_elems)),
+        0.0f
+    );
+
     std::vector<float> h_avg(static_cast<size_t>(B * L * M), 0.0f);
+    const float inv_R = 1.0f / static_cast<float>(std::max<int64_t>(1, R));
     #pragma omp parallel for schedule(static)
     for (int64_t b = 0; b < B; b++) {
         for (int64_t l = 0; l < L; l++) {
-            const int64_t base_bl = (b * L + l) * R * D * C;
+            const int64_t base_bl = (b * L + l) * R * M;
             const int64_t out_bl = (b * L + l) * M;
-            for (int64_t m = 0; m < M; m++) {
-                const int64_t d_idx = m / C;
-                const int64_t c_idx = m % C;
-                float sum_r = 0.0f;
-                for (int64_t r = 0; r < R; r++) {
-                    const int64_t idx = base_bl + r * D * C + d_idx * C + c_idx;
-                    sum_r += h_ptr[idx];
+            float* out_row = h_avg.data() + out_bl;
+            std::fill(out_row, out_row + M, 0.0f);
+            for (int64_t r = 0; r < R; r++) {
+                const float* h_row = h_ptr + base_bl + r * M;
+                for (int64_t m = 0; m < M; m++) {
+                    out_row[m] += h_row[m];
                 }
-                h_avg[out_bl + m] = sum_r / static_cast<float>(R);
+            }
+            for (int64_t m = 0; m < M; m++) {
+                out_row[m] *= inv_R;
             }
         }
     }
@@ -1593,51 +1605,76 @@ std::vector<torch::Tensor> mes_super_step(
         const int64_t T_curr = (l == 0) ? T : 1;
         const float* x_level = (l == 0) ? x_hist.data() : x_single.data();
         const int64_t x_batch_stride = T_curr * M;
+        if (max_threads > 1 && layer_table_elems > 0) {
+            std::fill(grad_thread_accum.begin(), grad_thread_accum.end(), 0.0f);
+        }
 
-        #pragma omp parallel for reduction(+:mse_acc,l1_acc) schedule(static)
-        for (int64_t b = 0; b < B; b++) {
-            const float* xb = x_level + b * x_batch_stride;
-            const float* hb = h_avg.data() + (b * L + l) * M;
-            float* curr_in_b = current_in_last.data() + b * M;
-            const float* tgt_b = target_last.data() + b * M;
+        #pragma omp parallel reduction(+:mse_acc,l1_acc)
+        {
+            int thread_id = 0;
+            #ifdef _OPENMP
+            thread_id = omp_get_thread_num();
+            #endif
+            float* g_local = g_level;
+            if (max_threads > 1 && layer_table_elems > 0) {
+                g_local = grad_thread_accum.data() + static_cast<int64_t>(thread_id) * layer_table_elems;
+            }
 
-            for (int64_t m = 0; m < M; m++) {
-                uint32_t addr = Core::compute_ram_address(
-                    xb,
-                    d_level + m * K,
-                    c_level + m * K,
-                    static_cast<int>(T_curr - 1),
-                    static_cast<int>(T_curr),
-                    static_cast<int>(M),
-                    static_cast<int>(K),
-                    static_cast<int>(M),
-                    1
-                );
-                int64_t slot = static_cast<int64_t>(addr) % RAM;
-                if (slot < 0) slot += RAM;
+            #pragma omp for schedule(static)
+            for (int64_t b = 0; b < B; b++) {
+                const float* xb = x_level + b * x_batch_stride;
+                const float* hb = h_avg.data() + (b * L + l) * M;
+                float* curr_in_b = current_in_last.data() + b * M;
+                const float* tgt_b = target_last.data() + b * M;
 
-                float u_ff = t_level[m * RAM + slot];
-                float v_curr = hb[m];
-                float v_next = lif_decay * v_curr + u_ff;
-                float s = (v_next > lif_threshold) ? 1.0f : 0.0f;
-                float target = tgt_b[m];
-                float diff = s - target;
+                for (int64_t m = 0; m < M; m++) {
+                    uint32_t addr = Core::compute_ram_address(
+                        xb,
+                        d_level + m * K,
+                        c_level + m * K,
+                        static_cast<int>(T_curr - 1),
+                        static_cast<int>(T_curr),
+                        static_cast<int>(M),
+                        static_cast<int>(K),
+                        static_cast<int>(M),
+                        1
+                    );
+                    int64_t slot = static_cast<int64_t>(addr) % RAM;
+                    if (slot < 0) slot += RAM;
 
-                mse_acc += static_cast<double>(diff * diff) * static_cast<double>(R);
-                l1_acc += static_cast<double>(std::abs(s)) * static_cast<double>(R);
+                    const int64_t table_idx = m * RAM + slot;
+                    float u_ff = t_level[table_idx];
+                    float v_curr = hb[m];
+                    float v_next = lif_decay * v_curr + u_ff;
+                    float s = (v_next > lif_threshold) ? 1.0f : 0.0f;
+                    float target = tgt_b[m];
+                    float diff = s - target;
 
-                float grad_s = (2.0f * diff) * inv_N;
-                if (s > 0.0f) {
-                    grad_s += l1_weight * inv_N;
+                    mse_acc += static_cast<double>(diff * diff) * static_cast<double>(R);
+                    l1_acc += static_cast<double>(std::abs(s)) * static_cast<double>(R);
+
+                    float grad_s = (2.0f * diff) * inv_N;
+                    if (s > 0.0f) {
+                        grad_s += l1_weight * inv_N;
+                    }
+                    float v_norm = v_next / lif_thr_safe;
+                    float surrogate = std::max(0.0f, 1.0f - std::abs(v_norm));
+                    float g = grad_s * surrogate;
+
+                    g_local[table_idx] += g;
+                    curr_in_b[m] = s;
                 }
-                float v_norm = v_next / lif_thr_safe;
-                float surrogate = std::max(0.0f, 1.0f - std::abs(v_norm));
-                float g = grad_s * surrogate;
+            }
+        }
 
-                #pragma omp atomic
-                g_level[m * RAM + slot] += g;
-
-                curr_in_b[m] = s;
+        if (max_threads > 1 && layer_table_elems > 0) {
+            #pragma omp parallel for schedule(static)
+            for (int64_t idx = 0; idx < layer_table_elems; idx++) {
+                float sum = 0.0f;
+                for (int th = 0; th < max_threads; th++) {
+                    sum += grad_thread_accum[static_cast<int64_t>(th) * layer_table_elems + idx];
+                }
+                g_level[idx] += sum;
             }
         }
 
@@ -2159,6 +2196,9 @@ std::vector<at::Tensor> _fused_cognitive_cycle_impl(
     float* hp_ptr = halt_probs.data_ptr<float>();
     float* out_ptr = output.data_ptr<float>();
     bool* conv_ptr = converged.data_ptr<bool>();
+    (void)hw_ptr;
+    (void)hb_ptr;
+    (void)hp_ptr;
     
     int total_steps = (int)(H_cycles * L_cycles);
 
@@ -2187,6 +2227,17 @@ std::vector<at::Tensor> _fused_cognitive_cycle_impl(
         );
         ram_slot_cache[static_cast<size_t>(idx)] = static_cast<int32_t>(addr % static_cast<uint32_t>(ram_size));
     }
+
+    std::vector<std::vector<int>> active_regions(static_cast<size_t>(L));
+    for (int l = 0; l < L; l++) {
+        auto& active = active_regions[static_cast<size_t>(l)];
+        active.reserve(static_cast<size_t>(R));
+        for (int r = 0; r < R; r++) {
+            if (m_ptr[l * R + r] >= 0.5f) {
+                active.push_back(r);
+            }
+        }
+    }
     
     #pragma omp parallel
     {
@@ -2198,18 +2249,22 @@ std::vector<at::Tensor> _fused_cognitive_cycle_impl(
             s_spikes.resize(M);
         }
         
-        #pragma omp for schedule(dynamic)
+        #pragma omp for schedule(static)
         for (int b = 0; b < B; b++) {
             // Base offset for this batch
-            int batch_offset = b * L * R * M;
+            const int64_t batch_offset = static_cast<int64_t>(b) * static_cast<int64_t>(L) * static_cast<int64_t>(R) * static_cast<int64_t>(M);
             
             for (int step = 0; step < total_steps; step++) {
-                if (conv_ptr[b]) continue;
+                if (conv_ptr[b]) break;
                 
                 float max_delta = 0.0f;
                 
                 for (int l = 0; l < L; l++) {
-                    int layer_offset = batch_offset + l * R * M;
+                    const auto& active_rs = active_regions[static_cast<size_t>(l)];
+                    if (active_rs.empty()) {
+                        continue;
+                    }
+                    const int64_t layer_offset = batch_offset + static_cast<int64_t>(l) * static_cast<int64_t>(R) * static_cast<int64_t>(M);
                 
                     // 1. Average State (Across R)
                     for (int m = 0; m < M; m++) {
@@ -2232,12 +2287,10 @@ std::vector<at::Tensor> _fused_cognitive_cycle_impl(
                     }
                     
                     // 3. Update State (Decay + Spike Injection)
-                    for (int r = 0; r < R; r++) {
-                        float gate_val = m_ptr[l * R + r]; 
-                        if (gate_val < 0.5f) continue;
-                        
-                        int state_base = layer_offset + r * M;
-                        int decay_base = l * R * M + r * M; 
+                    for (size_t ri = 0; ri < active_rs.size(); ri++) {
+                        int r = active_rs[ri];
+                        const int64_t state_base = layer_offset + static_cast<int64_t>(r) * static_cast<int64_t>(M);
+                        const int64_t decay_base = static_cast<int64_t>(l) * static_cast<int64_t>(R) * static_cast<int64_t>(M) + static_cast<int64_t>(r) * static_cast<int64_t>(M); 
                         
                         for (int m = 0; m < M; m++) {
                             float s = s_spikes[m];
@@ -2261,19 +2314,19 @@ std::vector<at::Tensor> _fused_cognitive_cycle_impl(
         }
     }
     
-    // Output aggregation
-    const int64_t out_blocks = static_cast<int64_t>(B) * static_cast<int64_t>(R);
+    // Output aggregation (sum over layers, then average).
+    const float inv_L = 1.0f / static_cast<float>(std::max(1, L));
+    const int64_t out_blocks = static_cast<int64_t>(B) * static_cast<int64_t>(R) * static_cast<int64_t>(M);
     #pragma omp parallel for schedule(static)
     for (int64_t idx = 0; idx < out_blocks; idx++) {
-        const int b = static_cast<int>(idx / R);
-        const int r = static_cast<int>(idx % R);
-        for (int i = 0; i < M; i++) {
-            float sum = 0.0f;
-            for (int l = 0; l < L; l++) {
-                sum += h_ptr[b * L * R * M + l * R * M + r * M + i];
-            }
-            out_ptr[b * R * M + r * M + i] = sum / (float)L;
+        const int b = static_cast<int>(idx / (static_cast<int64_t>(R) * M));
+        const int rm = static_cast<int>(idx % (static_cast<int64_t>(R) * M));
+        float sum = 0.0f;
+        const int64_t base = static_cast<int64_t>(b) * static_cast<int64_t>(L) * static_cast<int64_t>(R) * static_cast<int64_t>(M) + static_cast<int64_t>(rm);
+        for (int l = 0; l < L; l++) {
+            sum += h_ptr[base + l * R * M];
         }
+        out_ptr[b * R * M + rm] = sum * inv_L;
     }
 
     const long double b_ld = static_cast<long double>(B);

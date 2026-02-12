@@ -113,6 +113,14 @@ class Config:
     NEURAL_CACHE_ENABLED = bool(_CONFIG_DATA.get('model', {}).get('neural_cache_enabled', False))
     USE_FUSED_COGNITIVE_CYCLE = bool(_CONFIG_DATA.get('model', {}).get('use_fused_cognitive_cycle', True))
     USE_FORWARD_STACK = bool(_CONFIG_DATA.get('model', {}).get('use_forward_stack', True))
+    LGH_ENABLED = bool(_CONFIG_DATA.get('model', {}).get('lgh_enabled', True))
+    LGH_REPLACE_FORWARD_STACK = bool(_CONFIG_DATA.get('model', {}).get('lgh_replace_forward_stack', True))
+    LGH_CURVE_LENGTH = int(_CONFIG_DATA.get('model', {}).get('lgh_curve_length', 96))
+    LGH_CURVE_WRAP = bool(_CONFIG_DATA.get('model', {}).get('lgh_curve_wrap', True))
+    LGH_MASK_MIN_KEEP = float(_CONFIG_DATA.get('model', {}).get('lgh_mask_min_keep', 0.10))
+    LGH_MASK_MAX_KEEP = float(_CONFIG_DATA.get('model', {}).get('lgh_mask_max_keep', 0.90))
+    LGH_MORTON_DEPTH = int(_CONFIG_DATA.get('model', {}).get('lgh_morton_depth', 1))
+    LGH_PREFETCH_DISTANCE = int(_CONFIG_DATA.get('model', {}).get('lgh_prefetch_distance', 2))
     AUDIT_PERIOD_STEPS = int(_CONFIG_DATA.get('model', {}).get('audit_period_steps', 25))
     AUDIT_RANDOM_PROB = float(_CONFIG_DATA.get('model', {}).get('audit_random_prob', 0.01))
     # Hierarchical Predictive Coding (HPC)
@@ -213,6 +221,13 @@ class Config:
     TORCH_NUM_THREADS = int(_CONFIG_DATA.get('runtime', {}).get('torch_num_threads', 0))
     TORCH_INTEROP_THREADS = int(_CONFIG_DATA.get('runtime', {}).get('torch_interop_threads', 0))
     CPP_OMP_THREADS = int(_CONFIG_DATA.get('runtime', {}).get('cpp_omp_threads', 0))
+    OMEGA_STEP_UPDATE_EVERY = int(_CONFIG_DATA.get('runtime', {}).get('omega_step_update_every', 250))
+    GENOME_STEP_UPDATE_EVERY = int(_CONFIG_DATA.get('runtime', {}).get('genome_step_update_every', 5000))
+    TRAIN_LOSS_EMA_DECAY = float(_CONFIG_DATA.get('runtime', {}).get('train_loss_ema_decay', 0.98))
+    SPARSITY_LOG_EVERY = int(_CONFIG_DATA.get('runtime', {}).get('sparsity_log_every', 50))
+    LGH_THERMAL_FREQ_MIN_GHZ = float(_CONFIG_DATA.get('runtime', {}).get('lgh_thermal_freq_min_ghz', 3.0))
+    LGH_THERMAL_EMA_DECAY = float(_CONFIG_DATA.get('runtime', {}).get('lgh_thermal_ema_decay', 0.95))
+    LGH_THERMAL_PENALTY_WEIGHT = float(_CONFIG_DATA.get('runtime', {}).get('lgh_thermal_penalty_weight', 0.25))
     RUNTIME_DEVICE = str(_CONFIG_DATA.get('runtime', {}).get('device', 'auto')).lower()
     STRICT_CPU_ONLY = bool(_CONFIG_DATA.get('runtime', {}).get('strict_cpu_only', True))
     VIRTUAL_LAB_ENABLED = bool(_CONFIG_DATA.get('runtime', {}).get('virtual_lab_enabled', False))
@@ -222,12 +237,20 @@ class Config:
     # Global Constants
     if STRICT_CPU_ONLY:
         DEVICE = torch.device('cpu')
+        print(">>> Device: CPU (Strict)")
     else:
         if RUNTIME_DEVICE in ('cpu', 'cuda'):
             if RUNTIME_DEVICE == 'cuda' and not torch.cuda.is_available():
                 DEVICE = torch.device('cpu')
+                print(">>> Device: CPU (CUDA requested but not available)")
             else:
                 DEVICE = torch.device(RUNTIME_DEVICE)
-        else:
-            DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+                print(f">>> Device: {DEVICE}")
+        else: # 'auto'
+            if torch.cuda.is_available():
+                DEVICE = torch.device('cuda')
+                print(">>> Device: CUDA (Auto-detected)")
+            else:
+                DEVICE = torch.device('cpu')
+                print(">>> Device: CPU (Auto-fallback)")
 

@@ -11,7 +11,7 @@ def _require_cpp_ademamix(*tensors):
         raise RuntimeError("AdEMAMix requires the cpp_loader extension (no Python fallback).")
     if not ACCEL.has('ademamix_update'):
         raise RuntimeError("AdEMAMix requires C++ op 'ademamix_update'.")
-    if not ACCEL.ready(*tensors):
+    if not ACCEL.ready('ademamix_update', *tensors):
         raise RuntimeError("AdEMAMix requires CPU tensors for C++ execution.")
 
 def adaptive_gradient_clip(model, clip_factor=0.1, eps=1e-3):

@@ -20,7 +20,7 @@ cpp_loader = _ACCEL.loader
 
 
 def _cpp_ready(*tensors):
-    return _ACCEL.ready(*tensors)
+    return _ACCEL.ready(None, *tensors)
 
 
 def _cpp_has(op_name, *tensors):
@@ -200,20 +200,21 @@ class VirtualLab:
             return
 
         cpu_usage = self.process.cpu_percent()
-        ram_usage = self.process.memory_info().rss / (1024 * 1024 * 1024) # GB
+        ram_usage = self.process.memory_info().rss / 1e9 # GB
 
         entry = {}
         for k, v in data.items():
             if isinstance(v, torch.Tensor):
                 if v.numel() == 1:
-                    entry[k] = v.detach().cpu().item()
+                    entry[k] = float(v.item())
                 elif k == 'mask':
-                    sparsity = 1.0 - (v > Config.SPARSITY_THRESHOLD).float().mean().item()
-                    entry['mask_sparsity'] = sparsity
-                elif k == 'ram_addresses':
+                    # Only compute sparsity if we are logging OS metrics
+                    entry['mask_sparsity'] = 1.0 - (v > Config.SPARSITY_THRESHOLD).float().mean().item()
+                elif k == 'ram_addresses' and self.step_count % 100 == 0:
                     entry['ram_addresses'] = v.detach().cpu()
             elif isinstance(v, (int, float, bool)):
                 entry[k] = float(v)
+        
         entry['timestamp'] = time.time()
         entry['step'] = self.step_count
         entry['os_cpu_percent'] = cpu_usage
@@ -223,14 +224,13 @@ class VirtualLab:
         for k, v in entry.items():
             if isinstance(v, (int, float)):
                 self.writer.add_scalar(f"VirtualLab/{k}", v, self.step_count)
-        if self._noise_step >= 0:
-            recovery_age = self.step_count - self._noise_step
-            if 'H' in data:
-                h_norm = data['H'].norm().item() / (data['H'].shape[0] ** 0.5)
-                entry['recovery_norm'] = h_norm
+        
+        if self._noise_step >= 0 and 'H' in data:
+            entry['recovery_norm'] = data['H'].norm().item() / (data['H'].shape[0] ** 0.5)
+            
         self.logs.append(entry)
-        if len(self.logs) >= Config.MAX_LOG_ENTRIES:
-            self.logs = self.logs[-(Config.MAX_LOG_ENTRIES - 1):]
+        if len(self.logs) > Config.MAX_LOG_ENTRIES:
+            self.logs.pop(0)
         self._bench_cache_key = None
 
 
@@ -341,77 +341,13 @@ class VirtualLab:
         return result
 
 # ---------------------------
-# Spiking & Weightless Layers
+# Spiking & Weightless Layers (C++ ACCELERATED)
 # ---------------------------
 
-class SurrogateHeaviside(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x):
-        ctx.save_for_backward(x)
-        return (x > 0).float()
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        x, = ctx.saved_tensors
-        # Triangular surrogate: grad is 1 if |x| < 1, else 0
-        grad_input = grad_output.clone()
-        return grad_input * (1.0 - torch.abs(x)).clamp(min=0)
-
-spike = SurrogateHeaviside.apply
-
-# --- CUSTOM AUTOGRAD FOR C++ KERNELS (Enables gradient flow through C++) ---
-def _compute_ram_addresses(x_seq, delays, connections, current_t):
-    """Compute RAM addresses for DCLS lookup."""
-    return _cpp_try(
-        'dcls_ram_addresses',
-        x_seq, delays, connections, int(current_t),
-        tensors=(x_seq, delays, connections)
-    )
+# Multi-layer RAM lookups are handled by fused C++ kernels (forward_stack_io).
 
 
-class DCLSFunction(torch.autograd.Function):
-    """
-    Custom autograd wrapper for C++ dcls_ram_lookup.
-    Uses straight-through estimator for backward pass.
-    """
-    @staticmethod
-    def forward(ctx, x_seq, delays, ram_tables, connections, current_t):
-        # Store for backward pass
-        need_addr = torch.is_grad_enabled() and (x_seq.requires_grad or ram_tables.requires_grad)
-        if need_addr:
-            addresses = _compute_ram_addresses(x_seq, delays, connections, current_t)
-        else:
-            addresses = torch.empty(0, dtype=torch.long, device=x_seq.device)
-        ctx.save_for_backward(x_seq, delays, connections, addresses)
-        ctx.current_t = current_t
-        ctx.ram_size = int(ram_tables.size(1))
-        
-        return _cpp_try(
-            'dcls_ram_lookup',
-            x_seq, delays, ram_tables, connections, current_t,
-            tensors=(x_seq, delays, ram_tables, connections)
-        )
-    
-    @staticmethod
-    def backward(ctx, grad_output):
-        x_seq, delays, connections, addresses = ctx.saved_tensors
-        need_grad_x = bool(ctx.needs_input_grad[0])
-        need_grad_tables = bool(ctx.needs_input_grad[2])
-
-        if need_grad_tables and addresses.numel() == 0:
-            addresses = _compute_ram_addresses(x_seq, delays, connections, ctx.current_t)
-
-        if not _cpp_has('dcls_backward', x_seq, delays, connections, grad_output, addresses):
-            raise RuntimeError("Missing required C++ op 'dcls_backward' for DCLSFunction.backward.")
-        grad_x_cpp, grad_tables_cpp = cpp_loader.dcls_backward(
-            x_seq, delays, connections,
-            grad_output.contiguous(), addresses.contiguous(),
-            int(ctx.current_t), int(ctx.ram_size),
-            need_grad_x, need_grad_tables
-        )
-        grad_x = grad_x_cpp if need_grad_x else None
-        grad_tables = grad_tables_cpp if need_grad_tables else None
-        return grad_x, None, grad_tables, None, None
+# --- RAM Parameter Storage ---
 
 
 class VNNILinear(nn.Module):
@@ -496,82 +432,11 @@ class RAMTupleLayer(nn.Module):
         self.ram_tables_q.copy_(q)
         self._quantized_valid = True
 
-    def fused_forward(self, x_seq, current_t, v_prev, lif_decay, lif_threshold):
-        """
-        Fused LIF + RAM path for maximum speed.
-        Returns: (spikes, v_next)
-        """
-        if torch.is_grad_enabled():
-            raise RuntimeError("fused_forward requires no-grad mode with C++ kernel.")
-        return _cpp_try(
-            'fused_lif_ram_lookup',
-            x_seq, v_prev, self.delays, self.ram_tables, self.connections,
-            float(lif_decay), float(lif_threshold), int(current_t),
-            tensors=(x_seq, v_prev, self.delays, self.ram_tables, self.connections)
-        )
+    def forward(self, *args, **kwargs):
+        """RAMTupleLayer.forward is bypassed; reasoning core must use forward_stack_io kernel."""
+        raise RuntimeError("RAMTupleLayer.forward is bypassed; use forward_stack_io.")
 
-    def rewire_on_surprise(self, surprise_mask):
-        """
-        Homeostatic Structural Rewiring:
-        Surgically move connections from useless RAM tables to 
-        high-surprise pathways.
-        """
-        with torch.no_grad():
-            M, K = self.connections.shape
-            # Identify high-surprise indices to rewire TO
-            hot_indices = (surprise_mask > Config.SURPRISE_REWIRE_THRESHOLD).nonzero(as_tuple=False).flatten()
-            if hot_indices.numel() == 0: return
-            
-            # Identify dead tables to rewire FROM
-            rewire_fraction = 0.01
-            num_rewire = max(1, int(M * rewire_fraction))
-            dead_indices = torch.randint(0, M, (num_rewire,), device=self.device)
-            
-            # Sample new assignments from the 'good' connections
-            good_wiring_pool = self.connections[hot_indices % M].flatten()
-            if good_wiring_pool.numel() > 0:
-                indices = torch.randint(0, good_wiring_pool.size(0), (num_rewire, K), device=self.device)
-                new_wiring = good_wiring_pool[indices]
-                self.connections[dead_indices] = new_wiring
-                # Reset metabolic state for these engrams
-                self.ram_tables.data[dead_indices] *= 0.1
-
-    def forward(self, x_seq, current_t):
-        """Forward pass using C++ dcls_ram_lookup kernel with autograd support."""
-        if self.training:
-            self._quantized_valid = False
-        use_int8 = (
-            (not self.training)
-            and (not torch.is_grad_enabled())
-            and self.ram_int8_infer
-            and _cpp_has(
-                'dcls_ram_lookup_int8',
-                x_seq, self.delays, self.ram_tables_q, self.ram_scales, self.connections
-            )
-        )
-        if use_int8:
-            if not self._quantized_valid:
-                self._refresh_quantized_tables()
-            return _cpp_try(
-                'dcls_ram_lookup_int8',
-                x_seq, self.delays, self.ram_tables_q, self.ram_scales, self.connections, int(current_t),
-                tensors=(x_seq, self.delays, self.ram_tables_q, self.ram_scales, self.connections)
-            )
-        return DCLSFunction.apply(x_seq, self.delays, self.ram_tables, self.connections, current_t)
-
-class LIF(nn.Module):
-    def __init__(self, dim, decay=0.9, threshold=1.0, device=DEVICE):
-        super().__init__()
-        self.dim = dim
-        self.decay = decay
-        self.threshold = threshold
-        self.device = device
-
-    def forward(self, x, v_prev):
-        v_next = self.decay * v_prev + x
-        s = spike(v_next / self.threshold)
-        v_next = v_next * (1.0 - s)
-        return s, v_next
+# Spiking logic is handled by C++ kernels (fused_lif_ram_lookup / forward_stack_io).
 
 class BaseCognitiveModule(nn.Module):
     """Shared tensor/device plumbing for cognitive modules."""
@@ -604,29 +469,13 @@ class BaseCognitiveModule(nn.Module):
             if isinstance(t, torch.Tensor) and t.device.type != 'cpu':
                 raise RuntimeError(f"Tensor at position {idx} must be on CPU for this path.")
 
+# BaseOrganismLayer removed; utilities moved to BaseCognitiveModule.
 
-class BaseOrganismLayer(BaseCognitiveModule):
-    def __init__(self, R, D, C, device=DEVICE):
+
+class OrganismLevel(BaseCognitiveModule):
+    def __init__(self, R, D, C, device=DEVICE, cfg=Config):
         super().__init__(device=device)
         self.R, self.D, self.C = R, D, C
-
-    @staticmethod
-    def _is_fully_masked(mask):
-        return mask is not None and (not bool(mask.any().item()))
-
-    def _lif_spikes(self, wsnn_out, h_prev):
-        B = h_prev.size(0)
-        h_prev_flat = h_prev.reshape(B, self.R, self.D * self.C).mean(dim=1)
-        v_next = self.lif.decay * h_prev_flat + wsnn_out
-        return spike(v_next / self.lif.threshold)
-
-    def _expand_spikes(self, spikes, batch_size):
-        return spikes.reshape(batch_size, 1, self.D, self.C).expand(-1, self.R, -1, -1)
-
-
-class OrganismLevel(BaseOrganismLayer):
-    def __init__(self, R, D, C, device=DEVICE, cfg=Config):
-        super().__init__(R, D, C, device=device)
         self.cfg = cfg
         
         # Transparency Gate: O(1) engagement prediction
@@ -635,74 +484,25 @@ class OrganismLevel(BaseOrganismLayer):
         self.h_decay_rate = self.cfg.BYPASS_H_DECAY  # Light memory decay during bypass
         
         self.wsnn = RAMTupleLayer(M=D*C, K=8, D_in=D*C, device=device)
-        self.delrec_delays = nn.Parameter(torch.rand(D*C, device=device) * self.cfg.DELREC_INIT_MAX)
-        self.lif = LIF(D*C, decay=self.cfg.LIF_DECAY, threshold=self.cfg.LIF_THRESHOLD, device=device)
-        self.raw_decay = nn.Parameter(torch.randn(R, D * C) * self.cfg.DECAY_INIT_SCALE + self.cfg.DECAY_INIT_OFFSET)
         self.halt_head = VNNILinear(D * C, 1).to(device)
-        
         self.firing_rate_ema = torch.tensor(0.5, device=device)
         
-        # MES: Local state for C++ optimizer
+        # Decay Parameter: Learned scalar per block, initialized for stability
+        self.raw_decay = nn.Parameter(
+            (torch.randn(self.R, 1, device=device) * self.cfg.DECAY_INIT_SCALE) 
+            + self.cfg.DECAY_INIT_OFFSET
+        )
+        
+        # MES state for C++ optimizer (batched_ademamix_update)
         if self.cfg.MES_ENABLED:
             self.register_buffer('m_fast', torch.zeros_like(self.wsnn.ram_tables))
             self.register_buffer('m_slow', torch.zeros_like(self.wsnn.ram_tables))
             self.register_buffer('v_opt', torch.zeros_like(self.wsnn.ram_tables))
             self.register_buffer('_zero_grad_ram', torch.zeros_like(self.wsnn.ram_tables))
             self.opt_step = 1
-            
-            # Use AdEMAMix for local updates (Fixing Optimizer Drift)
-            self.local_optimizer = AdEMAMix(
-                self.parameters(), 
-                lr=self.cfg.LEARNING_RATE, 
-                beta1_fast=0.9, 
-                beta1_slow=0.999, 
-                beta2=0.999, 
-                alpha=5.0
-            )
 
-    def forward(self, x_seq, h_prev, cos_sin=None, mask=None, mode='parallel', learning_brain=None):
-        """
-        Forward pass using C++ dcls_ram_lookup with autograd support for MES training.
-        """
-        B, T = x_seq.shape[0], x_seq.shape[1]
-        
-        # Skip if fully masked
-        if self._is_fully_masked(mask):
-            return torch.zeros_like(x_seq), h_prev, torch.zeros(B, T, 1, device=self.device)
-        
-        # Prefer fused RMS+mean kernel to minimize Python/Torch overhead per level step.
-        x_flat = fused_rms_mean(x_seq)
-        wsnn_out = self.wsnn(x_flat, T - 1)
-        s = self._lif_spikes(wsnn_out, h_prev)
-        
-        # Reshape to [B, R, D, C]
-        h_next = self._expand_spikes(s, B)
-        if mask is not None:
-            h_next = h_next * mask
-            
-        y = h_next.unsqueeze(1)  # [B, 1, R, D, C]
-        p_halt = torch.sigmoid(self.halt_head(s)).unsqueeze(1)  # [B, 1, 1]
-        return y, h_next, p_halt
-
-    def local_mes_update(self, current_output, target_signal):
-        """
-        MES ENGINE: Local NoProp Denoising Update.
-        Using AdEMAMix for consistency.
-        """
-        if not self.cfg.MES_ENABLED: return 0.0
-        
-        if not hasattr(self, 'local_optimizer'):
-             return 0.0
-
-        self.local_optimizer.zero_grad()
-        # Denoising Loss: MSE between current local engram and the target signal
-        loss_local = F.mse_loss(current_output, target_signal.detach())
-        # Penalize non-sparse activations (Metabolic Hunger)
-        loss_local += 0.01 * current_output.abs().mean()
-        
-        loss_local.backward()
-        self.local_optimizer.step()
-        return loss_local.item()
+    def forward(self, *args, **kwargs):
+        raise RuntimeError("OrganismLevel.forward is bypassed; reasoning core must use forward_stack_io kernel.")
 
 class SurvivalController:
     """Pruning controller with C++ accelerated update and mask generation."""
@@ -983,12 +783,28 @@ class CognitiveOrganism(BaseCognitiveModule):
                 lr=self.cfg.LEARNING_RATE * self.cfg.LOCAL_LR_RATIO
             )
         
+        # Cache config values to avoid self.cfg/self.runtime_cfg getattr overhead in hot path
+        self.cfg_mes_enabled = bool(Config.MES_ENABLED)
+        self.cfg_cache_enabled = bool(Config.NEURAL_CACHE_ENABLED)
+        self.cfg_episodic_enabled = True
+        self.cfg_pruning_enabled = True
+        self.cfg_h_cycles = int(Config.H_CYCLES)
+        self.cfg_l_cycles = int(Config.L_CYCLES)
+        self.cfg_dissonance_penalty = float(Config.DISSONANCE_PENALTY)
+        self.cfg_dissonance_threshold = float(Config.DISSONANCE_CONFIDENCE_THRESHOLD)
+        self.cfg_metabolic_tax_rate = float(Config.METABOLIC_TAX_RATE)
+        self.cfg_halt_threshold = float(Config.HALT_THRESHOLD)
+        self.cfg_param_cost_scale = float(Config.PARAM_COST_SCALE)
+        self.cfg_lif_decay = float(Config.LIF_DECAY)
+        self.cfg_lif_threshold = float(Config.LIF_THRESHOLD)
+        
         # Pre-allocate contiguous state buffer (System 2 States)
         self.max_batch_size = Config.BATCH_SIZE
         self.H_buffer = torch.zeros(
             self.max_batch_size, L, R, self.d_s2, C, 
             device=device
         ).contiguous()
+        self.register_buffer('byte_bit_shifts', torch.arange(8, device=device).view(1, 1, -1))
         
         self.rope = RotaryEmbedding(self.d_s2 * C, device=device)
         self.survival = SurvivalController(L, R, device=self.device)
@@ -1009,8 +825,8 @@ class CognitiveOrganism(BaseCognitiveModule):
         )
         self.memory_governor = MemoryGovernor(dim=self.d_s2 * C, device=self.device)
         self.memory_governor_predictor = self.memory_governor.predictor
-        self.H_cycles = self.cfg.H_CYCLES
-        self.L_cycles = self.cfg.L_CYCLES
+        self.H_cycles = self.cfg_h_cycles
+        self.L_cycles = self.cfg_l_cycles
         self.current_phase = 0
         self.register_buffer('step_counter', torch.zeros(1))
         self._current_engagement_rate = torch.tensor(1.0, device=self.device)
@@ -1033,6 +849,8 @@ class CognitiveOrganism(BaseCognitiveModule):
         self.register_buffer('_last_surprise_cycle_scale', torch.tensor(1.0, dtype=torch.float32, device=self.device))
         self.register_buffer('_last_temporal_signal', torch.tensor(1.0, dtype=torch.float32, device=self.device))
         self.register_buffer('_last_temporal_cycle_scale', torch.tensor(1.0, dtype=torch.float32, device=self.device))
+        self.episodic_enabled = True
+        self.pruning_enabled = True
         
         # Parameter Stacking Cache (For C++ Fusion)
         self._stacked_params = None
@@ -1150,7 +968,10 @@ class CognitiveOrganism(BaseCognitiveModule):
         delays = torch.stack([level.wsnn.delays for level in self.levels])       # [L, M, K]
         tables = torch.stack([level.wsnn.ram_tables for level in self.levels])   # [L, M, 2^K]
         conns = torch.stack([level.wsnn.connections for level in self.levels])   # [L, M, K]
-        decays = torch.stack([level.raw_decay.view(self.R, -1) for level in self.levels])  # [L, R, D*C]
+        decays_raw = torch.stack([level.raw_decay.view(self.R, -1) for level in self.levels])  # [L, R, D*C]
+        # Stability: recurrent decay must stay in (0, 1) for bounded state dynamics.
+        decays = torch.sigmoid(decays_raw)
+        decays = torch.nan_to_num(decays, nan=0.9, posinf=0.999, neginf=1e-4).clamp(1e-4, 0.999)
         halt_w = torch.stack([level.halt_head.weight.view(-1) for level in self.levels])  # [L, D*C]
         halt_b = torch.cat([level.halt_head.bias for level in self.levels])              # [L]
         
@@ -1191,8 +1012,8 @@ class CognitiveOrganism(BaseCognitiveModule):
             p_stack['decays'], p_stack['halt_w'], p_stack['halt_b']
         ]
         self._forward_stack_scalars[0] = 0.0
-        self._forward_stack_scalars[1] = self.runtime_cfg.lif_decay
-        self._forward_stack_scalars[2] = self.runtime_cfg.lif_threshold
+        self._forward_stack_scalars[1] = self.cfg_lif_decay
+        self._forward_stack_scalars[2] = self.cfg_lif_threshold
         self._forward_stack_scalars[3] = float(dyn_threshold)
         self._forward_stack_scalars[4] = float(max(1, int(l_cycles)))
         out_io = self._cpp_io_call(
@@ -1347,7 +1168,7 @@ class CognitiveOrganism(BaseCognitiveModule):
         
         print(f">>> Phenotype Updated (Gen {self.genome.generation}): CREB={creb:.2f} (Stab={self.survival.gamma:.3f}), "
               f"DRD2={drd2:.2f} (Conf={self.confidence_multiplier:.2f}), "
-              f"FKBP5={fkbp5:.2f} (Sparsity={self.lambda_sparsity:.3f}, Thresh={self.metabolic_threshold:.3f})")
+              f"FKBP5={fkbp5:.2f} (Sparsity={self.lambda_sparsity:.6f}, Thresh={self.metabolic_threshold:.6f})")
         print(f">>> GABA={gaba:.2f} (Inhibition) | Energy Factor={energy_factor:.2f} -> LR={self.suggested_lr:.2e} | Omega_mom={self.omega_momentum:.4f}")
 
     def get_engagement_rate(self):
@@ -1357,9 +1178,27 @@ class CognitiveOrganism(BaseCognitiveModule):
         return self._current_engagement_rate
 
     def _cache(self):
-        if not self.cache_enabled:
+        if not self.cfg_cache_enabled:
             return None
         return self.neural_cache
+
+    def set_runtime_toggles(self, *, mes_enabled=None, cache_enabled=None, episodic_enabled=None, pruning_enabled=None):
+        if mes_enabled is not None:
+            enabled = bool(mes_enabled)
+            self.mes_cfg.enabled = enabled
+            self.cfg_mes_enabled = enabled
+        if cache_enabled is not None:
+            enabled = bool(cache_enabled)
+            self.cache_enabled = enabled
+            self.cfg_cache_enabled = enabled
+        if episodic_enabled is not None:
+            enabled = bool(episodic_enabled)
+            self.episodic_enabled = enabled
+            self.cfg_episodic_enabled = enabled
+        if pruning_enabled is not None:
+            enabled = bool(pruning_enabled)
+            self.pruning_enabled = enabled
+            self.cfg_pruning_enabled = enabled
 
     def _clear_cache_trace(self):
         self._last_cache_bits = None
@@ -1441,6 +1280,8 @@ class CognitiveOrganism(BaseCognitiveModule):
         return bool(step == 1 or (step % update_every) == 0)
 
     def _maybe_update_survival(self, H_next, H_prev, should_update=None):
+        if not self.pruning_enabled:
+            return
         if should_update is None:
             should_update = self._should_update_survival()
         if should_update:
@@ -1510,8 +1351,8 @@ class CognitiveOrganism(BaseCognitiveModule):
 
     def _dynamic_cycle_counts(self):
         scale = self._hpc_cycle_scale()
-        h_cycles = max(1, int(round(self.H_cycles * scale)))
-        l_cycles = max(1, int(round(self.L_cycles * scale)))
+        h_cycles = max(1, int(round(self.cfg_h_cycles * scale)))
+        l_cycles = max(1, int(round(self.cfg_l_cycles * scale)))
         h_cap = max(1, self.hpc_cfg.h_cycles_max)
         l_cap = max(1, self.hpc_cfg.l_cycles_max)
         return min(h_cycles, h_cap), min(l_cycles, l_cap)
@@ -1584,6 +1425,26 @@ class CognitiveOrganism(BaseCognitiveModule):
         )
         return h_next, l_next, skip_reasoning
 
+    def _apply_efficiency_cycle_control(self, h_cycles, l_cycles, p_brain, gate, is_audit=False):
+        if is_audit or (not isinstance(p_brain, torch.Tensor)) or p_brain.dim() != 3:
+            return h_cycles, l_cycles
+        # Easy-token proxy: low latent activity + low engaged gate density.
+        latent_activity = float(torch.nan_to_num(p_brain[:, -1].abs().mean(), nan=0.0, posinf=1.0, neginf=0.0).item())
+        gate_activity = 1.0
+        if isinstance(gate, torch.Tensor) and gate.numel() > 0:
+            gate_activity = float(torch.nan_to_num(gate.mean(), nan=1.0, posinf=1.0, neginf=1.0).item())
+        activity_signal = 0.5 * math.tanh(latent_activity) + 0.5 * max(0.0, min(1.0, gate_activity))
+        easy_threshold = 0.35
+        min_scale = 0.45
+        if activity_signal >= easy_threshold:
+            scale = 1.0
+        else:
+            scale = min_scale + (1.0 - min_scale) * (activity_signal / easy_threshold)
+        scale = max(min_scale, min(1.0, scale))
+        h_next = max(1, int(round(h_cycles * scale)))
+        l_next = max(1, int(round(l_cycles * scale)))
+        return h_next, l_next
+
     def _hpc_refresh_from_states(self, H_next, H_prev=None):
         if not self._hpc_active():
             self._hpc_last_error.fill_(0.0)
@@ -1617,7 +1478,7 @@ class CognitiveOrganism(BaseCognitiveModule):
             tps_pressure = self._get_tps_pressure()
         fkbp5 = getattr(self, 'fkbp5', 0.0)
         gaba = getattr(self, 'gaba_inhibition', 0.0)
-        dyn_threshold = self.runtime_cfg.halt_threshold * (1.0 + fkbp5) / (1.0 + gaba)
+        dyn_threshold = self.cfg_halt_threshold * (1.0 + fkbp5) / (1.0 + gaba)
         dyn_threshold *= (1.0 - tps_pressure)
         if self._hpc_active():
             target_error = max(1e-6, self.hpc_cfg.target_error)
@@ -1678,9 +1539,11 @@ class CognitiveOrganism(BaseCognitiveModule):
 
     def _bytes_to_bits(self, bytes_bt):
         """Convert byte tokens [B, T] to bit vectors [B, T, 8]."""
+        # Centralized check and pre-allocation avoidance
         tokens = bytes_bt.to(device=self.device, dtype=torch.long)
-        shifts = self.byte_bit_shifts.view(1, 1, -1)
-        return ((tokens.unsqueeze(-1) >> shifts) & 1).to(torch.float32)
+        # byte_bit_shifts is already view(1,1,-1) or equivalent in __init__? 
+        # Actually let's ensure it's correct here.
+        return ((tokens.unsqueeze(-1) >> self.byte_bit_shifts) & 1).to(torch.float32)
 
     def _encode_s1_input(self, x):
         """
@@ -1746,7 +1609,7 @@ class CognitiveOrganism(BaseCognitiveModule):
             p_stack['delays'], p_stack['tables'], p_stack['conns'],
             p_stack['decays'], p_stack['halt_w'], p_stack['halt_b'],
             int(h_cycles), int(l_cycles),
-            self.runtime_cfg.lif_decay, self.runtime_cfg.lif_threshold, float(dyn_threshold),
+            self.cfg_lif_decay, self.cfg_lif_threshold, float(dyn_threshold),
             h_out_passed
         )
         z_L = out_fused.view(B, 1, self.R, self.d_s2, self.C).expand(-1, T, -1, -1, -1)
@@ -1802,15 +1665,15 @@ class CognitiveOrganism(BaseCognitiveModule):
         # --- PERFORMANCE CONTROL: TPS Pressure ---
         tps_pressure = self._get_tps_pressure()
         
-        if self.current_phase == 0:
+        if not self.pruning_enabled:
+            gate = torch.ones(self.L, self.R, 1, 1, dtype=torch.float32, device=self.device)
+        elif self.current_phase == 0:
             # Phase 0 (Warmup): Fixed Top-K for architecture stability
-            keep_ratio = self.runtime_cfg.phase0_keep_ratio
-            k = max(1, int(combined_scores.numel() * keep_ratio))
+            k = max(1, int(combined_scores.numel() * Config.PHASE_0_KEEP_RATIO))
             threshold = torch.topk(combined_scores.flatten(), k).values.min()
             gate = (combined_scores >= threshold).float()[:, :, None, None]
         else:
             # Phase 1+ (Autonomous): Dynamic Metabolic + Performance Masking
-            # Use blended scores for mask generation without mutating survival usage state.
             gate = self.survival.mask(
                 metabolic_pressure=self.lambda_sparsity,
                 tps_pressure=tps_pressure,
@@ -1829,10 +1692,9 @@ class CognitiveOrganism(BaseCognitiveModule):
             surprise_trigger = bool((max_sim < 0.85).any().item())
             
             # Full sequence bypass if everything is cached and high confidence
-            # AUDIT: Ignore cache hit if we are in audit mode or surprise-triggered.
             if bool(hit_mask.all().item()) and (not is_audit) and (not surprise_trigger):
                 out_full = cache_val.unsqueeze(1).expand(-1, T, -1)
-                return out_full, H, self.runtime_cfg.fast_path_cost, torch.zeros_like(gate)
+                return out_full, H, 0.001, torch.zeros_like(gate) # Fixed fast-path cost
         else:
             self._clear_cache_trace()
 
@@ -1878,6 +1740,9 @@ class CognitiveOrganism(BaseCognitiveModule):
         h_cycles_cfg, l_cycles_cfg, skip_temporal = self._apply_temporal_cycle_control(
             h_cycles_cfg, l_cycles_cfg, temporal_signal, is_audit=is_audit
         )
+        h_cycles_cfg, l_cycles_cfg = self._apply_efficiency_cycle_control(
+            h_cycles_cfg, l_cycles_cfg, p_brain, gate, is_audit=is_audit
+        )
         skip_reasoning = bool(skip_surprise and skip_temporal)
         dyn_threshold = self._compute_dyn_halt_threshold(tps_pressure=tps_pressure)
         h_cycles_used = float(max(1, h_cycles_cfg * l_cycles_cfg))
@@ -1916,65 +1781,60 @@ class CognitiveOrganism(BaseCognitiveModule):
         p_flat = p_titans  # [B, D_S2 * C]
         
         # Store high-importance patterns using an EMA threshold (avoids per-step quantile sort).
-        if self.training:
+        if self.episodic_enabled and self.training:
             with torch.no_grad():
                 importance_score = self.memory_governor_predictor(p_flat.detach()).squeeze(-1)  # [B]
                 importance_threshold = self._compute_importance_threshold(importance_score)
                 should_store = importance_score > importance_threshold
                 if should_store.any():
-                    store_keys = p_flat[should_store]
-                    store_values = z_L.reshape(B, -1)[should_store, :self.d_s2 * self.C]  # Use output as value
-                    self.episodic_memory.write(store_keys, store_values)
+                    self.episodic_memory.write(p_flat[should_store], z_L.reshape(B, -1)[should_store, :self.d_s2 * self.C])
         
         # Retrieve from episodic memory and blend with current context
-        read_every = max(1, self.episodic_cfg.read_every)
-        read_top_k = max(1, self.episodic_cfg.read_top_k)
-        max_scan = max(1, self.episodic_cfg.max_scan)
         should_read_episodic = (
+            self.episodic_enabled
+            and
             (self.episodic_memory.count > 0)
-            and ((not self.training) or ((int(self.step_counter.item()) % read_every) == 0))
+            and ((not self.training) or ((int(self.step_counter.item()) % self.episodic_cfg.read_every) == 0))
         )
         if should_read_episodic:
             with torch.no_grad():
                 _, retrieved, retrieval_score = self.episodic_memory.read(
                     p_flat.detach(),
-                    top_k=read_top_k,
-                    max_scan=max_scan
+                    top_k=self.episodic_cfg.read_top_k,
+                    max_scan=self.episodic_cfg.max_scan
                 )
                 # retrieved: [B, K, D], retrieval_score: [B, K]
-                alpha = retrieval_score.unsqueeze(-1).clamp(0, 1) * 0.1  # [B, K, 1]
-                memory_context = (retrieved * alpha).sum(dim=1)          # [B, D]
-            p_with_memory = p_flat + memory_context
+                # alpha = retrieval_score.unsqueeze(-1).clamp(0, 1) * 0.1  # [B, K, 1]
+                # memory_context = (retrieved * alpha).sum(dim=1)          # [B, D]
+            # p_with_memory = p_flat + memory_context
+            # Blend episodic memory into output
+            # Expand p_with_memory to match readout input dimensions
+            # We add the memory contribution to each time step
+            T_out = z_L.size(1)
+            y_flat = z_L.reshape(B, T_out, self.R * self.d_s2 * self.C)
+            y_flat = rms_norm(y_flat) # Stability before readout
+            
+            # Broadcast memory context across regions without materializing a repeated [B,T,R*M] tensor.
+            # memory_contribution = p_with_memory.view(B, 1, 1, self.d_s2 * self.C)
+            y_blocks = y_flat.reshape(B, T_out, self.R, self.d_s2 * self.C)
+            y_blocks = y_blocks + 0.1 * (retrieved * retrieval_score.unsqueeze(-1).clamp(0, 1) * 0.1).sum(dim=1).view(B, 1, 1, self.d_s2 * self.C)
+            y_flat = y_blocks.reshape(B, T_out, self.R * self.d_s2 * self.C)
         else:
-            p_with_memory = p_flat
+            T_out = z_L.size(1)
+            y_flat = z_L.reshape(B, T_out, self.R * self.d_s2 * self.C)
+            y_flat = rms_norm(y_flat) # Stability before readout
         
         # --- BIOLOGICAL FEATURE: Myelin Update (Use-dependent insulation) ---
-        # Increase myelin on heavily-used pathways
-        with torch.no_grad():
-            if int(self.step_counter.item()) % 100 == 0:
-                # H_next is [B, L, R, D_S2, C] - we want pathway_usage as [L, R]
-                H_flat = H_next.view(B, self.L, self.R, -1)  # [B, L, R, D_S2*C]
-                pathway_usage = H_flat.norm(dim=(0, 3))  # [L, R]
-                self.myelin_sheaths.data = 0.99 * self.myelin_sheaths.data + 0.01 * pathway_usage
+        if self.training and int(self.step_counter.item()) % 100 == 0:
+            with torch.no_grad():
+                self.myelin_sheaths.data.mul_(0.99).add_(H_next.view(B, self.L, self.R, -1).norm(dim=(0, 3)), alpha=0.01)
         
-        # --- Blend episodic memory into output ---
-        # Expand p_with_memory to match readout input dimensions
-        # We add the memory contribution to each time step
-        T_out = z_L.size(1)
-        y_flat = z_L.reshape(B, T_out, self.R * self.d_s2 * self.C)
-        y_flat = rms_norm(y_flat) # Stability before readout
-        
-        # Broadcast memory context across regions without materializing a repeated [B,T,R*M] tensor.
-        memory_contribution = p_with_memory.view(B, 1, 1, self.d_s2 * self.C)
-        y_blocks = y_flat.reshape(B, T_out, self.R, self.d_s2 * self.C)
-        y_blocks = y_blocks + 0.1 * memory_contribution
-        y_flat = y_blocks.reshape(B, T_out, self.R * self.d_s2 * self.C)
         out = self.readout(y_flat)
         
         # PRUNING 2.0: update survival usage on throttled cadence to reduce CPU stalls.
         self._maybe_update_survival(H_next, z_H_start, should_update=should_update_survival)
         
-        cost_step = gate.sum() * self.runtime_cfg.param_cost_scale
+        cost_step = gate.sum() * self.cfg_param_cost_scale
         
         # Calculate aggregate engagement rate from all levels
         self._current_engagement_rate = self._compute_engagement_rate()
@@ -2058,7 +1918,7 @@ class CognitiveOrganism(BaseCognitiveModule):
         target_brain = self.bridge_s1_to_s2(target_latent)
         return x_win, target_latent, p_brain, target_brain
 
-    def _mes_super_kernel_step(self, p_brain, target_brain, H_inter):
+    def _mes_super_kernel_step(self, p_brain, target_brain, H_inter, apply_update=True):
         if not self.mes_cfg.super_kernel:
             raise RuntimeError("MES_SUPER_KERNEL must be enabled; Python MES fallback is removed.")
         p_stack = self._sync_stacked_params()
@@ -2081,10 +1941,11 @@ class CognitiveOrganism(BaseCognitiveModule):
         if not isinstance(grad_tables, torch.Tensor) or grad_tables.dim() != 3 or grad_tables.size(0) != self.L:
             raise RuntimeError("mes_super_step_io returned invalid grad_tables tensor.")
 
-        with torch.no_grad():
-            for l, level in enumerate(self.levels):
-                level.wsnn.ram_tables.grad = grad_tables[l].contiguous()
-        self._batched_mes_optimizer_step()
+        if apply_update:
+            with torch.no_grad():
+                for l, level in enumerate(self.levels):
+                    level.wsnn.ram_tables.grad = grad_tables[l].contiguous()
+            self._batched_mes_optimizer_step()
         return float(loss_local.item())
 
     def _mes_train_surprise_head(self, H_next, target_latent):
@@ -2162,24 +2023,26 @@ class CognitiveOrganism(BaseCognitiveModule):
             print(f">>> DE-MYELINATION: {int(indices.size(0))} reflexes lost confidence. Stripping myelin...")
         return int(indices.size(0))
 
-    def mes_step(self, x, target_bits, precomputed_H_next=None):
+    def mes_step(self, x, target_bits, precomputed_H_next=None, dry_run=False):
         """
         Total Metabolic Engram Sculpting (MES): 
         Sole learning driver. No global backprop.
         """
-        self.mes_throttle_count += 1
+        if not dry_run:
+            self.mes_throttle_count += 1
         
         if not self.mes_cfg.enabled:
             return {}
         
         # Performance Throttling: Skip MES update occasionally to maintain high TPS
-        if self.mes_throttle_count % self.mes_cfg.skip_step != 0:
+        if (not dry_run) and (self.mes_throttle_count % self.mes_cfg.skip_step != 0):
             return {'mes_loss': 0.0, 'throttled': True}
 
         B = x.size(0)
         
         # 1. READOUT UPDATE (The Objective Manifold)
-        self.readout_optimizer.zero_grad(set_to_none=True)
+        if not dry_run:
+            self.readout_optimizer.zero_grad(set_to_none=True)
         
         # We need H_next to map to targets.
         if precomputed_H_next is None:
@@ -2212,28 +2075,36 @@ class CognitiveOrganism(BaseCognitiveModule):
         mes_loss_value = 0.0
 
         # Prefer C++ MES super-kernel path (single-call orchestration + table grads).
-        local_loss_cpp = self._mes_super_kernel_step(p_brain, target_brain, H_inter)
+        local_loss_cpp = self._mes_super_kernel_step(
+            p_brain, target_brain, H_inter, apply_update=(not dry_run)
+        )
         # Super-kernel path only needs readout backward here.
-        loss_readout.backward()
+        if not dry_run:
+            loss_readout.backward()
         mes_loss_value = float(loss_readout.item() + local_loss_cpp)
 
-        self.readout_optimizer.step()
+        if not dry_run:
+            self.readout_optimizer.step()
         
         # 3. BIT-TO-LATENT (The Sensory Manifold)
-        self.s1_optimizer.zero_grad(set_to_none=True)
-        with torch.enable_grad():
-            p_mes, _, _ = self._encode_s1_input(x_win)
-            loss_s1 = F.mse_loss(p_mes, target_latent.detach())
-            loss_s1.backward()
-            self.s1_optimizer.step()
-        
+        if not dry_run:
+            self.s1_optimizer.zero_grad(set_to_none=True)
+            with torch.enable_grad():
+                p_mes, _, _ = self._encode_s1_input(x_win)
+                loss_s1 = F.mse_loss(p_mes, target_latent.detach())
+                loss_s1.backward()
+                self.s1_optimizer.step()
+
         # 4. SURPRISE HEAD TRAINING
-        self._mes_train_surprise_head(H_next, target_latent)
-        hpc_loss = self._hpc_train_predictors(H_next)
+        if not dry_run:
+            self._mes_train_surprise_head(H_next, target_latent)
+            hpc_loss = self._hpc_train_predictors(H_next)
+        else:
+            hpc_loss = 0.0
         hpc_weight = self.hpc_cfg.local_loss_weight
         mes_loss_value += hpc_weight * hpc_loss
-        
-        return {'mes_loss': mes_loss_value, 'hpc_loss': hpc_loss}
+
+        return {'mes_loss': mes_loss_value, 'hpc_loss': hpc_loss, 'dry_run': bool(dry_run)}
 
     @torch.no_grad()
     def _consolidate_memories(self, s2_out, is_audit):
