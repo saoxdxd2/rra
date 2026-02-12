@@ -939,7 +939,7 @@ class CognitiveOrganism(BaseCognitiveModule):
         if missing_ops:
             raise RuntimeError(f"Missing required cpp_loader ops: {', '.join(missing_ops)}")
         available_ops = []
-        for op in required_ops + ['quantized_matmul', 'ademamix_update', 'fused_cognitive_cycle', 'neural_cache_lookup_fast']:
+        for op in required_ops + ['quantized_matmul', 'ademamix_update', 'fused_cognitive_cycle', 'neural_cache_lookup_fast', 'geometric_manifold_forward_avx512']:
             if hasattr(cpp_loader, op):
                 available_ops.append(op)
         event_mode_raw = self.exec_cfg.event_mode
@@ -977,6 +977,11 @@ class CognitiveOrganism(BaseCognitiveModule):
             print(">>> NeuralCache reflex path disabled (reasoning-first mode).")
         if not self.exec_cfg.use_fused_cycle:
             print(">>> fused_cognitive_cycle disabled (using forward_stack_io path).")
+        if self.cfg_lgh_enabled:
+            if hasattr(cpp_loader, 'geometric_manifold_forward_avx512'):
+                print(">>> LGH core enabled: geometric_manifold_forward_avx512 is available.")
+            else:
+                print(">>> LGH requested, but kernel is missing in current extension build; falling back to forward_stack_io.")
         if not self.exec_cfg.use_forward_stack:
             raise RuntimeError("USE_FORWARD_STACK must be enabled; no Python reasoning fallback path exists.")
         print(
