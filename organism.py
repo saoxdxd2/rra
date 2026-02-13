@@ -92,12 +92,18 @@ class HomeostaticModule(nn.Module):
         self.register_buffer('reliability', torch.ones(L, R))
         
         # --- 3. Consolidated configuration for C++ kernels ---
-        # [0: gamma, 1: imp_w, 2: surp_w, 3: metabolic_pressure, 4: tps_pressure, 5: noise, 6-15: reserved]
-        self.register_buffer('config_scalars', torch.zeros(16, dtype=torch.float32))
+        # 0: gamma, 1: imp_w, 2: surp_w, 3: metabolic_pressure, 4: tps_pressure, 5: noise
+        # 6: hpc_error_ema, 7: hpc_last_error, 8: hpc_last_cycle_scale
+        # 9: surprise_signal, 10: surprise_cycle_scale
+        # 11: temporal_signal, 12: temporal_cycle_scale
+        # 13: thermal_penalty_ema, 14: last_freq_ghz, 15: current_engagement_rate
+        # 16-20: forward_stack_scalars, 21-23: mes_super_scalars, 24-31: reserved
+        self.register_buffer('config_scalars', torch.zeros(32, dtype=torch.float32))
         self.config_scalars[0] = 0.95 # Default gamma
         self.config_scalars[1] = 1.0  # Default importance weight
         self.config_scalars[2] = 1.0  # Default surprise weight
         self.config_scalars[5] = 0.05 # Default noise
+        self.config_scalars[15] = 1.0 # Default engagement rate
         
         if device:
             self.to(device)
@@ -742,15 +748,11 @@ class CognitiveOrganism(BaseCognitiveModule):
                 lr=self.cfg.LEARNING_RATE * self.cfg.LOCAL_LR_RATIO
             )
         if self.cfg.MES_ENABLED and self.hpc_enabled and self.hpc_encoder is not None:
-            self.hpc_optimizer = torch.optim.SGD(
-                [
-                    *self.hpc_encoder.parameters(),
-                    *self.hpc_decoder.parameters(),
-                    self.hpc_layer_gain,
-                    self.hpc_layer_bias,
-                ],
-                lr=self.cfg.LEARNING_RATE * self.cfg.LOCAL_LR_RATIO
-            )
+            # Sub-module optimizers are now unified in RRATrainer via model.parameters()
+            # but we can provide a master_optimizer for local updates if needed.
+            pass
+
+
         
         # Cache config values to avoid self.cfg/self.runtime_cfg getattr overhead in hot path
         self.cfg_mes_enabled = bool(Config.MES_ENABLED)
@@ -817,23 +819,18 @@ class CognitiveOrganism(BaseCognitiveModule):
         self._tps_pressure_step = -1
         self.importance_threshold_ema = 0.5
         self.mes_throttle_count = 0
-        self.register_buffer('_hpc_error_ema', torch.tensor(self.hpc_cfg.target_error, dtype=torch.float32, device=self.device))
-        self.register_buffer('_hpc_last_error', torch.tensor(0.0, dtype=torch.float32, device=self.device))
-        self.register_buffer('_hpc_last_cycle_scale', torch.tensor(1.0, dtype=torch.float32, device=self.device))
-        self.register_buffer('_hpc_layer_error_ema', torch.zeros(self.L, dtype=torch.float32, device=self.device))
-        self.register_buffer('_last_surprise_signal', torch.tensor(1.0, dtype=torch.float32, device=self.device))
-        self.register_buffer('_last_surprise_cycle_scale', torch.tensor(1.0, dtype=torch.float32, device=self.device))
-        self.register_buffer('_last_temporal_signal', torch.tensor(1.0, dtype=torch.float32, device=self.device))
-        self.register_buffer('_last_temporal_cycle_scale', torch.tensor(1.0, dtype=torch.float32, device=self.device))
-        self.register_buffer('_last_temporal_cycle_scale', torch.tensor(1.0, dtype=torch.float32, device=self.device))
-        self.episodic_enabled = True
-        self.cfg_pruning_enabled = True
-        
-        # Parameter Stacking Cache (For C++ Fusion)
-        self._stacked_params = None
-        self._stacked_params_step = -1
-        self.register_buffer('_forward_stack_scalars', torch.zeros(5, dtype=torch.float32, device=self.device))
-        self.register_buffer('_mes_super_scalars', torch.zeros(3, dtype=torch.float32, device=self.device))
+        # All scalars are now consolidated in self.homeostasis.config_scalars
+        # 6: hpc_error_ema, 7: hpc_last_error, 8: hpc_last_cycle_scale
+        # 9: surprise_signal, 10: surprise_cycle_scale
+        # 11: temporal_signal, 12: temporal_cycle_scale
+        # 13: thermal_penalty_ema, 14: last_freq_ghz, 15: current_engagement_rate
+        # 16-20: forward_stack_scalars, 21-23: mes_super_scalars
+        self.homeostasis.config_scalars[6] = self.hpc_cfg.target_error
+        self.homeostasis.config_scalars[8] = 1.0 # last_cycle_scale
+        self.homeostasis.config_scalars[10] = 1.0 # surprise_cycle_scale
+        self.homeostasis.config_scalars[12] = 1.0 # temporal_cycle_scale
+        self.homeostasis.config_scalars[15] = 1.0 # engagement_rate
+
 
         # --- BIOLOGICAL FEATURE: Myelin Sheaths (Fast Pathway Insulation) ---
         # Myelin tracks which pathways are heavily used and should be "insulated" (penalized for energy)
@@ -1328,7 +1325,7 @@ class CognitiveOrganism(BaseCognitiveModule):
         if should_update is None:
             should_update = self._should_update_survival()
         if should_update:
-            self.genome.update_metabolism(H_next, H_prev=H_prev)
+            self.homeostasis.update_metabolism(H_next, H_prev=H_prev, bdnf_gamma=self.genome.creb_gamma)
 
     def _hpc_active(self):
         return bool(self.hpc_enabled and (self.L > 1) and (self.hpc_encoder is not None) and (self.hpc_decoder is not None))

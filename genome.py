@@ -399,59 +399,11 @@ class Genome: # Renamed from GenomeEngine to maintain compat with organism.py
 
         self.state.generation += 1
 
-    # --- Metabolic Engine (Merged Logic) ---
-
-    def _ensure_metabolic_buffers(self, L, R, device):
-        if self.usage is None or self.usage.shape != (L, R):
-            self.usage = torch.ones(L, R, device=device)
-            self.reliability = torch.ones(L, R, device=device)
-            self._survival_scalars = self._survival_scalars.to(device)
-            self._mask_scalars = self._mask_scalars.to(device)
-
-    def update_metabolism(self, H, H_prev=None):
-        """Update usage scores via C++ kernel."""
-        L, R = H.shape[1], H.shape[2]
-        self._ensure_metabolic_buffers(L, R, H.device)
-        
-        H_c = H.contiguous()
-        H_prev_t = H_prev.contiguous() if H_prev is not None else torch.empty(0, device=H.device, dtype=H_c.dtype)
-        
-        # Use survival_update_io op from cpp_loader
-        from organism import _cpp_try
-        self._survival_scalars[0] = float(self.creb_gamma) # Scaled by CREB
-        
-        out = _cpp_try(
-            'survival_update_io',
-            H_c,
-            self.usage,
-            [H_prev_t],
-            self._survival_scalars,
-            tensors=(H_c, self.usage, H_prev_t, self._survival_scalars)
-        )
-        self.usage = out
-
     @property
     def creb_gamma(self):
         # Lower CREB (less memory focus) -> higher gamma (faster usage decay)
         return 0.01 + (0.1 * (1.0 - self.creb))
 
-    def get_metabolic_mask(self, metabolic_pressure, tps_pressure):
-        """Generate sparse activation mask via C++."""
-        if self.usage is None:
-            return torch.ones(1, 1, 1, 1) # Fallback if not initialized
-            
-        from organism import _cpp_try
-        self._mask_scalars[0] = float(metabolic_pressure)
-        self._mask_scalars[1] = float(tps_pressure)
-        
-        out = _cpp_try(
-            'survival_mask_io',
-            self.usage,
-            self.reliability,
-            [],
-            self._mask_scalars,
-            tensors=(self.usage, self.reliability, self._mask_scalars)
-        )
         return out
 
     def calculate_metabolic_losses(self, H, H_prev=None):
