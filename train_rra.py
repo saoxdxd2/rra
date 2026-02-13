@@ -1139,8 +1139,13 @@ class RRATrainer:
         loss_task = self.learning_brain.calculate_task_loss(logits, targets)
         loss_task = self._finite(loss_task, nan=10.0, posinf=10.0, neginf=10.0)
         
+        # Phase 4: Retrieve thermal penalty for metabolic survival
+        thermal_penalty, _ = self._thermal_penalty()
+        
         # Phase 0 only cares about Task + Stability
-        total_loss = loss_task + (self.cfg.lambda_stability * l_stab) + (self.cfg.lambda_energy * l_eng)
+        # If throttled, double the energy penalty
+        energy_weight = self.cfg.lambda_energy * (1.0 + thermal_penalty)
+        total_loss = loss_task + (self.cfg.lambda_stability * l_stab) + (energy_weight * l_eng)
         if not torch.isfinite(total_loss):
             logger.warning(f">>> Non-finite Phase-0 loss at global_step={self.global_step}. Skipping this batch.")
             self.optimizer.zero_grad(set_to_none=True)
@@ -1219,13 +1224,15 @@ class RRATrainer:
                     l_myelin = torch.tensor(float(l_myelin), device=out.device, dtype=out.dtype)
                 l_myelin = self._finite(l_myelin, nan=0.0, posinf=1e4, neginf=0.0)
                 l_teacher_eff = loss_task if L_teacher is None else L_teacher
+                thermal_penalty, _ = self._thermal_penalty()
                 total_loss, loss_info = self.learning_brain.calculate_unified_loss(
                     L_task=loss_task,
                     L_teacher=l_teacher_eff,
                     L_stability=(l_stab + self.cfg.coherence_weight * l_coh + l_myelin),
-                    omega=self.model.omega
+                    omega=self.model.omega,
+                    thermal_penalty=thermal_penalty
                 )
-                total_loss = total_loss + (self.cfg.dynamic_energy_scale * (cost + l_eng))
+                total_loss = total_loss + (self.cfg.dynamic_energy_scale * (1.0 + thermal_penalty) * (cost + l_eng))
                 if hasattr(self.model, 'get_engagement_rate'):
                     engagement_rate = self.model.get_engagement_rate()
                     if isinstance(engagement_rate, torch.Tensor):
@@ -1243,6 +1250,22 @@ class RRATrainer:
             loss_info['L_task'] = float(loss_info.get('L_task', float('nan')))
             loss_info['L_teacher'] = float(loss_info.get('L_teacher', float('nan')))
             if not math.isfinite(L_total_val):
+                self._recover_from_nonfinite_omega(reason="omega_mes_total_loss")
+                return None
+        else:
+            # Global Backprop: Centralized Orchestration
+            # We use learning_step which handles backward() and optimizer.step()
+            thermal_penalty, _ = self._thermal_penalty()
+            results = self.learning_brain.learning_step(
+                self.model, inp, yb, H, self.optimizer, 
+                L_teacher=L_teacher, 
+                omega=self.model.omega, 
+                thermal_penalty=thermal_penalty
+            )
+            L_total_val = float(results['total_loss'])
+            H_next = results['H_next']
+            loss_info['L_task'] = results.get('loss_task', float('nan'))
+            if L_teacher is not None and hasattr(L_teacher, 'item'):
                 loss_info['L_teacher'] = L_teacher.item()
             if not math.isfinite(L_total_val):
                 self._recover_from_nonfinite_omega(reason="omega_global_total_loss")
