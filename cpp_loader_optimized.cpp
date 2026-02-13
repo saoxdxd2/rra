@@ -2678,7 +2678,7 @@ std::vector<at::Tensor> geometric_manifold_forward_avx512(
                 for (; m + 16 <= M; m += 16) {
                     __m512 a = _mm512_loadu_ps(proto_ptr + m);
                     __m512 b = _mm512_loadu_ps(row_ptr + m);
-                    _mm512_storeu_ps(proto_ptr + m, _mm512_fmadd_ps(b, coeff_v, a));
+                    _mm512_storeu_ps(proto_ptr + m, _mm512_add_ps(a, _mm512_mul_ps(b, coeff_v)));
                 }
                 for (; m < M; m++) {
                     proto_ptr[m] += coeff * row_ptr[m];
