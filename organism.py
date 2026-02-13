@@ -8,12 +8,8 @@ import psutil
 from torch.utils.tensorboard import SummaryWriter
 import time
 import random
-import yaml
 import os
-# from genome import Genome <-- Removed (Integrated into CognitiveOrganism)
-# from morton import MortonBuffer  <-- Removed
 import math
-from types import SimpleNamespace
 from optimizers import AdEMAMix
 from accelerator import get_accelerator
 
@@ -240,13 +236,23 @@ class Governor(nn.Module):
         H_c = H.contiguous()
         H_prev_t = H_prev.contiguous() if H_prev is not None else torch.empty(0, device=H.device, dtype=H_c.dtype)
         if bdnf_gamma is not None: self.config_scalars[0] = float(bdnf_gamma)
-        out = _cpp_try('survival_update_io', H_c, self.usage, [H_prev_t], self.config_scalars[:3], tensors=(H_c, self.usage, H_prev_t, self.config_scalars))
-        if out is not None: self.usage = out
+        
+        # Unified command 3 = CMD_SURVIVAL_UPDATE
+        from accelerator import Accelerator
+        acc = Accelerator.get_instance()
+        out = acc.call('unified_dispatch_io', H_c, self.usage, [H_prev_t], self.config_scalars, 3)
+        if isinstance(out, (list, tuple)) and len(out) > 0:
+            self.usage = out[0]
             
     def get_metabolic_mask(self, metabolic_pressure, tps_pressure):
         self.config_scalars[3] = float(metabolic_pressure)
         self.config_scalars[4] = float(tps_pressure)
-        return _cpp_try('survival_mask_io', self.usage, self.reliability, self.config_scalars[3:6], tensors=(self.usage, self.reliability, self.config_scalars))
+        
+        # Unified command 4 = CMD_SURVIVAL_MASK
+        from accelerator import Accelerator
+        acc = Accelerator.get_instance()
+        out = acc.call('unified_dispatch_io', self.usage, self.reliability, [], self.config_scalars, 4)
+        return out[0] if isinstance(out, (list, tuple)) and len(out) > 0 else out
 
     def build_curve_chain(self, total_nodes: int, length: int, hint: int = 0) -> List[int]:
         total = max(1, int(total_nodes))
@@ -660,10 +666,7 @@ class OrganismLevel(BaseCognitiveModule):
         super().__init__(device=device)
         self.R, self.D, self.C = R, D, C
         self.cfg = cfg
-        
-        # Governor: Unified lifecycle/metabolism management (The BIOS)
         self.governor = Governor(L=1, R=R, input_dim=D*C, device=device)
-        self.strategic_gating = self.governor # Alias for backward compatibility
         self.omega_ref = 0.0  # Synced from parent CognitiveOrganism
         self.h_decay_rate = self.cfg.BYPASS_H_DECAY  # Light memory decay during bypass
         
@@ -679,10 +682,9 @@ class OrganismLevel(BaseCognitiveModule):
         
         # MES state for C++ optimizer (batched_ademamix_update)
         if self.cfg.MES_ENABLED:
-            self.register_buffer('m_fast', torch.zeros_like(self.wsnn.ram_tables))
-            self.register_buffer('m_slow', torch.zeros_like(self.wsnn.ram_tables))
-            self.register_buffer('v_opt', torch.zeros_like(self.wsnn.ram_tables))
-            self.register_buffer('_zero_grad_ram', torch.zeros_like(self.wsnn.ram_tables))
+            # Consolidated AdEMAMix state: [m_fast, m_slow, v_opt]
+            # Shape: [3, R, K, D_in]
+            self.register_buffer('optimizer_state', torch.zeros(3, *self.wsnn.ram_tables.shape, device=device))
             self.opt_step = 1
 
                                     
@@ -731,7 +733,6 @@ class CognitiveOrganism(BaseCognitiveModule):
         # Bridge: S1 -> S2 (The Uploader)
         self.bridge_s1_to_s2 = SwiGLU(self.d_s1 * self.C, expansion=2.0, out_dim=self.d_s2 * self.C)
         self.governor = Governor(L=L, R=R, input_dim=self.d_s1 * self.C, device=self.device)
-        self.strategic_gating = self.governor # Unified alias
         
         # System 2: Slow/Reasoning Path (D_S2)
         self.levels = nn.ModuleList([OrganismLevel(R, self.d_s2, C, device=device, cfg=Config) for _ in range(L)])
@@ -775,30 +776,42 @@ class CognitiveOrganism(BaseCognitiveModule):
                 [*self.readout.parameters(), *self.governor.parameters()], 
                 lr=Config.LEARNING_RATE * Config.LOCAL_LR_RATIO
             )
-        if Config.MES_ENABLED and self.hpc_enabled and self.hpc_encoder is not None:
-            # Sub-module optimizers are now unified in RRATrainer via model.parameters()
-            # but we can provide a master_optimizer for local updates if needed.
-            pass
-
 
         
         # BIOS scalars are managed directly via self.governor.config_scalars.
         # Hot-path config values are accessed directly from Config or self.governor.
         self.max_batch_size = Config.BATCH_SIZE
-        self.H_buffer = torch.zeros(
-            self.max_batch_size, L, R, self.d_s2, C, 
-            device=device
-        ).contiguous()
+        # H_buffer is now a view into Zone D of the zero-copy workspace (see below)
+        self.H_buffer = None 
         
         # Phase 3: Zero-Copy Workspace Allocation (~1GB for B=64, T=512, M=1024)
         M_dim = self.d_s2 * C
-        self._lgh_workspace_size = Config.BATCH_SIZE * (
-            L * R * M_dim +          # Zone A: H_next
-            Config.SEQ_LEN * R * M_dim + # Zone B: out
-            Config.SEQ_LEN           # Zone C: halt_probs
+        # Workspace layout:
+        # Zone A: H_next (Final States) [B, L, R, M_dim]
+        # Zone B: y_seq (Sequence Outputs) [B, T, R, M_dim]  -- Reduced to T=Config.SEQ_LEN
+        # Zone C: halt_probs [B, T]
+        # Zone D: H_buffer (Transient States) [B, L, R, M_dim]
+        self._lgh_h_size = Config.BATCH_SIZE * L * R * M_dim
+        self._lgh_y_size = Config.BATCH_SIZE * Config.SEQ_LEN * R * M_dim
+        self._lgh_p_size = Config.BATCH_SIZE * Config.SEQ_LEN
+        
+        self._lgh_workspace_size = (
+            self._lgh_h_size +      # Zone A
+            self._lgh_y_size +      # Zone B
+            self._lgh_p_size +      # Zone C
+            self._lgh_h_size        # Zone D (H_buffer expansion)
         )
         self.register_buffer('_lgh_workspace', torch.zeros(self._lgh_workspace_size, dtype=torch.float32, device=device))
         
+        # Initialize views for LGH cognitive cycles
+        self._lgh_h_view = self._lgh_workspace[:self._lgh_h_size].view(Config.BATCH_SIZE, L, R, self.d_s2 * C)
+        self._lgh_y_view = self._lgh_workspace[self._lgh_h_size : self._lgh_h_size + self._lgh_y_size].view(Config.BATCH_SIZE, Config.SEQ_LEN, R, self.d_s2 * C)
+        self._lgh_p_view = self._lgh_workspace[self._lgh_h_size + self._lgh_y_size : self._lgh_h_size + self._lgh_y_size + self._lgh_p_size].view(Config.BATCH_SIZE, Config.SEQ_LEN)
+        
+        self.H_buffer = self._lgh_workspace[
+            self._lgh_h_size + self._lgh_y_size + self._lgh_p_size :
+        ].view(Config.BATCH_SIZE, L, R, self.d_s2, C)
+
         self._init_manifold()
         self.register_buffer('_lgh_thermal_penalty_ema', torch.tensor(0.0, dtype=torch.float32, device=self.device))
         self.register_buffer('_lgh_last_freq_ghz', torch.tensor(0.0, dtype=torch.float32, device=self.device))
@@ -813,7 +826,7 @@ class CognitiveOrganism(BaseCognitiveModule):
         
         self.rope = RotaryEmbedding(self.d_s2 * C, device=device)
         self.virtual_lab = VirtualLab(enabled=bool(Config.VIRTUAL_LAB_ENABLED))
-        # Memory imprinting handled by strategic_gating
+        # Memory imprinting handled by self.governor
         
         # Preflight flag for performance
         self._preflight_ready = False
@@ -1005,25 +1018,6 @@ class CognitiveOrganism(BaseCognitiveModule):
             
         print(f">>> BIOS: Phenotype updated (Gen {self.governor.generation})")
 
-    def _imprint_to_manifold(self, p, z, importance):
-        """Imprint patterns into the LGH-Manifold trajectory for O(1) density retrieval."""
-        if self.lgh_manifold_morton is None or self._lgh_curve_indices.numel() == 0:
-            return
-        with torch.no_grad():
-            indices = self._lgh_curve_indices.contiguous() # [S] Morton indices
-            # Broadcast batch of important values to the global manifold
-            # We use an EMA update weighted by importance.
-            val_mean = z.mean(dim=0) if z.dim() == 2 else z # [D]
-            imp_mean = importance.mean().item()
-            lr = 0.05 * imp_mean
-            # Vectorized scatter-add or indexing for imprinting along the path
-            self.lgh_manifold_morton[indices] = (1.0 - lr) * self.lgh_manifold_morton[indices] + lr * val_mean.unsqueeze(0)
-
-    def _compute_importance_threshold(self, score):
-        # Adaptive threshold based on EMA
-        self.importance_threshold_ema = 0.95 * self.importance_threshold_ema + 0.05 * score.mean().item()
-        return self.importance_threshold_ema
-
     def _init_manifold(self):
         # Firmware-Driven Morton Curve Generation
         if bool(Config.LGH_ENABLED):
@@ -1115,26 +1109,25 @@ class CognitiveOrganism(BaseCognitiveModule):
         )
 
     def _call_forward_stack(self, z_L, z_H, p_stack, dyn_threshold, l_cycles):
-        """Call unified C++ forward stack kernel (IO signature only)."""
+        """Call unified C++ forward stack kernel via unified_dispatch_io."""
+        B, T = z_L.size(0), z_L.size(1)
+        # Sequence-aware workspace views
+        h_o = self._lgh_h_view[:B].view(B, self.L, self.R, self.d_s2, self.C)
+        y_o = self._lgh_y_view[:B].view(B, Config.SEQ_LEN, self.R, self.d_s2, self.C)
+        
+        from accelerator import Accelerator
+        acc = Accelerator.get_instance()
+        
+        # IO Parameters: Base parameters + Zero-Copy output views
         io_params = [
             p_stack['delays'], p_stack['tables'], p_stack['conns'],
-            p_stack['decays'], p_stack['halt_w'], p_stack['halt_b']
+            p_stack['decays'], p_stack['halt_w'], p_stack['halt_b'],
+            h_o, y_o 
         ]
-        self._forward_stack_scalars[0] = 0.0
-        self._forward_stack_scalars[1] = float(Config.LIF_DECAY)
-        self._forward_stack_scalars[2] = float(Config.LIF_THRESHOLD)
-        self._forward_stack_scalars[3] = float(dyn_threshold)
-        self._forward_stack_scalars[4] = float(max(1, int(l_cycles)))
-        out_io = self._cpp_io_call(
-            'forward_stack_io',
-            z_L,
-            z_H,
-            params=io_params,
-            scalars=self._forward_stack_scalars
-        )
-        if not isinstance(out_io, (list, tuple)) or len(out_io) != 3:
-            raise RuntimeError("forward_stack_io returned unexpected output.")
-        y_seq, h_next, p_halt = out_io
+        
+        # Unified command 0 = CMD_FORWARD_STACK
+        # Returns: (y_seq, h_next, p_halt)
+        y_seq, h_next, p_halt = acc.call('unified_dispatch_io', z_L, z_H, io_params, [], 0)
         return self._normalize_stack_outputs(y_seq, h_next, p_halt, z_L)
 
     def _normalize_stack_outputs(self, y_seq, h_next, p_halt, z_L_ref):
@@ -1169,9 +1162,9 @@ class CognitiveOrganism(BaseCognitiveModule):
                     grads_list.append(zero_buf)
                 else:
                     grads_list.append(grad)
-            m_fast_list = [l.m_fast for l in self.levels]
-            m_slow_list = [l.m_slow for l in self.levels]
-            v_list = [l.v_opt for l in self.levels]
+            m_fast_list = [l.optimizer_state[0] for l in self.levels]
+            m_slow_list = [l.optimizer_state[1] for l in self.levels]
+            v_list = [l.optimizer_state[2] for l in self.levels]
             global_step = int(self.levels[0].opt_step)
             cpp_loader.batched_ademamix_update(
                 params_list, grads_list, m_fast_list, m_slow_list, v_list,
@@ -1970,7 +1963,6 @@ class CognitiveOrganism(BaseCognitiveModule):
         # Cache BIOS states locally for performance
         cfg_mes_enabled = bool(Config.MES_ENABLED)
         cfg_cache_enabled = bool(Config.NEURAL_CACHE_ENABLED)
-        cfg_pruning_enabled = True # Hardware Default
         is_stability = (mode == 'stability')
         L, R, C = self.L, self.R, self.C
         device = self.device
@@ -2014,9 +2006,7 @@ class CognitiveOrganism(BaseCognitiveModule):
         tps_pressure = self._get_tps_pressure()
         thermal_penalty = self._update_thermal_penalty()
         
-        if not cfg_pruning_enabled:
-            gate = torch.ones(L, R, 1, 1, dtype=torch.float32, device=device)
-        elif current_phase == 0:
+        if current_phase == 0:
             # Phase 0 (Warmup): Fixed Top-K for architecture stability
             k = max(1, int(combined_scores.numel() * Config.PHASE_0_KEEP_RATIO))
             threshold = torch.topk(combined_scores.flatten(), k).values.min()
@@ -2134,7 +2124,7 @@ class CognitiveOrganism(BaseCognitiveModule):
         with torch.no_grad():
             p_flat = p.mean(dim=1).detach()
             # Engagement head not used here yet, but importance head drives imprinting.
-            _, importance_score = self.strategic_gating(p_flat)
+            _, importance_score = self.governor(p_flat)
             importance_score = importance_score.squeeze(-1)
             importance_threshold = self._compute_importance_threshold(importance_score)
             should_store = (importance_score > importance_threshold).any()

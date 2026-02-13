@@ -408,11 +408,6 @@ def _record_to_text(value):
     if isinstance(value, (list, tuple)):
         parts = [str(v) for v in value if v is not None]
         return "\n".join(parts)
-    if isinstance(value, dict):
-        for key in ("text", "content", "value"):
-            if key in value and value[key] is not None:
-                return str(value[key])
-        return str(value)
     return str(value)
 
 

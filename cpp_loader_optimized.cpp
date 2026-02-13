@@ -1752,7 +1752,6 @@ std::vector<at::Tensor> forward_stack(
     at::Tensor x, at::Tensor H,
     at::Tensor delays, at::Tensor tables, at::Tensor conns,
     at::Tensor decays, at::Tensor hw, at::Tensor hb,
-    int64_t dummy_0,
     double lif_decay,
     double lif_threshold,
     double halt_threshold,
@@ -1768,18 +1767,53 @@ std::vector<at::Tensor> forward_stack_io(
     std::vector<at::Tensor> params,
     at::Tensor scalars
 ) {
-    TORCH_CHECK(params.size() == 6, "forward_stack_io expects 6 params: delays,tables,conns,decays,halt_w,halt_b.");
-    // Hardware Constants (NIS ISA) are now used directly in forward_stack.
-    // scalars tensor is ignored for BIOS values.
+    TORCH_CHECK(params.size() >= 6, "forward_stack_io expects at least 6 params.");
+    at::Tensor h_o = (params.size() > 6) ? params[6] : at::Tensor();
+    at::Tensor y_o = (params.size() > 7) ? params[7] : at::Tensor();
+
     return forward_stack(
         x_input, H_state,
         params[0], params[1], params[2], params[3], params[4], params[5],
-        0, // dummy_0
         NIS::LIF_DECAY,
         NIS::LIF_THRESHOLD,
         NIS::HALT_THRESHOLD,
-        NIS::L_CYCLES
+        NIS::L_CYCLES,
+        h_o, y_o
     );
+}
+
+// Command codes for unified_dispatch_io
+enum CognitiveCmd {
+    CMD_FORWARD_STACK = 0,
+    CMD_MES_SUPER = 1,
+    CMD_SURVIVAL_LOSSES = 2,
+    CMD_SURVIVAL_UPDATE = 3,
+    CMD_SURVIVAL_MASK = 4
+};
+
+std::vector<at::Tensor> unified_dispatch_io(
+    at::Tensor x,
+    at::Tensor state,
+    std::vector<at::Tensor> params,
+    at::Tensor scalars,
+    int64_t cmd
+) {
+    Perf::g_total_calls.fetch_add(1ULL, std::memory_order_relaxed);
+    switch (cmd) {
+        case CMD_FORWARD_STACK: return forward_stack_io(x, state, params, scalars);
+        case CMD_MES_SUPER: return mes_super_step_io(x, state, params, scalars);
+        case CMD_SURVIVAL_LOSSES: return survival_losses_io(x, state, params, scalars);
+        case CMD_SURVIVAL_UPDATE: {
+            auto out = survival_update_io(x, state, params, scalars);
+            return {out};
+        }
+        case CMD_SURVIVAL_MASK: {
+            auto out = survival_mask_io(x, state, params, scalars);
+            return {out};
+        }
+        default:
+            TORCH_CHECK(false, "Unknown Unified Command: ", cmd);
+    }
 }
 
 std::vector<torch::Tensor> mes_super_step_io(
@@ -1858,8 +1892,6 @@ std::vector<torch::Tensor> survival_losses_io(
     std::vector<torch::Tensor> params,
     torch::Tensor scalars
 ) {
-    (void)params;
-    (void)scalars;
     return survival_losses(x_input, state);
 }
 
@@ -2163,11 +2195,12 @@ std::vector<at::Tensor> forward_stack(
     at::Tensor x, at::Tensor H,
     at::Tensor delays, at::Tensor tables, at::Tensor conns,
     at::Tensor decays, at::Tensor hw, at::Tensor hb,
-    int64_t dummy_0,
     double lif_decay,
     double lif_threshold,
     double halt_threshold,
-    int64_t steps
+    int64_t steps,
+    at::Tensor H_out,
+    at::Tensor y_out
 ) {
     const int64_t B = x.size(0);
     const int64_t T = x.size(1);
@@ -2178,8 +2211,23 @@ std::vector<at::Tensor> forward_stack(
 
     auto x_c = ensure_contig(x);
     auto h_c = ensure_contig(H);
+    at::Tensor h_next;
+    if (H_out.defined() && H_out.numel() > 0 && H_out.sizes() == h_c.sizes()) {
+        h_next = H_out;
+        h_next.copy_(h_c);
+    } else {
+        h_next = h_c.clone();
+    }
+
+    at::Tensor y_seq;
+    if (y_out.defined() && (y_out.size(0) == B && y_out.size(1) == T)) {
+        y_seq = y_out;
+    } else {
+        y_seq = torch::zeros({B, T, R, D, C}, x_c.options());
+    }
+
     float* x_ptr = x_c.data_ptr<float>();
-    float* h_ptr = h_c.data_ptr<float>();
+    float* h_ptr = h_next.data_ptr<float>();
 
     // Zero-Copy Workspace Pointer (Simplified)
     // In a full implementation, we'd use the Morton curve to jump.
@@ -2209,7 +2257,7 @@ std::vector<at::Tensor> forward_stack(
         }
     }
 
-    return {x_c, h_c};
+    return {y_seq, h_next, torch::zeros({B, T, 1}, x_c.options())};
 }
 
 // -------------------------------------------------------------------------
@@ -3378,6 +3426,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("survival_update_io", &survival_update_io);
     m.def("survival_mask_io", &survival_mask_io);
     m.def("survival_losses_io", &survival_losses_io);
+    m.def("unified_dispatch_io", &unified_dispatch_io);
     m.def("configure_hpc", &configure_hpc);
     m.def("get_hpc_error_ema", &get_hpc_error_ema);
     m.def("configure_runtime", &configure_runtime);

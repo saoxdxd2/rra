@@ -102,7 +102,6 @@ class LearningBrain(nn.Module):
         
         loss_task = self.calculate_task_loss(out, targets)
         
-        pass
         
         confusion_ratio = torch.clamp(loss_task.detach(), 0.0, Config.CONFUSION_NORM) / Config.CONFUSION_NORM
         warmup_factor = min(1.0, self._step / self._warmup_steps)
