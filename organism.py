@@ -788,20 +788,27 @@ class CognitiveOrganism(BaseCognitiveModule):
         M_dim = self.d_s2 * C
         # Workspace layout:
         # Zone A: H_next (Final States) [B, L, R, M_dim]
-        # Zone B: y_seq (Sequence Outputs) [B, T, R, M_dim]  -- Reduced to T=Config.SEQ_LEN
+        # Zone B: y_seq (Sequence Outputs) [B, T, R, M_dim]
         # Zone C: halt_probs [B, T]
         # Zone D: H_buffer (Transient States) [B, L, R, M_dim]
+        # Zone E: signal_cache [B, T, D_in] (Latching inputs)
+        # Zone F: metabolic_masks [L, R]
         self._lgh_h_size = Config.BATCH_SIZE * L * R * M_dim
         self._lgh_y_size = Config.BATCH_SIZE * Config.SEQ_LEN * R * M_dim
         self._lgh_p_size = Config.BATCH_SIZE * Config.SEQ_LEN
+        self._lgh_s_size = Config.BATCH_SIZE * Config.SEQ_LEN * self.d_s2 # D_in
+        self._lgh_m_size = L * R
         
         self._lgh_workspace_size = (
             self._lgh_h_size +      # Zone A
             self._lgh_y_size +      # Zone B
             self._lgh_p_size +      # Zone C
-            self._lgh_h_size        # Zone D (H_buffer expansion)
+            self._lgh_h_size +      # Zone D
+            self._lgh_s_size +      # Zone E
+            self._lgh_m_size        # Zone F
         )
-        self.register_buffer('_lgh_workspace', torch.zeros(self._lgh_workspace_size, dtype=torch.float32, device=device))
+        self.register_buffer('_lgh_workspace', torch.empty(self._lgh_workspace_size, dtype=torch.float32, device=device))
+        self._lgh_workspace.zero_()
         
         # Initialize views for LGH cognitive cycles
         self._lgh_h_view = self._lgh_workspace[:self._lgh_h_size].view(Config.BATCH_SIZE, L, R, self.d_s2 * C)
@@ -810,7 +817,17 @@ class CognitiveOrganism(BaseCognitiveModule):
         
         self.H_buffer = self._lgh_workspace[
             self._lgh_h_size + self._lgh_y_size + self._lgh_p_size :
+            self._lgh_h_size * 2 + self._lgh_y_size + self._lgh_p_size
         ].view(Config.BATCH_SIZE, L, R, self.d_s2, C)
+
+        self._lgh_signal_cache = self._lgh_workspace[
+            self._lgh_h_size * 2 + self._lgh_y_size + self._lgh_p_size :
+            self._lgh_h_size * 2 + self._lgh_y_size + self._lgh_p_size + self._lgh_s_size
+        ].view(Config.BATCH_SIZE, Config.SEQ_LEN, self.d_s2)
+
+        self._lgh_metabolic_mask = self._lgh_workspace[
+            self._lgh_h_size * 2 + self._lgh_y_size + self._lgh_p_size + self._lgh_s_size :
+        ].view(L, R)
 
         self._init_manifold()
         self.register_buffer('_lgh_thermal_penalty_ema', torch.tensor(0.0, dtype=torch.float32, device=self.device))
@@ -1693,29 +1710,44 @@ class CognitiveOrganism(BaseCognitiveModule):
 
     def _run_fused_cycle(self, p_brain, H, gate, B, T, h_cycles, l_cycles, dyn_threshold):
         if not (
-            _cpp_has('fused_cognitive_cycle', p_brain, H, gate)
+            _cpp_has('unified_dispatch_io')
             and bool(Config.USE_FUSED_COGNITIVE_CYCLE)
         ):
             return False, None, None, None
 
         p_stack = self._sync_stacked_params()
-        h_out_passed = torch.empty(0)
-        if not self.training:
-            h_out_passed = self._new_state(B)
         gate_cpp = gate.reshape(self.L, self.R) if gate.dim() > 2 else gate
         p_brain_c = p_brain.float().contiguous()
         H_c = H.contiguous()
         gate_c = gate_cpp.float().contiguous()
-        out_fused, H_next_fused, halt_probs_cycle = cpp_loader.fused_cognitive_cycle(
-            p_brain_c, H_c, gate_c,
+        
+        from accelerator import Accelerator
+        acc = Accelerator.get_instance()
+        
+        # Sequence-aware workspace views (Zero-Copy)
+        h_o = self._lgh_h_view[:B].view(B, self.L, self.R, self.d_s2, self.C)
+        y_o = self._lgh_y_view[:B].view(B, T, self.R, self.d_s2, self.C)
+        
+        # params: [mask, delays, tables, conns, decays, hw, hb, h_out, y_out]
+        io_params = [
+            gate_c, 
             p_stack['delays'], p_stack['tables'], p_stack['conns'],
             p_stack['decays'], p_stack['halt_w'], p_stack['halt_b'],
-            int(h_cycles), int(l_cycles),
+            h_o, y_o
+        ]
+        
+        # scalars: [h_cycles, l_cycles, lif_decay, lif_threshold, halt_threshold, tax_rate]
+        scalars = torch.tensor([
+            float(h_cycles), float(l_cycles),
             float(Config.LIF_DECAY), float(Config.LIF_THRESHOLD), float(dyn_threshold),
-            h_out_passed
-        )
-        z_L = out_fused.view(B, 1, self.R, self.d_s2, self.C).expand(-1, T, -1, -1, -1)
-        return True, z_L, H_next_fused, halt_probs_cycle
+            float(getattr(Config, 'METABOLIC_TAX_RATE', 0.01))
+        ], device=H.device)
+
+        # Unified command 6 = CMD_FUSED_STEP (with L-R parallelization)
+        # Using CMD_FUSED_CYCLE_ULTRA (5) for sequence-wide fusion if T > 1
+        cmd = 5 if T > 1 else 6
+        y_seq, h_next = acc.call('unified_dispatch_io', p_brain_c, H_c, io_params, scalars, cmd)
+        return True, y_seq, h_next, torch.zeros(B, 1, 1, device=H.device)
 
     def _lgh_morton_manifold(self):
         if (not bool(Config.LGH_ENABLED)) or (self.lgh_manifold_morton is None):

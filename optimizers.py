@@ -96,6 +96,9 @@ class AdEMAMix(optim.Optimizer):
                 last_step = state['step']
 
             if p_b:
-                ACCEL.call('batched_ademamix_update', p_b, g_b, mf_b, ms_b, v_b, lr, bf, bs, b2, current_alpha, eps, last_step, tensors=tuple(p_b + g_b + mf_b + ms_b + v_b))
+                # Command 6 = CMD_GROUP_ADEMAMIX (or use batched_ademamix_update directly)
+                # But here we use batched_ademamix_update as before, just with metabolic_tax
+                metabolic_tax = float(getattr(group, 'metabolic_tax', 0.0001))
+                ACCEL.call('batched_ademamix_update', p_b, g_b, mf_b, ms_b, v_b, lr, bf, bs, b2, current_alpha, eps, wd, metabolic_tax, last_step, tensors=tuple(p_b + g_b + mf_b + ms_b + v_b))
 
         return loss
