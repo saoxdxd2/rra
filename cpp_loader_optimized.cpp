@@ -2681,14 +2681,13 @@ std::vector<at::Tensor> geometric_manifold_forward_avx512(
     if (S > 0) {
         float contrib_count = 0.0f;
         for (int64_t s = 0; s < S; s++) {
-            const int64_t dt = base_phase + s;
             const int64_t tbin = lgh_wrap_row(dt, t_bins);
-            const int64_t row_base = lgh_map_curve_row(idx_ptr[s], inv_ptr, N3);
+            const int64_t row_base = lgh_clamp_row(idx_ptr[s], N3);
             const int64_t row = lgh_temporal_fold_row(row_base, dt, N3, t_bins, Core::g_hpc_fold_alpha);
             if (S_prefetch > 0) {
                 const int64_t p_dt = dt + prefetch_d;
                 const int64_t p_tbin = lgh_wrap_row(p_dt, t_bins);
-                const int64_t p_base = lgh_map_curve_row(pidx_ptr[s % S_prefetch], inv_ptr, N3);
+                const int64_t p_base = lgh_clamp_row(pidx_ptr[s % S_prefetch], N3);
                 const int64_t p_row3 = lgh_temporal_fold_row(p_base, p_dt, N3, t_bins, Core::g_hpc_fold_alpha);
                 const int64_t p_row = p_row3 * atlas_bins + (p_tbin % atlas_bins);
                 const float* p_ptr_prefetch = m_ptr + p_row * M;
@@ -2697,7 +2696,7 @@ std::vector<at::Tensor> geometric_manifold_forward_avx512(
             if (s + prefetch_d < S) {
                 const int64_t n_dt = dt + prefetch_d;
                 const int64_t n_tbin = lgh_wrap_row(n_dt, t_bins);
-                const int64_t next_base = lgh_map_curve_row(idx_ptr[s + prefetch_d], inv_ptr, N3);
+                const int64_t next_base = lgh_clamp_row(idx_ptr[s + prefetch_d], N3);
                 const int64_t next_row3 = lgh_temporal_fold_row(next_base, n_dt, N3, t_bins, Core::g_hpc_fold_alpha);
                 const int64_t next_row = next_row3 * atlas_bins + (n_tbin % atlas_bins);
                 const float* next_ptr = m_ptr + next_row * M;
@@ -2718,7 +2717,7 @@ std::vector<at::Tensor> geometric_manifold_forward_avx512(
                 for (; m + 16 <= M; m += 16) {
                     __m512 a = _mm512_loadu_ps(proto_ptr + m);
                     __m512 b = _mm512_loadu_ps(row_ptr + m);
-                    _mm512_storeu_ps(proto_ptr + m, _mm512_add_ps(a, _mm512_mul_ps(b, coeff_v)));
+                    _mm512_storeu_ps(proto_ptr + m, _mm512_fmadd_ps(b, coeff_v, a));
                 }
                 for (; m < M; m++) {
                     proto_ptr[m] += coeff * row_ptr[m];
@@ -3029,14 +3028,13 @@ std::vector<at::Tensor> geometric_manifold_forward_avx512_int8(
     if (S > 0) {
         float contrib_count = 0.0f;
         for (int64_t s = 0; s < S; s++) {
-            const int64_t dt = base_phase + s;
             const int64_t tbin = lgh_wrap_row(dt, t_bins);
-            const int64_t row_base = lgh_map_curve_row(idx_ptr[s], inv_ptr, N3);
+            const int64_t row_base = lgh_clamp_row(idx_ptr[s], N3);
             const int64_t row = lgh_temporal_fold_row(row_base, dt, N3, t_bins, Core::g_hpc_fold_alpha);
             if (S_prefetch > 0) {
                 const int64_t p_dt = dt + prefetch_d;
                 const int64_t p_tbin = lgh_wrap_row(p_dt, t_bins);
-                const int64_t p_base = lgh_map_curve_row(pidx_ptr[s % S_prefetch], inv_ptr, N3);
+                const int64_t p_base = lgh_clamp_row(pidx_ptr[s % S_prefetch], N3);
                 const int64_t p_row3 = lgh_temporal_fold_row(p_base, p_dt, N3, t_bins, Core::g_hpc_fold_alpha);
                 const int64_t p_row = p_row3 * atlas_bins + (p_tbin % atlas_bins);
                 const int8_t* p_ptr_prefetch = q_ptr + p_row * M;
@@ -3045,7 +3043,7 @@ std::vector<at::Tensor> geometric_manifold_forward_avx512_int8(
             if (s + prefetch_d < S) {
                 const int64_t n_dt = dt + prefetch_d;
                 const int64_t n_tbin = lgh_wrap_row(n_dt, t_bins);
-                const int64_t next_base = lgh_map_curve_row(idx_ptr[s + prefetch_d], inv_ptr, N3);
+                const int64_t next_base = lgh_clamp_row(idx_ptr[s + prefetch_d], N3);
                 const int64_t next_row3 = lgh_temporal_fold_row(next_base, n_dt, N3, t_bins, Core::g_hpc_fold_alpha);
                 const int64_t next_row = next_row3 * atlas_bins + (n_tbin % atlas_bins);
                 const int8_t* next_ptr = q_ptr + next_row * M;
@@ -3062,9 +3060,23 @@ std::vector<at::Tensor> geometric_manifold_forward_avx512_int8(
                 const int8_t* row_ptr = q_ptr + w_row * M;
                 const float row_scale = sc_ptr[w_row];
                 const float total_scale = coeff * row_scale;
+#ifdef __AVX512F
+                int64_t m = 0;
+                const __m512 scale_v = _mm512_set1_ps(total_scale);
+                for (; m + 16 <= M; m += 16) {
+                    __m128i row_int8 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(row_ptr + m));
+                    __m512 row_f32 = _mm512_cvtepi8_ps(row_int8);
+                    __m512 a = _mm512_loadu_ps(proto_ptr + m);
+                    _mm512_storeu_ps(proto_ptr + m, _mm512_fmadd_ps(row_f32, scale_v, a));
+                }
+                for (; m < M; m++) {
+                    proto_ptr[m] += static_cast<float>(row_ptr[m]) * total_scale;
+                }
+#else
                 for (int64_t m = 0; m < M; m++) {
                     proto_ptr[m] += static_cast<float>(row_ptr[m]) * total_scale;
                 }
+#endif
                 trace_ptr[w_row] = lgh_trace_pulse_update(trace_v, trace_gain_f, std::abs(coeff));
                 contrib_count += std::max(0.001f, ripple * phase);
             }

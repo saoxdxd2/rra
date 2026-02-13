@@ -31,36 +31,7 @@ def _cpp_has(op_name, *tensors):
 def _cpp_try(op_name, *args, tensors=None):
     return _ACCEL.call(op_name, *args, tensors=tensors)
 
-# TitansMemory using C++ kernels (replaces neural_memory.py)
-class TitansMemory(nn.Module):
-    """Associative memory using C++ titans_memory_forward kernel."""
-    def __init__(self, input_dim, hidden_dim, learning_rate=None, decay=None, max_memories=1024):
-        super().__init__()
-        self.dim = input_dim
-        self.max_memories = max_memories
-        self.register_buffer('memory_keys', torch.empty(0, input_dim))
-        self.register_buffer('memory_values', torch.empty(0, input_dim))
-
-    def forward(self, x):
-        if self.memory_keys.size(0) > 0:
-            output, _ = _cpp_try(
-                'titans_memory_forward',
-                x.contiguous(), self.memory_keys, self.memory_values, 1.0,
-                tensors=(x, self.memory_keys, self.memory_values)
-            )
-            return output
-        return torch.zeros_like(x)  # No memories yet
-    
-    def write(self, key, value):
-        self.memory_keys, self.memory_values = _cpp_try(
-            'titans_memory_update',
-            self.memory_keys, self.memory_values, key.contiguous(), value.contiguous(), self.max_memories,
-            tensors=(key, value, self.memory_keys, self.memory_values)
-        )
-    
-    def reset_memory(self):
-        self.memory_keys = torch.empty(0, self.dim, device=self.memory_keys.device)
-        self.memory_values = torch.empty(0, self.dim, device=self.memory_values.device)
+# TitansMemory decommissioned in favor of Manifold Imprinting.
 
 # ---------------------------
 # Hyperparameters & Constants
@@ -779,8 +750,7 @@ class CognitiveOrganism(BaseCognitiveModule):
             self.register_parameter('hpc_layer_gain', None)
             self.register_parameter('hpc_layer_bias', None)
         
-        # TitansMemory (System 2 Context)
-        self.titans_memory = TitansMemory(input_dim=self.d_s2 * C, hidden_dim=self.d_s2 * C).to(self.device)
+        # TitansMemory decommissioned (Merged into LGH-Manifold)
         
         # System 2 Readout (Bit-Level)
         self.readout = VNNILinear(R * self.d_s2 * C, 8).to(self.device)
@@ -852,19 +822,7 @@ class CognitiveOrganism(BaseCognitiveModule):
         self.survival = SurvivalController(L, R, device=self.device)
         self.virtual_lab = VirtualLab(enabled=bool(Config.VIRTUAL_LAB_ENABLED))
         self.memory_depth = memory_depth
-        self.episodic_memory = HybridEpisodicMemory(
-            dim=self.d_s2 * C,
-            hot_capacity=self.episodic_cfg.hot_capacity,
-            cold_capacity=self.cfg.EPISODIC_CAPACITY,
-            device=self.device,
-            cold_dense_mode=self.episodic_cfg.dense_mode,
-            key_latent_dim=self.episodic_cfg.key_latent_dim,
-            value_latent_dim=self.episodic_cfg.value_latent_dim,
-            cold_capacity_multiplier=self.episodic_cfg.dense_capacity_multiplier,
-            fallback_threshold=self.episodic_cfg.hybrid_fallback_threshold,
-            hot_top_k=self.episodic_cfg.hot_top_k,
-            cold_top_k=self.episodic_cfg.cold_top_k,
-        )
+        # HybridEpisodicMemory decommissioned (Merged into LGH-Manifold)
         self.memory_governor = MemoryGovernor(dim=self.d_s2 * C, device=self.device)
         self.memory_governor_predictor = self.memory_governor.predictor
         self.H_cycles = self.cfg_h_cycles
@@ -941,7 +899,6 @@ class CognitiveOrganism(BaseCognitiveModule):
             'rms_norm', 'parallel_scan', 'fused_rms_mean',
             'dcls_ram_addresses', 'dcls_ram_lookup', 'dcls_ram_lookup_int8', 'dcls_backward',
             'fused_lif_ram_lookup', 'batched_ademamix_update',
-            'titans_memory_forward', 'titans_memory_update',
             'configure_hpc', 'configure_runtime',
             'forward_stack_io', 'mes_super_step_io',
             'survival_update_io', 'survival_mask_io', 'survival_losses_io'
@@ -1033,7 +990,6 @@ class CognitiveOrganism(BaseCognitiveModule):
             self.register_buffer('_lgh_mdna_mask', torch.ones(self.L, self.R, dtype=torch.float32, device=self.device))
             self.register_buffer('_lgh_synaptic_trace', torch.zeros(n, dtype=torch.float32, device=self.device))
             self.register_buffer('_lgh_morton_order', self._lgh_morton.order.clone().to(dtype=torch.long))
-            self.register_buffer('_lgh_inverse_order', self._lgh_morton.inverse_order.clone().to(dtype=torch.long))
         else:
             self.lgh_manifold_morton = None
             self.register_buffer('_lgh_curve_indices', torch.empty(0, dtype=torch.long, device=self.device))
@@ -1041,7 +997,6 @@ class CognitiveOrganism(BaseCognitiveModule):
             self.register_buffer('_lgh_mdna_mask', torch.empty(0, dtype=torch.float32, device=self.device))
             self.register_buffer('_lgh_synaptic_trace', torch.empty(0, dtype=torch.float32, device=self.device))
             self.register_buffer('_lgh_morton_order', torch.empty(0, dtype=torch.long, device=self.device))
-            self.register_buffer('_lgh_inverse_order', torch.empty(0, dtype=torch.long, device=self.device))
     
     def _sync_stacked_params(self):
         """
@@ -1815,8 +1770,7 @@ class CognitiveOrganism(BaseCognitiveModule):
                     temporal_bins=self.lgh_cfg.temporal_bins,
                     fold_alpha=self.lgh_cfg.temporal_fold_alpha
                 )
-                chain_orig = self._lgh_morton.morton_to_original(chain_morton)
-                return chain_orig
+                return chain_morton
         return None
 
     def _predict_prefetch_curve_chain(self, p_s1):
@@ -1843,8 +1797,7 @@ class CognitiveOrganism(BaseCognitiveModule):
                     temporal_bins=self.lgh_cfg.temporal_bins,
                     fold_alpha=self.lgh_cfg.temporal_fold_alpha
                 )
-                chain_orig = self._lgh_morton.morton_to_original(chain_morton)
-                return chain_orig
+                return chain_morton
         return None
 
     def _refresh_lgh_curve_from_genome(self, predicted_curve=None):
@@ -1865,7 +1818,7 @@ class CognitiveOrganism(BaseCognitiveModule):
         focus_sharpness = float(self.lgh_cfg.focus_sharpness)
         if hasattr(self.genome, 'focus_sharpness'):
             focus_sharpness = max(0.01, float(getattr(self.genome, 'focus_sharpness', self.lgh_cfg.focus_sharpness)))
-        new_curve = self._lgh_morton.curve_segment_original(
+        new_curve = self._lgh_morton.curve_segment_morton(
             start,
             int(self._lgh_curve_indices.numel()),
             wrap=self.lgh_cfg.curve_wrap,
@@ -1936,7 +1889,19 @@ class CognitiveOrganism(BaseCognitiveModule):
                 d = p_curve[:, -1, :].abs().mean()
             return float(torch.nan_to_num(d, nan=1.0, posinf=1.0, neginf=0.0).item())
 
-    def _run_lgh_cycle(self, p_brain, H, gate, B, T, h_cycles, l_cycles, dyn_threshold, p_s1=None):
+    def _imprint_to_manifold(self, keys, values, importance):
+        """Imprint patterns into the LGH-Manifold trajectory for O(1) density retrieval."""
+        if self.lgh_manifold_morton is None or self._lgh_curve_indices.numel() == 0:
+            return
+        with torch.no_grad():
+            indices = self._lgh_curve_indices.contiguous() # [S] Morton indices
+            # Broadcast batch of important values to the global manifold
+            # We use an EMA update weighted by importance.
+            val_mean = values.mean(dim=0) # [D]
+            imp_mean = importance.mean().item()
+            lr = 0.05 * imp_mean
+            # Vectorized scatter-add or indexing for imprinting along the path
+            self.lgh_manifold_morton[indices] = (1.0 - lr) * self.lgh_manifold_morton[indices] + lr * val_mean.unsqueeze(0)
         if not (self.cfg_lgh_enabled and self.lgh_cfg.replace_forward_stack):
             return False, None, None, None
         if self.lgh_manifold_morton is None or self._lgh_curve_indices.numel() == 0:
@@ -1966,7 +1931,6 @@ class CognitiveOrganism(BaseCognitiveModule):
         thermal_penalty = self.get_thermal_penalty()
         curve_idx = self._lgh_curve_indices.contiguous()
         prefetch_curve_idx = self._lgh_prefetch_curve_indices.contiguous()
-        inv_order = self._lgh_inverse_order.contiguous()
         syn_trace = self._lgh_synaptic_trace
         time_phase = int(self.step_counter.item()) if hasattr(self, 'step_counter') else 0
         trace_bias = max(0.0, min(1.0, float(getattr(self, 'temporal_trace_bias', 0.5))))
@@ -2186,10 +2150,9 @@ class CognitiveOrganism(BaseCognitiveModule):
         z_L = p_expanded
         
         
-        # L2-Cycle: Titans Working Memory Context (Brain Scale)
+        # L2-Cycle: Titans Working Memory (Merged into LGH-Manifold)
         p_titans = p_brain.mean(dim=1)
-        p_context = self.titans_memory(p_titans) 
-        z_L = z_L + p_context.view(B, 1, 1, self.d_s2, self.C)
+        # Contextualization is now handled implicitly by the LGH-Manifold traverser.
 
         # === DISTRIBUTED COGNITIVE CYCLE ===
         # Prefer fused kernel when enabled; otherwise use required forward_stack_io path.
@@ -2244,53 +2207,20 @@ class CognitiveOrganism(BaseCognitiveModule):
         if learning_brain is not None and hasattr(learning_brain, 'apply_temporal_scaling_vec'):
             H_next = learning_brain.apply_temporal_scaling_vec(H_next, H)
         
-        # --- BIOLOGICAL FEATURE: Episodic Memory Consolidation ---
-        # Store important patterns in long-term memory and retrieve during inference
-        p_flat = p_titans  # [B, D_S2 * C]
-        
-        # Store high-importance patterns using an EMA threshold (avoids per-step quantile sort).
-        if self.episodic_enabled and self.training:
+        # --- BIOLOGICAL FEATURE: Manifold Memory Imprinting ---
+        # Instead of a separate episodic memory, we imprint important patterns
+        # directly into the LGH-Manifold trajectory for O(1) retrieval.
+        if self.cfg_lgh_enabled and self.training:
             with torch.no_grad():
                 importance_score = self.memory_governor_predictor(p_flat.detach()).squeeze(-1)  # [B]
                 importance_threshold = self._compute_importance_threshold(importance_score)
-                should_store = importance_score > importance_threshold
-                if should_store.any():
-                    self.episodic_memory.write(p_flat[should_store], z_L.reshape(B, -1)[should_store, :self.d_s2 * self.C])
+                should_store = (importance_score > importance_threshold).any()
+                if should_store:
+                    self._imprint_to_manifold(p_titans, z_L.reshape(B, -1)[:, :self.d_s2 * self.C], importance_score)
         
-        # Retrieve from episodic memory and blend with current context
-        should_read_episodic = (
-            self.episodic_enabled
-            and
-            (self.episodic_memory.count > 0)
-            and ((not self.training) or ((int(self.step_counter.item()) % self.episodic_cfg.read_every) == 0))
-        )
-        if should_read_episodic:
-            with torch.no_grad():
-                _, retrieved, retrieval_score = self.episodic_memory.read(
-                    p_flat.detach(),
-                    top_k=self.episodic_cfg.read_top_k,
-                    max_scan=self.episodic_cfg.max_scan
-                )
-                # retrieved: [B, K, D], retrieval_score: [B, K]
-                # alpha = retrieval_score.unsqueeze(-1).clamp(0, 1) * 0.1  # [B, K, 1]
-                # memory_context = (retrieved * alpha).sum(dim=1)          # [B, D]
-            # p_with_memory = p_flat + memory_context
-            # Blend episodic memory into output
-            # Expand p_with_memory to match readout input dimensions
-            # We add the memory contribution to each time step
-            T_out = z_L.size(1)
-            y_flat = z_L.reshape(B, T_out, self.R * self.d_s2 * self.C)
-            y_flat = rms_norm(y_flat) # Stability before readout
-            
-            # Broadcast memory context across regions without materializing a repeated [B,T,R*M] tensor.
-            # memory_contribution = p_with_memory.view(B, 1, 1, self.d_s2 * self.C)
-            y_blocks = y_flat.reshape(B, T_out, self.R, self.d_s2 * self.C)
-            y_blocks = y_blocks + 0.1 * (retrieved * retrieval_score.unsqueeze(-1).clamp(0, 1) * 0.1).sum(dim=1).view(B, 1, 1, self.d_s2 * self.C)
-            y_flat = y_blocks.reshape(B, T_out, self.R * self.d_s2 * self.C)
-        else:
-            T_out = z_L.size(1)
-            y_flat = z_L.reshape(B, T_out, self.R * self.d_s2 * self.C)
-            y_flat = rms_norm(y_flat) # Stability before readout
+        T_out = z_L.size(1)
+        y_flat = z_L.reshape(B, T_out, self.R * self.d_s2 * self.C)
+        y_flat = rms_norm(y_flat) # Stability before readout
         
         # --- BIOLOGICAL FEATURE: Myelin Update (Use-dependent insulation) ---
         if self.training and int(self.step_counter.item()) % 100 == 0:
