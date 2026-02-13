@@ -101,7 +101,8 @@ namespace NIS {
     /**
      * Cache & LGH Metadata
      */
-    static constexpr int64_t CACHE_HASH_BITS     = 20;
+    static constexpr bool    LGH_ENABLED             = true;
+    static constexpr int64_t CACHE_HASH_BITS         = 20;
     static constexpr int64_t LGH_CURVE_LENGTH    = 96;
     static constexpr float LGH_TRACE_DECAY     = 0.90f;
     static constexpr float LGH_TRACE_GAIN      = 0.20f;
@@ -170,6 +171,7 @@ namespace NIS {
     static constexpr float TTFS_SLOPE_THRESHOLD   = 0.001f;
     static constexpr float EVENT_DENSITY_THRESHOLD= 0.1f;
     static constexpr const char* EVENT_DRIVEN_MODE= "hybrid";
+    static constexpr bool  EVENT_DRIVEN_ENABLED   = true;
     
     static constexpr float PHASE_0_KEEP_RATIO     = 0.5f;
     static constexpr float DISSONANCE_CONFIDENCE_THRESHOLD = 0.5f;
