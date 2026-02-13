@@ -1935,6 +1935,8 @@ class CognitiveOrganism(BaseCognitiveModule):
         curve_idx = self._lgh_curve_indices.contiguous()
         prefetch_curve_idx = self._lgh_prefetch_curve_indices.contiguous()
         inv_order = self._lgh_inverse_order.contiguous()
+        syn_trace = self._lgh_synaptic_trace
+        time_phase = int(self.step_counter.item()) if hasattr(self, 'step_counter') else 0
 
         if uncertainty <= float(self.lgh_cfg.int4_uncertainty_threshold):
             q_bits = 4
@@ -1954,7 +1956,7 @@ class CognitiveOrganism(BaseCognitiveModule):
                 focus_sharpness=focus_sharpness
             )
             if manifold_q is not None and manifold_scale is not None and _cpp_ready(
-                p_brain, H, gate_cpp, manifold_q, manifold_scale, curve_idx, prefetch_curve_idx, inv_order, self._lgh_mdna_mask
+                p_brain, H, gate_cpp, manifold_q, manifold_scale, curve_idx, prefetch_curve_idx, inv_order, self._lgh_mdna_mask, syn_trace
             ):
                 out = _cpp_try(
                     'geometric_manifold_forward_avx512_int8',
@@ -1967,19 +1969,26 @@ class CognitiveOrganism(BaseCognitiveModule):
                     prefetch_curve_idx,
                     inv_order,
                     self._lgh_mdna_mask.contiguous(),
+                    syn_trace,
+                    int(time_phase),
                     int(h_cycles),
                     int(l_cycles),
                     float(dyn_threshold),
                     int(self.lgh_cfg.prefetch_distance),
                     float(thermal_penalty),
                     float(self.lgh_cfg.low_entropy_fold_threshold),
-                    tensors=(p_brain, H, gate_cpp, manifold_q, manifold_scale, curve_idx, prefetch_curve_idx, inv_order, self._lgh_mdna_mask)
+                    int(self.lgh_cfg.wave_radius),
+                    float(self.lgh_cfg.wave_decay),
+                    float(self.lgh_cfg.trace_decay),
+                    float(self.lgh_cfg.trace_gain),
+                    int(self.lgh_cfg.temporal_bins),
+                    tensors=(p_brain, H, gate_cpp, manifold_q, manifold_scale, curve_idx, prefetch_curve_idx, inv_order, self._lgh_mdna_mask, syn_trace)
                 )
 
         if out is None:
             if not _cpp_has(
                 'geometric_manifold_forward_avx512',
-                p_brain, H, gate_cpp, manifold_morton, curve_idx, prefetch_curve_idx, inv_order, self._lgh_mdna_mask
+                p_brain, H, gate_cpp, manifold_morton, curve_idx, prefetch_curve_idx, inv_order, self._lgh_mdna_mask, syn_trace
             ):
                 return False, None, None, None
             out = _cpp_try(
@@ -1992,13 +2001,20 @@ class CognitiveOrganism(BaseCognitiveModule):
                 prefetch_curve_idx,
                 inv_order,
                 self._lgh_mdna_mask.contiguous(),
+                syn_trace,
+                int(time_phase),
                 int(h_cycles),
                 int(l_cycles),
                 float(dyn_threshold),
                 int(self.lgh_cfg.prefetch_distance),
                 float(thermal_penalty),
                 float(self.lgh_cfg.low_entropy_fold_threshold),
-                tensors=(p_brain, H, gate_cpp, manifold_morton, curve_idx, prefetch_curve_idx, inv_order, self._lgh_mdna_mask)
+                int(self.lgh_cfg.wave_radius),
+                float(self.lgh_cfg.wave_decay),
+                float(self.lgh_cfg.trace_decay),
+                float(self.lgh_cfg.trace_gain),
+                int(self.lgh_cfg.temporal_bins),
+                tensors=(p_brain, H, gate_cpp, manifold_morton, curve_idx, prefetch_curve_idx, inv_order, self._lgh_mdna_mask, syn_trace)
             )
         if not isinstance(out, (list, tuple)) or len(out) != 3:
             return False, None, None, None
