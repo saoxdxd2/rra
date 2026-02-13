@@ -129,10 +129,12 @@ class Accelerator:
         return [op for op in op_names if not hasattr(mod, op)]
 
     def call(self, op_name, *args, tensors=None):
+        # Hot-path optimization: bypass overhead for common calls
         probe_tensors = args if tensors is None else tensors
         dev_type = "cpu"
+        # Fast device detection
         for t in probe_tensors:
-            if isinstance(t, torch.Tensor):
+            if hasattr(t, "device"):
                 dev_type = t.device.type
                 break
         
@@ -144,35 +146,12 @@ class Accelerator:
                 if self.strict:
                     raise RuntimeError(f"C++ op '{op_name}' failed on '{dev_type}': {exc}") from exc
                 return None
-        if not self.ready(op_name, *probe_tensors):
-            if self.strict:
-                # Detect device type for better error message
-                dev_type = "cpu"
-                for t in probe_tensors:
-                    if isinstance(t, torch.Tensor):
-                        dev_type = t.device.type
-                        break
-                raise RuntimeError(f"C++ op '{op_name}' does not support implementation for device '{dev_type}'.")
-            return None
 
-        # Dispatch to specialized implementation if it exists
-        dev_type = "cpu"
-        for t in probe_tensors:
-            if isinstance(t, torch.Tensor):
-                dev_type = t.device.type
-                break
-        
-        final_op_name = op_name
-        specialized_name = f"{op_name}_{dev_type}"
-        if hasattr(mod, specialized_name):
-            final_op_name = specialized_name
-
-        try:
-            return getattr(mod, final_op_name)(*args)
-        except Exception as exc:
-            if self.strict:
-                raise RuntimeError(f"C++ op '{final_op_name}' failed: {exc}") from exc
-            return None
+        if self.strict:
+            if self.loader is None:
+                raise RuntimeError(f"C++ loader not available; required op '{op_name}'.")
+            raise RuntimeError(f"C++ op '{op_name}' is unavailable or unsupported on device '{dev_type}'.")
+        return None
 
     def configure(self, **kwargs):
         mod = self.loader
