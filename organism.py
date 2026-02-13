@@ -849,6 +849,16 @@ class CognitiveOrganism(BaseCognitiveModule):
         self.register_buffer('_last_surprise_cycle_scale', torch.tensor(1.0, dtype=torch.float32, device=self.device))
         self.register_buffer('_last_temporal_signal', torch.tensor(1.0, dtype=torch.float32, device=self.device))
         self.register_buffer('_last_temporal_cycle_scale', torch.tensor(1.0, dtype=torch.float32, device=self.device))
+
+    def _imprint_to_manifold(self, p, z, importance):
+        """Placeholder for Manifold Imprinting (titans-style FAST learning)."""
+        pass
+
+    def _compute_importance_threshold(self, score):
+        # Adaptive threshold based on EMA
+        self.importance_threshold_ema = 0.95 * self.importance_threshold_ema + 0.05 * score.mean().item()
+        return self.importance_threshold_ema
+        self.register_buffer('_last_temporal_cycle_scale', torch.tensor(1.0, dtype=torch.float32, device=self.device))
         self.episodic_enabled = True
         self.pruning_enabled = True
         
@@ -2266,13 +2276,13 @@ class CognitiveOrganism(BaseCognitiveModule):
         # --- BIOLOGICAL FEATURE: Manifold Memory Imprinting ---
         # Instead of a separate episodic memory, we imprint important patterns
         # directly into the LGH-Manifold trajectory for O(1) retrieval.
-        if self.cfg_lgh_enabled and self.training:
             with torch.no_grad():
-                importance_score = self.memory_governor_predictor(p_flat.detach()).squeeze(-1)  # [B]
+                p_flat = p.mean(dim=1).detach()
+                importance_score = self.memory_governor_predictor(p_flat).squeeze(-1)  # [B]
                 importance_threshold = self._compute_importance_threshold(importance_score)
                 should_store = (importance_score > importance_threshold).any()
                 if should_store:
-                    self._imprint_to_manifold(p_titans, z_L.reshape(B, -1)[:, :self.d_s2 * self.C], importance_score)
+                    self._imprint_to_manifold(p_flat, z_L.reshape(B, -1, self.R * self.d_s2 * self.C).mean(dim=1)[:, :self.d_s2 * self.C], importance_score)
         
         T_out = z_L.size(1)
         y_flat = z_L.reshape(B, T_out, self.R * self.d_s2 * self.C)
