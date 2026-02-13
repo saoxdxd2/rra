@@ -52,7 +52,7 @@ from config import Config
 
 L = Config.L
 R = Config.R
-D = Config.D
+D = Config.WORKING_DIM
 C = Config.C
 DEVICE = Config.DEVICE
 
@@ -90,6 +90,7 @@ class HomeostaticModule(nn.Module):
         # --- 2. Metabolic Governance (Migrated from Genome) ---
         self.register_buffer('usage', torch.ones(L, R))
         self.register_buffer('reliability', torch.ones(L, R))
+        self.register_buffer('hpc_layer_error_ema', torch.zeros(L))
         
         # --- 3. Consolidated configuration for C++ kernels ---
         # 0: gamma, 1: imp_w, 2: surp_w, 3: metabolic_pressure, 4: tps_pressure, 5: noise
@@ -1377,23 +1378,22 @@ class CognitiveOrganism(BaseCognitiveModule):
             if hasattr(cpp_loader, 'get_hpc_error_ema'):
                 # Note: Currently C++ EMA is a placeholder, updating it here via Python's logic
                 # for parity until the kernel is updated.
-                self._hpc_error_ema.mul_(decay).add_(global_safe * (1.0 - decay))
-                # Future: Core::g_hpc_error_ema = ... in C++
+                self.homeostasis.config_scalars[6] = self.homeostasis.config_scalars[6] * decay + float(global_safe * (1.0 - decay))
             else:
-                self._hpc_error_ema.mul_(decay).add_(global_safe * (1.0 - decay))
+                self.homeostasis.config_scalars[6] = self.homeostasis.config_scalars[6] * decay + float(global_safe * (1.0 - decay))
             
-            self._hpc_last_error.copy_(global_safe)
-            self._hpc_layer_error_ema.mul_(decay).add_(layer_safe * (1.0 - decay))
+            self.homeostasis.config_scalars[7] = float(global_safe)
+            self.homeostasis.hpc_layer_error_ema.mul_(decay).add_(layer_safe * (1.0 - decay))
         
         # Facade property update
-        self.error_ema = float(self._hpc_error_ema.item())
+        self.error_ema = float(self.homeostasis.config_scalars[6])
 
     def _hpc_cycle_scale(self):
         if not self._hpc_active():
-            self._hpc_last_cycle_scale.fill_(1.0)
+            self.homeostasis.config_scalars[8] = 1.0
             return 1.0
         target_error = max(1e-6, self.hpc_cfg.target_error)
-        ema_error = float(self._hpc_error_ema.item())
+        ema_error = float(self.homeostasis.config_scalars[6])
         if not math.isfinite(ema_error):
             ema_error = target_error
         ratio = ema_error / target_error
@@ -1402,7 +1402,7 @@ class CognitiveOrganism(BaseCognitiveModule):
         min_scale = max(0.1, min(min_scale, max_scale))
         max_scale = max(min_scale, max_scale)
         scale = max(min_scale, min(max_scale, ratio))
-        self._hpc_last_cycle_scale.fill_(float(scale))
+        self.homeostasis.config_scalars[8] = float(scale)
         return float(scale)
 
     def _dynamic_cycle_counts(self):
@@ -1415,7 +1415,7 @@ class CognitiveOrganism(BaseCognitiveModule):
 
     def _apply_surprise_cycle_control(self, h_cycles, l_cycles, surprise_signal, is_audit=False):
         if (not self.hpc_cfg.surprise_gate) or is_audit:
-            self._last_surprise_cycle_scale.fill_(1.0)
+            self.homeostasis.config_scalars[10] = 1.0
             return h_cycles, l_cycles, False
         threshold = max(1e-6, self.hpc_cfg.surprise_threshold)
         score = float(surprise_signal.mean().item())
@@ -1431,7 +1431,7 @@ class CognitiveOrganism(BaseCognitiveModule):
             scale = 1.0
         h_next = max(1, int(round(h_cycles * scale)))
         l_next = max(1, int(round(l_cycles * scale)))
-        self._last_surprise_cycle_scale.fill_(float(scale))
+        self.homeostasis.config_scalars[10] = float(scale)
         skip_reasoning = bool(
             self.hpc_cfg.surprise_skip_enabled
             and (scale <= self.hpc_cfg.surprise_skip_scale)
@@ -1441,23 +1441,23 @@ class CognitiveOrganism(BaseCognitiveModule):
 
     def _temporal_activity_signal(self, p):
         if (not self.hpc_cfg.temporal_gate_enabled) or p.dim() != 3 or p.size(1) <= 1:
-            self._last_temporal_signal.fill_(1.0)
+            self.homeostasis.config_scalars[11] = 1.0
             return torch.ones((p.size(0), 1, 1), dtype=torch.float32, device=p.device)
         window = min(int(self.hpc_cfg.temporal_gate_window), int(p.size(1)))
         if window <= 1:
-            self._last_temporal_signal.fill_(1.0)
+            self.homeostasis.config_scalars[11] = 1.0
             return torch.ones((p.size(0), 1, 1), dtype=torch.float32, device=p.device)
         p_tail = p[:, -window:, :]
         delta = (p_tail[:, 1:, :] - p_tail[:, :-1, :]).abs().mean(dim=(1, 2), keepdim=True)
         delta = torch.nan_to_num(delta, nan=0.0, posinf=1.0, neginf=0.0)
         signal = torch.tanh(delta).to(dtype=torch.float32)
         signal = torch.nan_to_num(signal, nan=0.0, posinf=1.0, neginf=0.0)
-        self._last_temporal_signal.copy_(signal.mean().detach().to(self.device, dtype=torch.float32))
+        self.homeostasis.config_scalars[11] = float(signal.mean().detach())
         return signal
 
     def _apply_temporal_cycle_control(self, h_cycles, l_cycles, temporal_signal, is_audit=False):
         if (not self.hpc_cfg.temporal_gate_enabled) or is_audit:
-            self._last_temporal_cycle_scale.fill_(1.0)
+            self.homeostasis.config_scalars[12] = 1.0
             return h_cycles, l_cycles, False
         threshold = max(1e-6, self.hpc_cfg.temporal_gate_threshold)
         score = float(temporal_signal.mean().item())
@@ -1473,7 +1473,7 @@ class CognitiveOrganism(BaseCognitiveModule):
             scale = 1.0
         h_next = max(1, int(round(h_cycles * scale)))
         l_next = max(1, int(round(l_cycles * scale)))
-        self._last_temporal_cycle_scale.fill_(float(scale))
+        self.homeostasis.config_scalars[12] = float(scale)
         skip_reasoning = bool(
             self.hpc_cfg.temporal_gate_skip_enabled
             and (scale <= self.hpc_cfg.temporal_gate_skip_scale)
@@ -1503,16 +1503,16 @@ class CognitiveOrganism(BaseCognitiveModule):
 
     def _hpc_refresh_from_states(self, H_next, H_prev=None):
         if not self._hpc_active():
-            self._hpc_last_error.fill_(0.0)
-            return self._hpc_last_error
+            self.homeostasis.config_scalars[7] = 0.0
+            return self.homeostasis.config_scalars[7]
         step = int(self.step_counter.item())
         monitor_every = max(1, self.hpc_cfg.monitor_every)
         if self.training and (step % monitor_every) != 0:
-            return self._hpc_last_error
+            return self.homeostasis.config_scalars[7]
         with torch.no_grad():
             global_error, layer_error_full, _, _ = self._hpc_error_terms(H_next.detach(), H_prev.detach() if H_prev is not None else None)
             self._hpc_update_error_stats(global_error, layer_error_full)
-        return self._hpc_last_error
+        return self.homeostasis.config_scalars[7]
 
     def _hpc_train_predictors(self, H_next, H_prev=None):
         if not (self._hpc_active() and hasattr(self, 'hpc_optimizer')):
@@ -1592,7 +1592,7 @@ class CognitiveOrganism(BaseCognitiveModule):
 
     def _project_bits(self, bits):
         """Shared bit->latent->brain projection."""
-        p = self.bit_to_latent(bits)
+        p = F.linear(bits, self.bit_to_latent.weight, self.bit_to_latent.bias)
         p_brain = self.bridge_s1_to_s2(p)
         return p, p_brain
 
@@ -1610,7 +1610,7 @@ class CognitiveOrganism(BaseCognitiveModule):
         Returns: p [B, T, d_s1*C], B, T
         """
         if self._preflight_ready:
-            return self.bit_to_latent(x) if x.dim() == 3 and x.size(-1) == 8 else x, x.size(0), x.size(1)
+            return F.linear(x, self.bit_to_latent.weight, self.bit_to_latent.bias) if x.dim() == 3 and x.size(-1) == 8 else x, x.size(0), x.size(1)
 
         if isinstance(x, np.ndarray):
             x = torch.from_numpy(x)
@@ -1628,10 +1628,10 @@ class CognitiveOrganism(BaseCognitiveModule):
                 else:
                     is_binary = bool(((x == 0) | (x == 1)).all().item())
                     bits = x.unsqueeze(1).to(torch.float32) if is_binary else self._bytes_to_bits(x)
-                p = self.bit_to_latent(bits)
+                p = F.linear(bits, self.bit_to_latent.weight, self.bit_to_latent.bias)
                 return p, p.size(0), p.size(1)
             bits = self._bytes_to_bits(x)
-            p = self.bit_to_latent(bits)
+            p = F.linear(bits, self.bit_to_latent.weight, self.bit_to_latent.bias)
             return p, p.size(0), p.size(1)
 
         if x.dim() != 3:
@@ -1642,7 +1642,7 @@ class CognitiveOrganism(BaseCognitiveModule):
             return p, p.size(0), p.size(1)
         if x.size(-1) == 8:
             bits = x.to(torch.float32)
-            p = self.bit_to_latent(bits)
+            p = F.linear(bits, self.bit_to_latent.weight, self.bit_to_latent.bias)
             return p, p.size(0), p.size(1)
 
         raise ValueError(f"Unsupported last dimension for x: {x.size(-1)} (expected 8 or {self.d_s1 * self.C}).")
@@ -1989,6 +1989,7 @@ class CognitiveOrganism(BaseCognitiveModule):
             
         return self.noise_scale
 
+    def forward(self, x, H, gate=None, mode='stability', learning_brain=None):
         # 0. Hot-path caching
         cfg_mes_enabled = self.cfg_mes_enabled
         cfg_cache_enabled = self.cfg_cache_enabled
@@ -2074,7 +2075,7 @@ class CognitiveOrganism(BaseCognitiveModule):
         surprise_error = torch.tanh(error.detach().abs().mean(dim=(1, 2), keepdim=True))
         surprise_gate_prob = torch.sigmoid(self.surprise_gate(h_ctx)).unsqueeze(-1)
         surprise_signal = (0.5 * surprise_error + 0.5 * surprise_gate_prob).clamp(0.0, 1.0)
-        self._last_surprise_signal.copy_(surprise_signal.mean().detach().to(device, dtype=torch.float32))
+        self.homeostasis.config_scalars[9] = float(surprise_signal.mean().detach())
         temporal_signal = self._temporal_activity_signal(p)
         gaba = getattr(self, 'gaba_inhibition', 0.5)
         fkbp5 = getattr(self, 'fkbp5', 0.5)
@@ -2170,7 +2171,10 @@ class CognitiveOrganism(BaseCognitiveModule):
             with torch.no_grad():
                 self.myelin_sheaths.data.mul_(0.99).add_(H_next.view(B, self.L, self.R, -1).norm(dim=(0, 3)), alpha=0.01)
         
-        out = self.readout(y_flat)
+        if self.training:
+            out = F.linear(y_flat, self.readout.weight, self.readout.bias)
+        else:
+            out = self.readout(y_flat) # Use VNNI if quantized
         
         # PRUNING 2.0: update survival usage on throttled cadence to reduce CPU stalls.
         self._maybe_update_survival(H_next, z_H_start, should_update=should_update_survival)
@@ -2178,7 +2182,7 @@ class CognitiveOrganism(BaseCognitiveModule):
         cost_step = gate.sum() * self.cfg_param_cost_scale
         
         # Calculate aggregate engagement rate from all levels
-        self._current_engagement_rate = self._compute_engagement_rate()
+        self.homeostasis.config_scalars[15] = float(self._compute_engagement_rate())
         
         # Log to Virtual Lab if enabled
         if self.virtual_lab.enabled:
@@ -2190,15 +2194,15 @@ class CognitiveOrganism(BaseCognitiveModule):
                 'audit': float(is_audit),
                 'thinking_duration': h_cycles_used,
                 'hpc_error': float(hpc_error.item()) if isinstance(hpc_error, torch.Tensor) else float(hpc_error),
-                'hpc_cycle_scale': float(self._hpc_last_cycle_scale.item()),
-                'hpc_surprise_signal': float(self._last_surprise_signal.item()),
-                'hpc_surprise_scale': float(self._last_surprise_cycle_scale.item()),
-                'hpc_temporal_signal': float(self._last_temporal_signal.item()),
-                'hpc_temporal_scale': float(self._last_temporal_cycle_scale.item()),
-                'engagement_rate': self._current_engagement_rate,
-                'bypass_rate': 1.0 - self._current_engagement_rate,
-                'thermal_penalty': float(thermal_penalty),
-                'cpu_freq_ghz': float(self._lgh_last_freq_ghz.item()),
+                'hpc_cycle_scale': float(self.homeostasis.config_scalars[8]),
+                'hpc_surprise_signal': float(self.homeostasis.config_scalars[9]),
+                'hpc_surprise_scale': float(self.homeostasis.config_scalars[10]),
+                'hpc_temporal_signal': float(self.homeostasis.config_scalars[11]),
+                'hpc_temporal_scale': float(self.homeostasis.config_scalars[12]),
+                'engagement_rate': float(self.homeostasis.config_scalars[15]),
+                'bypass_rate': 1.0 - float(self.homeostasis.config_scalars[15]),
+                'thermal_penalty': float(self.homeostasis.config_scalars[13]),
+                'cpu_freq_ghz': float(self.homeostasis.config_scalars[14]),
                 't': T,
                 'B': B
             })

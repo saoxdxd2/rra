@@ -2295,11 +2295,11 @@ def main():
     # 2. Model Initialization
     # input_dim: Bytes (dataset.vocab_size) -> d_s1
     model = CognitiveOrganism(
-        input_dim=Config.D_S1 * Config.C, 
+        input_dim=(Config.WORKING_DIM // 8) * Config.C, 
         L=Config.L, 
         R=Config.R, 
-        d_s1=Config.D_S1, 
-        d_s2=Config.D_S2,
+        d_s1=(Config.WORKING_DIM // 8), 
+        d_s2=Config.WORKING_DIM,
         vocab_size=train_loader.dataset.vocab_size,
         output_dim=train_loader.dataset.vocab_size,
         device=DEVICE
@@ -2320,7 +2320,7 @@ def main():
     
     # --- CRITICAL FIX: Initialize LearningBrain ---
     learning_brain = LearningBrain(
-        L=Config.L, R=Config.R, D=Config.D_S2, C=Config.C, device=DEVICE
+        L=Config.L, R=Config.R, D=Config.WORKING_DIM, C=Config.C, device=DEVICE
     )
     
     trainer = RRATrainer(model, learning_brain=learning_brain, device=DEVICE)

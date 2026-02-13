@@ -17,6 +17,7 @@ def _masked_ema_update(current: torch.Tensor, new_value: torch.Tensor, gamma: fl
 class LearningBrain(nn.Module):
     def __init__(self, L, R, D, C, device='cpu'):
         super().__init__()
+        # Ensure D is passed or used from Config if needed
         self.L, self.R, self.D, self.C = L, R, D, C
         self.device = device
         

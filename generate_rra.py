@@ -74,7 +74,7 @@ def generate(model, prompt_text="The concept of", max_len=512, temperature=0.7):
     bits_input = bytes_to_bits_tensor(input_indices) # [1, T, 8]
     
     # Init State
-    H = init_state(Config.L, Config.R, Config.D_S2, Config.C, device=DEVICE, scale=Config.INIT_SCALE)
+    H = init_state(Config.L, Config.R, Config.WORKING_DIM, Config.C, device=DEVICE, scale=Config.INIT_SCALE)
     
     # Prefill (Process prompt)
     with torch.no_grad():
@@ -122,11 +122,11 @@ if __name__ == "__main__":
     print(f">>> Device: {DEVICE}")
     
     model = CognitiveOrganism(
-        input_dim=Config.D_S1 * Config.C, 
+        input_dim=(Config.WORKING_DIM // 8) * Config.C, 
         L=Config.L, 
         R=Config.R, 
-        d_s1=Config.D_S1, 
-        d_s2=Config.D_S2,
+        d_s1=(Config.WORKING_DIM // 8), 
+        d_s2=Config.WORKING_DIM,
         vocab_size=VOCAB_SIZE,
         output_dim=VOCAB_SIZE,
         device=DEVICE
