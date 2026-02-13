@@ -159,30 +159,28 @@ class NeuralCache(nn.Module):
     def lookup(self, x: torch.Tensor, key_similarity_threshold: float = 0.3, use_avx512: bool = False) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Performs a fast lookup in the neural cache using LSH and SIMD if available."""
         B = x.size(0)
-        x_fp32 = x.float()
-        addresses = self.hasher(x_fp32)
-        x_normalized = F.normalize(x_fp32, dim=1).contiguous()
+        x_normalized = F.normalize(x.float(), dim=1).contiguous()
         
-        values, hit_mask = ACCEL.call(
+        values, hit_mask, addresses_out = ACCEL.call(
             'neural_cache_lookup_fast',
             x_normalized.detach(),
             self.keys,
             self.values,
-            addresses,
+            self.hasher.planes,
             self.valid,
             key_similarity_threshold,
             use_avx512,
-            tensors=(x_normalized, self.keys, self.values, addresses, self.valid)
+            tensors=(x_normalized, self.keys, self.values, self.hasher.planes, self.valid)
         )
         
         if not hit_mask.any():
             self.miss_count += B
-            return values.to(torch.float32), hit_mask, torch.zeros(B, device=self.device), addresses[:, 0], torch.zeros(B, dtype=torch.long, device=self.device)
+            return values.to(torch.float32), hit_mask, torch.zeros(B, device=self.device), addresses_out[:, 0], torch.zeros(B, dtype=torch.long, device=self.device)
 
         # Vectorized similarity for hit rows only
         hit_indices = hit_mask.nonzero().squeeze(-1)
         hit_subset = x_normalized[hit_indices]
-        addr_subset = addresses[hit_indices]
+        addr_subset = addresses_out[hit_indices]
         keys_subset = self.keys[:, addr_subset] # [Tables, Hits, Dim]
         sims = (hit_subset.unsqueeze(0) * keys_subset.to(hit_subset.dtype)).sum(dim=-1) # [Tables, Hits]
         now = time.time()
@@ -193,7 +191,7 @@ class NeuralCache(nn.Module):
         _, best_table_subset = blended_score.max(dim=0)
         max_sim_subset = sims.gather(0, best_table_subset.unsqueeze(0)).squeeze(0)
         
-        hit_addrs = addresses[:, 0].clone()
+        hit_addrs = addresses_out[:, 0].clone()
         hit_tables = torch.zeros(B, dtype=torch.long, device=self.device)
         max_sim = torch.zeros(B, device=self.device)
         

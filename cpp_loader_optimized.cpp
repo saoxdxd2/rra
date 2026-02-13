@@ -1001,120 +1001,105 @@ std::vector<torch::Tensor> fused_lif_ram_lookup(
 
 
 
-
-
 // -------------------------------------------------------------------------
 // KERNEL: Neural Cache Fast Lookup
 // -------------------------------------------------------------------------
+// -------------------------------------------------------------------------
+// KERNEL: Neural Cache Lookup (LSH Accelerated)
+// -------------------------------------------------------------------------
 std::vector<torch::Tensor> neural_cache_lookup_fast(
-    torch::Tensor query,      // [B, D] float32
+    torch::Tensor query,      // [B, D]
     torch::Tensor keys,       // [TBL, RAM, D] bf16/float
     torch::Tensor values,     // [TBL, RAM, O] bf16/float
-    torch::Tensor addresses,  // [B, TBL] long
-    torch::Tensor valid,      // [TBL, RAM] bool
+    torch::Tensor planes,     // [TBL, D, Bits]
+    torch::Tensor valid,      // [TBL, RAM]
     float key_similarity_threshold,
     bool use_avx512
 ) {
-    (void)use_avx512;
     check_cpu(query, "query");
     check_cpu(keys, "keys");
     check_cpu(values, "values");
-    check_cpu(addresses, "addresses");
+    check_cpu(planes, "planes");
     check_cpu(valid, "valid");
-    check_dim(query, 2, "query");
-    check_dim(keys, 3, "keys");
-    check_dim(values, 3, "values");
-    check_dim(addresses, 2, "addresses");
-    check_dim(valid, 2, "valid");
-    check_dtype(query, at::kFloat, "query");
-    TORCH_CHECK(keys.scalar_type() == at::kFloat || keys.scalar_type() == at::kBFloat16, "keys must be float32 or bfloat16.");
-    TORCH_CHECK(values.scalar_type() == at::kFloat || values.scalar_type() == at::kBFloat16, "values must be float32 or bfloat16.");
-    check_dtype(addresses, at::kLong, "addresses");
-    check_dtype(valid, at::kBool, "valid");
-
+    
     auto q_c = ensure_contig(query);
     auto k_c = ensure_contig(keys.to(torch::kFloat32));
     auto v_c = ensure_contig(values.to(torch::kFloat32));
-    auto a_c = ensure_contig(addresses);
+    auto p_c = ensure_contig(planes);
     auto m_c = ensure_contig(valid);
 
     const int64_t B = q_c.size(0);
     const int64_t D = q_c.size(1);
     const int64_t TBL = k_c.size(0);
     const int64_t RAM = k_c.size(1);
-    const int64_t KD = k_c.size(2);
-    Perf::g_cache_lookup_calls.fetch_add(1ULL, std::memory_order_relaxed);
-    TORCH_CHECK(KD == D, "keys last dim must match query dim.");
-    TORCH_CHECK(v_c.size(0) == TBL && v_c.size(1) == RAM, "values first two dims must match keys.");
-    TORCH_CHECK(a_c.size(0) == B && a_c.size(1) == TBL, "addresses must be [B, TBL].");
-    TORCH_CHECK(m_c.size(0) == TBL && m_c.size(1) == RAM, "valid must be [TBL, RAM].");
+    const int64_t Bits = p_c.size(2);
     const int64_t O = v_c.size(2);
 
     auto out = torch::zeros({B, O}, q_c.options());
     auto hit_mask = torch::zeros({B}, q_c.options().dtype(torch::kBool));
+    auto hit_addrs = torch::zeros({B, TBL}, q_c.options().dtype(torch::kLong));
 
     const float* q_ptr = q_c.data_ptr<float>();
     const float* k_ptr = k_c.data_ptr<float>();
     const float* val_ptr = v_c.data_ptr<float>();
-    const int64_t* addr_ptr = a_c.data_ptr<int64_t>();
+    const float* plane_ptr = p_c.data_ptr<float>();
     const bool* valid_ptr = m_c.data_ptr<bool>();
-    float* out_ptr = out.data_ptr<float>();
-    bool* hit_ptr = hit_mask.data_ptr<bool>();
+    float* o_ptr = out.data_ptr<float>();
+    bool* h_ptr = hit_mask.data_ptr<bool>();
+    int64_t* a_ptr = hit_addrs.data_ptr<int64_t>();
 
     #pragma omp parallel for schedule(static)
     for (int64_t b = 0; b < B; b++) {
-        const int64_t q_base = b * D;
-        float best_sim = -std::numeric_limits<float>::infinity();
-        int64_t best_tbl = -1;
-        int64_t best_slot = 0;
-
-        float q_norm_sq = 0.0f;
-        for (int64_t d = 0; d < D; d++) {
-            const float qv = q_ptr[q_base + d];
-            q_norm_sq += qv * qv;
-        }
-        const float q_norm = std::sqrt(q_norm_sq) + 1e-8f;
+        const float* q_b = q_ptr + b * D;
+        float best_sim = -1.0f;
+        int64_t best_table_idx = -1;
+        int64_t best_slot_idx = -1;
 
         for (int64_t t = 0; t < TBL; t++) {
-            int64_t addr = addr_ptr[b * TBL + t];
-            if (addr < 0) {
-                addr = 0;
+            // LSH Hashing Internally (CPU Cache)
+            uint64_t hash = 0;
+            for (int64_t bit = 0; bit < Bits; bit++) {
+                float dot = 0.0f;
+                const float* p_tb = plane_ptr + (t * D * Bits + 0 * Bits + bit);
+                for (int64_t d = 0; d < D; d++) {
+                    dot += q_b[d] * plane_ptr[t * D * Bits + d * Bits + bit];
+                }
+                if (dot > 0.0f) hash |= (1ULL << bit);
             }
-            int64_t slot = addr % RAM;
-            if (slot < 0) {
-                slot += RAM;
-            }
-            if (!valid_ptr[t * RAM + slot]) {
-                continue;
-            }
+            
+            const int64_t slot = hash % RAM;
+            a_ptr[b * TBL + t] = slot;
 
-            const int64_t k_base = (t * RAM + slot) * D;
-            float dot = 0.0f;
-            float k_norm_sq = 0.0f;
+            if (!valid_ptr[t * RAM + slot]) continue;
+
+            // Cosine Similarity
+            const float* k_s = k_ptr + (t * RAM + slot) * D;
+            float dot_k = 0.0f;
+            float q_n = 0.0f;
+            float k_n = 0.0f;
             for (int64_t d = 0; d < D; d++) {
-                const float kv = k_ptr[k_base + d];
-                dot += q_ptr[q_base + d] * kv;
-                k_norm_sq += kv * kv;
+                dot_k += q_b[d] * k_s[d];
+                q_n += q_b[d] * q_b[d];
+                k_n += k_s[d] * k_s[d];
             }
-            const float sim = dot / (q_norm * (std::sqrt(k_norm_sq) + 1e-8f));
-            if (sim > best_sim) {
+            float sim = dot_k / (std::sqrt(q_n * k_n) + 1e-8f);
+            
+            if (sim > key_similarity_threshold && sim > best_sim) {
                 best_sim = sim;
-                best_tbl = t;
-                best_slot = slot;
+                best_table_idx = t;
+                best_slot_idx = slot;
             }
         }
 
-        const bool hit = (best_tbl >= 0) && std::isfinite(best_sim) && (best_sim >= key_similarity_threshold);
-        hit_ptr[b] = hit;
-        if (hit) {
-            const int64_t src = (best_tbl * RAM + best_slot) * O;
-            const int64_t dst = b * O;
-            for (int64_t o = 0; o < O; o++) {
-                out_ptr[dst + o] = val_ptr[src + o];
-            }
+        if (best_table_idx != -1) {
+            h_ptr[b] = true;
+            const float* v_s = val_ptr + (best_table_idx * RAM + best_slot_idx) * O;
+            for (int64_t o = 0; o < O; o++) o_ptr[b * O + o] = v_s[o];
         }
     }
 
+    return {out, hit_mask, hit_addrs};
+}
     const long double b_ld = static_cast<long double>(B);
     const long double d_ld = static_cast<long double>(D);
     const long double tbl_ld = static_cast<long double>(TBL);
@@ -1882,7 +1867,15 @@ std::vector<at::Tensor> fused_cognitive_step(
     auto y_seq = y_out.defined() ? y_out : torch::zeros({B, T, R, M}, x.options());
     float* y_ptr = y_seq.data_ptr<float>();
 
+    // AVX-512 Constants
+    #ifdef __AVX512F
+    const __m512 v_lif_decay = _mm512_set1_ps(lif_decay);
+    const __m512 v_lif_threshold = _mm512_set1_ps(lif_threshold);
+    #endif
+
+    float global_max_delta = 0.0f;
     for (int step = 0; step < total_steps; step++) {
+        global_max_delta = 0.0f;
         // Parallel over B and L for averaging
         #pragma omp parallel for collapse(2) schedule(static)
         for (int b = 0; b < B; b++) {
@@ -1911,7 +1904,7 @@ std::vector<at::Tensor> fused_cognitive_step(
         }
         
         // Parallel over B, L, R for update
-        #pragma omp parallel for collapse(3) schedule(static)
+        #pragma omp parallel for collapse(3) schedule(static) reduction(max:global_max_delta)
         for (int b = 0; b < B; b++) {
             for (int l = 0; l < L; l++) {
                 for (int r = 0; r < R; r++) {
@@ -1920,18 +1913,52 @@ std::vector<at::Tensor> fused_cognitive_step(
                     const int64_t state_base = (static_cast<int64_t>(b) * L * R + l * R + r) * M;
                     const int64_t decay_base = static_cast<int64_t>(l * R + r) * M;
                     const float* ha = h_avg_global.data() + (static_cast<int64_t>(b) * L + l) * M;
-                    
+                    float thread_max_delta = 0.0f;
+
+                    #ifdef __AVX512F
+                    for (int m = 0; m < (M & ~15); m += 16) {
+                        __m512 v_curr = _mm512_loadu_ps(ha + m);
+                        // Address re-calc (SIMD address calc is complex, keeping scalar addressing but masked blend)
+                        float u_ff_arr[16];
+                        for (int mi = 0; mi < 16; mi++) {
+                            uint32_t addr = Core::compute_ram_address(x_ptr, d_ptr + (l*M*K + (m+mi)*K), c_ptr + (l*M*K + (m+mi)*K), T-1, T, (int)x_c.size(2), (int)K, (int)x_c.size(2), 1);
+                            u_ff_arr[mi] = t_ptr[l * M * ram_size + (m+mi) * ram_size + (addr % ram_size)];
+                        }
+                        __m512 v_u_ff = _mm512_loadu_ps(u_ff_arr);
+                        __m512 v_next = _mm512_add_ps(_mm512_mul_ps(v_lif_decay, v_curr), v_u_ff);
+                        
+                        // vblendvps equivalent: _mm512_mask_blend_ps
+                        __mmask16 spike_mask = _mm512_cmp_ps_mask(v_next, v_lif_threshold, _CMP_GT_OS);
+                        __m512 v_spike = _mm512_mask_blend_ps(spike_mask, _mm512_setzero_ps(), _mm512_set1_ps(1.0f));
+                        
+                        __m512 v_decay = _mm512_loadu_ps(dec_ptr + decay_base + m);
+                        __m512 v_state_old = _mm512_loadu_ps(h_ptr + state_base + m);
+                        __m512 v_state_new = _mm512_add_ps(_mm512_mul_ps(v_decay, v_state_old), v_spike);
+                        
+                        _mm512_storeu_ps(h_ptr + state_base + m, v_state_new);
+                        
+                        // Delta check
+                        __m512 v_diff = _mm512_abs_ps(_mm512_sub_ps(v_state_new, v_state_old));
+                        float d = _mm512_reduce_max_ps(v_diff);
+                        if (d > thread_max_delta) thread_max_delta = d;
+                    }
+                    #else
                     for (int m = 0; m < M; m++) {
                         // LIF + Update
                         float v_curr = ha[m];
-                        // Address re-calc (simplified for fused)
                         uint32_t addr = Core::compute_ram_address(x_ptr, d_ptr + (l*M*K + m*K), c_ptr + (l*M*K + m*K), T-1, T, (int)x_c.size(2), (int)K, (int)x_c.size(2), 1);
                         float u_ff = t_ptr[l * M * ram_size + m * ram_size + (addr % ram_size)];
                         float v_next = lif_decay * v_curr + u_ff;
                         float spike = (v_next > lif_threshold) ? 1.0f : 0.0f;
                         
-                        h_ptr[state_base + m] = dec_ptr[decay_base + m] * h_ptr[state_base + m] + spike;
+                        float old_val = h_ptr[state_base + m];
+                        float new_val = dec_ptr[decay_base + m] * old_val + spike;
+                        h_ptr[state_base + m] = new_val;
+                        float d = std::abs(new_val - old_val);
+                        if (d > thread_max_delta) thread_max_delta = d;
                     }
+                    #endif
+                    if (thread_max_delta > global_max_delta) global_max_delta = thread_max_delta;
                 }
             }
         }
@@ -1941,6 +1968,10 @@ std::vector<at::Tensor> fused_cognitive_step(
             #pragma omp parallel for schedule(static)
             for (int64_t i = 0; i < h_c.numel(); i++) h_ptr[i] *= (1.0f - tax_rate);
         }
+
+        // --- H-Cycle Temporal Folding (Early Exit) ---
+        // If the state change is below a very small epsilon, we've converged.
+        if (global_max_delta < 1e-6f) break;
     }
     
     // Final copy of output from h_ptr to y_ptr for the last cycle step
@@ -2132,290 +2163,11 @@ std::vector<torch::Tensor> survival_losses_io(
     return survival_losses(x_input, state);
 }
 
-// -------------------------------------------------------------------------
-// KERNEL: Fused Cognitive Cycle (Legacy / Full)
-// -------------------------------------------------------------------------
-std::vector<at::Tensor> _fused_cognitive_cycle_impl(
-    at::Tensor x_input, at::Tensor H_state, at::Tensor mask,
-    at::Tensor all_delays, at::Tensor all_tables, at::Tensor all_connections,
-    at::Tensor all_decays, at::Tensor all_halt_w, at::Tensor all_halt_b,
-    int64_t H_cycles, int64_t L_cycles,
-    double lif_decay, double lif_threshold, double halt_threshold,
-    at::Tensor H_out
-) {
-    check_cpu(x_input, "x_input");
-    check_cpu(H_state, "H_state");
-    check_cpu(mask, "mask");
-    check_cpu(all_delays, "all_delays");
-    check_cpu(all_tables, "all_tables");
-    check_cpu(all_connections, "all_connections");
-    check_cpu(all_decays, "all_decays");
-    check_cpu(all_halt_w, "all_halt_w");
-    check_cpu(all_halt_b, "all_halt_b");
-    check_dim(x_input, 3, "x_input");
-    check_dim(H_state, 5, "H_state");
-    check_dim(mask, 2, "mask");
-    check_dim(all_delays, 3, "all_delays");
-    check_dim(all_tables, 3, "all_tables");
-    check_dim(all_connections, 3, "all_connections");
-    check_dim(all_decays, 3, "all_decays");
-    check_dim(all_halt_w, 2, "all_halt_w");
-    check_dim(all_halt_b, 1, "all_halt_b");
-    check_dtype(x_input, at::kFloat, "x_input");
-    check_dtype(H_state, at::kFloat, "H_state");
-    check_dtype(mask, at::kFloat, "mask");
-    check_dtype(all_delays, at::kFloat, "all_delays");
-    check_dtype(all_tables, at::kFloat, "all_tables");
-    check_dtype(all_connections, at::kLong, "all_connections");
-    check_dtype(all_decays, at::kFloat, "all_decays");
-    check_dtype(all_halt_w, at::kFloat, "all_halt_w");
-    check_dtype(all_halt_b, at::kFloat, "all_halt_b");
-    if (H_out.defined() && H_out.numel() > 0) {
-        check_cpu(H_out, "H_out");
-        check_dim(H_out, 5, "H_out");
-        check_dtype(H_out, at::kFloat, "H_out");
-    }
-
-    // 1. Contiguity Check (API Boundary)
-    auto x_c = ensure_contig(x_input);
-    auto H_c = ensure_contig(H_state);
-    auto m_c = ensure_contig(mask);
-    auto d_c = ensure_contig(all_delays);
-    auto t_c = ensure_contig(all_tables);
-    auto c_c = ensure_contig(all_connections);
-    auto dec_c = ensure_contig(all_decays);
-    auto hw_c = ensure_contig(all_halt_w);
-    auto hb_c = ensure_contig(all_halt_b);
-    
-    int B = x_c.size(0);
-    int T = x_c.size(1);
-    int D_in = x_c.size(2);
-    int L = H_c.size(1);
-    int R = H_c.size(2);
-    int M = d_c.size(1); 
-    int K = d_c.size(2);
-    Perf::g_fused_cognitive_calls.fetch_add(1ULL, std::memory_order_relaxed);
-    TORCH_CHECK(K > 0 && K <= 30, "K must be in [1, 30] for safe bit addressing.");
-    TORCH_CHECK(m_c.size(0) == L && m_c.size(1) == R, "mask must have shape [L, R].");
-    TORCH_CHECK(d_c.size(0) == L, "all_delays first dimension must match L.");
-    TORCH_CHECK(t_c.size(0) == L && t_c.size(1) == M, "all_tables must have shape [L, M, RAM].");
-    TORCH_CHECK(c_c.size(0) == L && c_c.size(1) == M && c_c.size(2) == K, "all_connections must match delays shape.");
-    TORCH_CHECK(dec_c.size(0) == L && dec_c.size(1) == R, "all_decays must have shape [L, R, M].");
-    TORCH_CHECK(hw_c.size(0) == L, "all_halt_w first dimension must match L.");
-    TORCH_CHECK(hb_c.size(0) == L, "all_halt_b must have length L.");
-    // Assuming d_c is [L, M, K] or [M, K]? 
-    // In organism.py: delays is [L, M, K].
-    // Let's verify M vs d_c.size(1).
-    // Original code: int M = d_contig.size(1). Correct.
-    
-    int ram_size = t_c.size(2);
-    int block_size = H_c.size(3) * H_c.size(4); // D*C
-
-    // ---------------------------------------------------------------------
-    // ENTERPRISE SAFETY CHECKS
-    int64_t flattened_dim = H_c.size(3) * H_c.size(4); // M = D*C
-    TORCH_CHECK(M == flattened_dim, "M Neuron Mismatch");
-    
-    at::Tensor H_next;
-    if (H_out.defined() && H_out.numel() > 0 && H_out.sizes() == H_c.sizes()) {
-        H_next = H_out;
-        H_next.copy_(H_c);
-    } else {
-        H_next = H_c.clone();
-    }
-    
-    auto halt_probs = torch::zeros({B}, x_c.options());
-    auto output = torch::zeros({B, R * flattened_dim}, x_c.options());
-    auto converged = torch::zeros({B}, torch::kBool);
-    
-    // Raw Pointers
-    float* x_ptr = x_c.data_ptr<float>();
-    float* h_ptr = H_next.data_ptr<float>();
-    float* m_ptr = m_c.data_ptr<float>();
-    float* d_ptr = d_c.data_ptr<float>();
-    float* t_ptr = t_c.data_ptr<float>();
-    int64_t* c_ptr = c_c.data_ptr<int64_t>();
-    float* dec_ptr = dec_c.data_ptr<float>();
-    float* hw_ptr = hw_c.data_ptr<float>();
-    float* hb_ptr = hb_c.data_ptr<float>();
-    float* hp_ptr = halt_probs.data_ptr<float>();
-    float* out_ptr = output.data_ptr<float>();
-    bool* conv_ptr = converged.data_ptr<bool>();
-    (void)hw_ptr;
-    (void)hb_ptr;
-    (void)hp_ptr;
-    
-    int total_steps = (int)(NIS::H_CYCLES * NIS::L_CYCLES);
-
-    // Precompute RAM slots once per [B, L, M] to avoid repeated address recomputation
-    // inside every cognitive step.
-    const int64_t lm_stride = static_cast<int64_t>(L) * static_cast<int64_t>(M);
-    const int64_t addr_count = static_cast<int64_t>(B) * lm_stride;
-    std::vector<int32_t> ram_slot_cache(static_cast<size_t>(addr_count), 0);
-    #pragma omp parallel for schedule(static)
-    for (int64_t idx = 0; idx < addr_count; idx++) {
-        const int b = static_cast<int>(idx / lm_stride);
-        const int lm = static_cast<int>(idx % lm_stride);
-        const int l = lm / M;
-        const int m = lm % M;
-        const int neuron_params_base = l * M * K + m * K;
-        const uint32_t addr = Core::compute_ram_address(
-            x_ptr + b * T * D_in,
-            d_ptr + neuron_params_base,
-            c_ptr + neuron_params_base,
-            T - 1,
-            T,
-            D_in,
-            K,
-            D_in,
-            1
-        );
-        ram_slot_cache[static_cast<size_t>(idx)] = static_cast<int32_t>(addr % static_cast<uint32_t>(ram_size));
-    }
-
-    std::vector<std::vector<int>> active_regions(static_cast<size_t>(L));
-    for (int l = 0; l < L; l++) {
-        auto& active = active_regions[static_cast<size_t>(l)];
-        active.reserve(static_cast<size_t>(R));
-        for (int r = 0; r < R; r++) {
-            if (m_ptr[l * R + r] >= 0.5f) {
-                active.push_back(r);
-            }
-        }
-    }
-    
-    #pragma omp parallel
-    {
-        // Thread-Local State
-        static thread_local std::vector<float> h_avg;
-        static thread_local std::vector<float> s_spikes;
-        if (h_avg.size() < (size_t)M) {
-            h_avg.resize(M);
-            s_spikes.resize(M);
-        }
-        
-        #pragma omp for schedule(static)
-        for (int b = 0; b < B; b++) {
-            // Base offset for this batch
-            const int64_t batch_offset = static_cast<int64_t>(b) * static_cast<int64_t>(L) * static_cast<int64_t>(R) * static_cast<int64_t>(M);
-            
-            for (int step = 0; step < total_steps; step++) {
-                if (conv_ptr[b]) break;
-                
-                float max_delta = 0.0f;
-                
-                for (int l = 0; l < NIS::L; l++) {
-                    const auto& active_rs = active_regions[static_cast<size_t>(l)];
-                    if (active_rs.empty()) {
-                        continue;
-                    }
-                    const int64_t layer_offset = batch_offset + static_cast<int64_t>(l) * static_cast<int64_t>(NIS::R) * static_cast<int64_t>(M);
-                
-                    // 1. Average State (Across R)
-#ifdef __AVX512F
-                    const float inv_R = 1.0f / static_cast<float>(NIS::R);
-                    const __m512 v_inv_R = _mm512_set1_ps(inv_R);
-                    for (int m = 0; m < (M & ~15); m += 16) {
-                        __m512 sum = _mm512_setzero_ps();
-                        for (int r = 0; r < NIS::R; r++) {
-                            sum = _mm512_add_ps(sum, _mm512_loadu_ps(h_ptr + layer_offset + r * M + m));
-                        }
-                        _mm512_storeu_ps(h_avg.data() + m, _mm512_mul_ps(sum, v_inv_R));
-                    }
-#else
-                    for (int m = 0; m < M; m++) {
-                        float sum = 0.0f;
-                        for (int r = 0; r < NIS::R; r++) {
-                            sum += h_ptr[layer_offset + r * M + m];
-                        }
-                        h_avg[m] = sum / (float)NIS::R;
-                    }
-#endif
-                    
-                    // 2. LIF Activation (BIOS Hard-Wired)
-                    for (int m = 0; m < M; m++) {
-                        const int64_t addr_idx = static_cast<int64_t>(b) * lm_stride + static_cast<int64_t>(l) * static_cast<int64_t>(M) + static_cast<int64_t>(m);
-                        const int32_t slot = ram_slot_cache[static_cast<size_t>(addr_idx)];
-                        float u_ff = t_ptr[l * M * ram_size + m * ram_size + slot];
-                        float v_curr = h_avg[m];
-                        float v_next = NIS::LIF_DECAY * v_curr + u_ff;
-                        
-                        s_spikes[m] = (v_next > NIS::LIF_THRESHOLD) ? 1.0f : 0.0f;
-                    }
-                    
-                    // 3. Update State (Decay + Spike Injection)
-                    for (size_t ri = 0; ri < active_rs.size(); ri++) {
-                        int r = active_rs[ri];
-                        const int64_t state_base = layer_offset + static_cast<int64_t>(r) * static_cast<int64_t>(M);
-                        const int64_t decay_base = static_cast<int64_t>(l) * static_cast<int64_t>(NIS::R) * static_cast<int64_t>(M) + static_cast<int64_t>(r) * static_cast<int64_t>(M); 
-#ifdef __AVX512F
-                        for (int m = 0; m < (M & ~15); m += 16) {
-                            __m512 s = _mm512_loadu_ps(s_spikes.data() + m);
-                            __m512 decay = _mm512_loadu_ps(dec_ptr + decay_base + m);
-                            __m512 old_val = _mm512_loadu_ps(h_ptr + state_base + m);
-                            __m512 new_val = _mm512_add_ps(_mm512_mul_ps(decay, old_val), s);
-                            _mm512_storeu_ps(h_ptr + state_base + m, new_val);
-                            
-                            // Note: max_delta update in SIMD is omitted for extreme performance, 
-                            // using scalar tail check or simplified heuristic if needed.
-                        }
-#else
-                        for (int m = 0; m < M; m++) {
-                            float s = s_spikes[m];
-                            float decay = dec_ptr[decay_base + m];
-                            float old_val = h_ptr[state_base + m];
-                            float new_val = decay * old_val + s;
-                            h_ptr[state_base + m] = new_val;
-                            float delta = std::abs(new_val - old_val);
-                            if (delta > max_delta) max_delta = delta;
-                        }
-#endif
-                    }
-                } // End L
-                
-                if (max_delta < 1e-5f) {
-                    conv_ptr[b] = true;
-                    break;
-                }
-            } // End Steps
-        }
-    }
-    
-    // Output aggregation (sum over layers, then average).
-    const float inv_L = 1.0f / static_cast<float>(std::max(1, L));
-    const int64_t out_blocks = static_cast<int64_t>(B) * static_cast<int64_t>(R) * static_cast<int64_t>(M);
-    #pragma omp parallel for schedule(static)
-    for (int64_t idx = 0; idx < out_blocks; idx++) {
-        const int b = static_cast<int>(idx / (static_cast<int64_t>(R) * M));
-        const int rm = static_cast<int>(idx % (static_cast<int64_t>(R) * M));
-        float sum = 0.0f;
-        const int64_t base = static_cast<int64_t>(b) * static_cast<int64_t>(L) * static_cast<int64_t>(R) * static_cast<int64_t>(M) + static_cast<int64_t>(rm);
-        for (int l = 0; l < L; l++) {
-            sum += h_ptr[base + l * R * M];
-        }
-        out_ptr[b * R * M + rm] = sum * inv_L;
-    }
-
-    const long double b_ld = static_cast<long double>(B);
-    const long double l_ld = static_cast<long double>(L);
-    const long double r_ld = static_cast<long double>(R);
-    const long double m_ld = static_cast<long double>(M);
-    const long double k_ld = static_cast<long double>(K);
-    const long double steps_ld = static_cast<long double>(std::max(0, total_steps));
-    const long double precompute_flops = b_ld * l_ld * m_ld * (8.0L * k_ld);
-    const long double cycle_flops = b_ld * steps_ld * l_ld * m_ld * (4.0L * r_ld + 5.0L);
-    const long double reduce_flops = b_ld * r_ld * m_ld * (l_ld + 1.0L);
-    const long double precompute_bytes = b_ld * l_ld * m_ld * (16.0L * k_ld + 4.0L);
-    const long double cycle_bytes = b_ld * steps_ld * l_ld * m_ld * (12.0L * r_ld + 16.0L);
-    const long double reduce_bytes = b_ld * r_ld * m_ld * (4.0L * l_ld + 4.0L);
-    Perf::add(
-        Perf::sat_from_ld(precompute_flops + cycle_flops + reduce_flops),
-        Perf::sat_from_ld(precompute_bytes + cycle_bytes + reduce_bytes)
-    );
-
-    // Explicitly return output to avoid garbage collection issues
-    return {output, H_next, halt_probs};
-}
+// --- THE GREAT PURGE: LEGACY FORWARD PATHS DELETED ---
+// geometric_manifold_forward_avx512 deleted
+// pulse_gated_forward deleted
+// forward_stack (legacy) deleted
+// _fused_cognitive_cycle_impl (merged) deleted
 
 // Wrapper for organism.py compatibility
 /**
@@ -3886,4 +3638,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.attr("GLOBAL_PULSE_EVERY") = NIS::GLOBAL_PULSE_EVERY;
     m.attr("GLOBAL_PULSE_WEIGHT") = NIS::GLOBAL_PULSE_WEIGHT;
     m.attr("EVENT_DRIVEN_ENABLED") = (bool)NIS::EVENT_DRIVEN_ENABLED;
+
+    // --- REFINED EXPORTS ---
+    m.def("batched_ademamix_update", &batched_ademamix_update);
+    m.def("neural_cache_lookup_fast", &neural_cache_lookup_fast);
+    m.def("fused_cognitive_step", &fused_cognitive_step);
+    m.def("unified_dispatch_io", &unified_dispatch_io);
+    m.def("fused_cognitive_cycle_ultra", &fused_cognitive_cycle_ultra);
+    m.def("survival_losses", &survival_losses);
+    m.def("calculate_nis_sparsity", &calculate_nis_sparsity);
 }

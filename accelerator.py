@@ -8,18 +8,37 @@ import torch
 def _configure_windows_dll_dirs():
     if os.name != "nt" or not hasattr(os, "add_dll_directory"):
         return
-    candidates = [os.getcwd()]
-    torch_lib = os.path.join(os.path.dirname(torch.__file__), "lib")
-    candidates.append(torch_lib)
+    
+    # Common candidates: local dir, torch lib, and Intel oneAPI/compiler runtimes
+    candidates = [
+        os.getcwd(),
+        os.path.join(os.path.dirname(torch.__file__), "lib"),
+    ]
+    
+    # Intel Compiler (ICX) runtime paths for OpenMP (libiomp5md.dll)
+    intel_paths = [
+        r"C:\Program Files (x86)\Intel\oneAPI\compiler\latest\windows\bin\intel64",
+        r"C:\Program Files (x86)\Intel\oneAPI\mkl\latest\bin\intel64",
+        r"C:\Program Files (x86)\Intel\oneAPI\compiler\latest\windows\redist\intel64_win\compiler",
+    ]
+    candidates.extend(intel_paths)
+    
+    # Also check if it's already in the PATH
+    env_path = os.environ.get("PATH", "")
+    for p in env_path.split(os.pathsep):
+        if "intel" in p.lower() or "oneapi" in p.lower():
+            candidates.append(p)
+
     seen = set()
     for path in candidates:
+        if not path: continue
         norm = os.path.normpath(path)
         if norm in seen or not os.path.isdir(path):
             continue
         seen.add(norm)
         try:
-            os.add_dll_directory(path)
-        except OSError:
+            os.add_dll_directory(norm)
+        except (OSError, ValueError):
             continue
 
 

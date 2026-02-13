@@ -1644,71 +1644,7 @@ class CognitiveOrganism(BaseCognitiveModule):
 
         raise ValueError(f"Unsupported last dimension for x: {x.size(-1)} (expected 8 or {self.d_s1 * self.C}).")
 
-    def _run_lgh_cycle(self, p_brain, H, gate, B, T, h_cycles, l_cycles, dyn_threshold, p_s1=None):
-        if not (bool(Config.LGH_ENABLED) and hasattr(cpp_loader, 'geometric_manifold_forward_avx512')):
-            return False, None, None, None
-
-        manifold = self._lgh_morton_manifold()
-        if manifold is None or manifold.numel() == 0:
-            return False, None, None, None
-
-        # Prep Curve Indices
-        # Using authoritative BIOS update
-        self.update_phenotype()
-
-        idx_c = self._lgh_curve_indices.contiguous()
-        pidx_c = self._lgh_prefetch_curve_indices.contiguous()
-        trace_c = self._lgh_synaptic_trace.contiguous()
-        mdna_c = self._lgh_mdna_mask.contiguous()
-        if gate.dim() == 4 and gate.size(0) == self.L and gate.size(1) == self.R:
-            gate_cpp = gate.squeeze(-1).squeeze(-1) # [L, R, 1, 1] -> [L, R]
-        elif gate.dim() == 4:
-            gate_cpp = gate.mean(dim=(0, 1)) # [B, T, L, R] -> [L, R]
-        elif gate.dim() == 2 and gate.size(0) == self.L and gate.size(1) == self.R:
-            gate_cpp = gate
-        elif gate.dim() == 2:
-            gate_cpp = gate.reshape(self.L, self.R)
-        else:
-            # Handle scalars or other shapes securely
-            val = gate.view(-1).mean() if gate.numel() > 0 else torch.tensor(1.0, device=gate.device)
-            gate_cpp = val.expand(self.L, self.R)
-        gate_c = gate_cpp.float().contiguous()
-        p_brain_c = p_brain.float().contiguous()
-        H_c = H.contiguous()
-
-        step = int(self.step_counter.item()) if hasattr(self, 'step_counter') else 0
-        
-        if self._lgh_use_int8 and hasattr(cpp_loader, 'geometric_manifold_forward_avx512_int8'):
-            q_manifold, q_scale = self._quantize_lgh_manifold(bits=8)
-            z_lgh, H_next, halt_probs = cpp_loader.geometric_manifold_forward_avx512_int8(
-                p_brain_c, H_c, gate_c, q_manifold, q_scale, idx_c, pidx_c, mdna_c, trace_c,
-                step, int(h_cycles), int(l_cycles), float(dyn_threshold),
-                int(Config.LGH_PREFETCH_DISTANCE), float(getattr(Config, 'LGH_THERMAL_PENALTY_WEIGHT', 0.0)),
-                float(getattr(Config, 'LGH_LOW_ENTROPY_FOLD_THRESHOLD', 0.015)), int(getattr(Config, 'LGH_WAVE_RADIUS', 1)),
-                float(getattr(Config, 'LGH_WAVE_DECAY', 0.65)), float(getattr(Config, 'LGH_TRACE_DECAY', 0.90)), float(getattr(Config, 'LGH_TRACE_GAIN', 0.20)),
-                int(getattr(Config, 'LGH_TEMPORAL_BINS', 16))
-            )
-        elif hasattr(cpp_loader, 'pulse_gated_forward'):
-            # Phase 2 & 3: Hardware-Native Pulse + Zero-Copy Workspace
-            z_lgh, H_next, halt_probs = cpp_loader.pulse_gated_forward(
-                p_brain_c, H_c, gate_c, mdna_c, idx_c, manifold, self._lgh_workspace,
-                step, int(h_cycles), int(l_cycles), float(dyn_threshold),
-                int(Config.LGH_PREFETCH_DISTANCE), float(getattr(Config, 'LGH_THERMAL_PENALTY_WEIGHT', 0.0)),
-                float(getattr(Config, 'LGH_LOW_ENTROPY_FOLD_THRESHOLD', 0.015)), int(getattr(Config, 'LGH_TEMPORAL_BINS', 16))
-            )
-        else:
-            z_lgh, H_next, halt_probs = cpp_loader.geometric_manifold_forward_avx512(
-                p_brain_c, H_c, gate_c, manifold, idx_c, pidx_c, mdna_c, trace_c,
-                step, int(h_cycles), int(l_cycles), float(dyn_threshold),
-                int(Config.LGH_PREFETCH_DISTANCE), float(getattr(Config, 'LGH_THERMAL_PENALTY_WEIGHT', 0.0)),
-                float(getattr(Config, 'LGH_LOW_ENTROPY_FOLD_THRESHOLD', 0.015)), int(getattr(Config, 'LGH_WAVE_RADIUS', 1)),
-                float(getattr(Config, 'LGH_WAVE_DECAY', 0.65)), float(getattr(Config, 'LGH_TRACE_DECAY', 0.90)), float(getattr(Config, 'LGH_TRACE_GAIN', 0.20)),
-                int(getattr(Config, 'LGH_TEMPORAL_BINS', 16))
-            )
-        
-        return True, z_lgh, H_next, halt_probs
-
-    def _run_fused_cycle(self, p_brain, H, gate, B, T, h_cycles, l_cycles, dyn_threshold):
+    def _run_unified_cycle(self, p_brain, H, gate, B, T, h_cycles, l_cycles, dyn_threshold):
         if not (
             _cpp_has('unified_dispatch_io')
             and bool(Config.USE_FUSED_COGNITIVE_CYCLE)
@@ -2118,22 +2054,14 @@ class CognitiveOrganism(BaseCognitiveModule):
             halting_probability = torch.zeros(B, 1, 1, dtype=torch.float32, device=self.device)
             h_cycles_used = 0.0
         else:
-            lgh_ok, z_L_lgh, H_next_lgh, halting_probability_lgh = self._run_lgh_cycle(
-                p_brain, H, gate, B, T, h_cycles_cfg, l_cycles_cfg, dyn_threshold, p_s1=p
+            unified_ok, z_L_unified, H_next_unified, halting_probability_unified = self._run_unified_cycle(
+                p_brain, H, gate, B, T, h_cycles_cfg, l_cycles_cfg, dyn_threshold
             )
-            if lgh_ok:
-                z_L = z_L_lgh
-                H_next = H_next_lgh
-                halting_probability = halting_probability_lgh
+            if unified_ok:
+                z_L = z_L_unified
+                H_next = H_next_unified
+                halting_probability = halting_probability_unified
             else:
-                fused_ok, z_L_fused, H_next_fused, halting_probability_fused = self._run_fused_cycle(
-                    p_brain, H, gate, B, T, h_cycles_cfg, l_cycles_cfg, dyn_threshold
-                )
-            if (not lgh_ok) and fused_ok:
-                z_L = z_L_fused
-                H_next = H_next_fused
-                halting_probability = halting_probability_fused
-            elif not lgh_ok:
                 cos_sin = self.rope(T, self.device)
                 z_L, H_next, halting_probability = self._step_inner(
                     z_L, z_H, cos_sin, gate, mode, learning_brain, l_cycles=l_cycles_cfg, dyn_threshold=dyn_threshold
