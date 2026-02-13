@@ -71,95 +71,158 @@ def rms_norm(x, eps=Config.RMS_NORM_EPS):
     return _cpp_try('rms_norm', x.contiguous(), eps, tensors=(x,))
 
 
-class HomeostaticModule(nn.Module):
+@dataclass
+class MutationConfig:
+    """Hyperparameters for the evolutionary process."""
+    base_rate: float = 0.1
+    stress_multiplier: float = 0.3
+    max_intensity: float = 0.2
+    thermal_penalty_weight: float = 0.25
+    simd_penalty_weight: float = 0.15
+    simd_starvation_threshold: float = 1200.0
+
+class Governor(nn.Module):
     """
-    Unified Governance & Homeostasis Module:
-    1. Strategic Gating (Engagement/Certainty & Importance).
-    2. Metabolic Governance (Usage Tracking & Reliability).
-    3. Consolidated Configuration (Scalar Buffers for C++ kernels).
+    Unified Governance & Homeostasis Module (The BIOS).
+    Consolidates: 
+    1. Strategic Gating (Engagement & Importance).
+    2. Metabolic Governance (Usage & Reliability).
+    3. Evolutionary Policy (Genes, Mutation, Adaptation).
     """
-    def __init__(self, L, R, input_dim, hidden_dim=128, device=None):
+    GENE_ROLES = {
+        "learning_rate": "bdnf", "memory_plasticity": "creb",
+        "sparsity_pressure": "fkbp5", "engagement_threshold": "drd2",
+        "inhibition": "gaba", "curve_trajectory": "curve_trajectory",
+        "mask_sparsity": "mask_sparsity_bias", "thermal_efficiency": "metabolic_efficiency",
+        "wormhole_jump_bias": "wormhole_jump_bias", "focus_x": "focus_x",
+        "focus_y": "focus_y", "focus_z": "focus_z",
+        "focus_sharpness": "focus_sharpness", "temporal_trace": "temporal_trace_bias",
+    }
+
+    def __init__(self, L, R, input_dim, hidden_dim=128, device=None, seed=None):
         super().__init__()
         self.L, self.R = L, R
         self.device = device
+        self.rng = random.Random(seed)
         
-        # --- 1. Strategic Gating (Architecture from StrategicGatingModule) ---
+        # --- 1. Strategic Gating ---
         self.shared = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.ReLU()
         )
-        self.engagement_head = nn.Linear(hidden_dim, 1)   # Logit for Transparency Gate
+        self.engagement_head = nn.Linear(hidden_dim, 1)
         self.importance_head = nn.Sequential(
             nn.Linear(hidden_dim, 1),
             nn.Sigmoid()
-        )                                                # Probability for imprinting
+        )
         
-        # --- 2. Metabolic Governance (Migrated from Genome) ---
+        # --- 2. Metabolic Governance ---
         self.register_buffer('usage', torch.ones(L, R))
         self.register_buffer('reliability', torch.ones(L, R))
         self.register_buffer('hpc_layer_error_ema', torch.zeros(L))
-        
-        # --- 3. Consolidated configuration for C++ kernels ---
-        # 0: gamma, 1: imp_w, 2: surp_w, 3: metabolic_pressure, 4: tps_pressure, 5: noise
-        # 6: hpc_error_ema, 7: hpc_last_error, 8: hpc_last_cycle_scale
-        # 9: surprise_signal, 10: surprise_cycle_scale
-        # 11: temporal_signal, 12: temporal_cycle_scale
-        # 13: thermal_penalty_ema, 14: last_freq_ghz, 15: current_engagement_rate
-        # 16-20: forward_stack_scalars, 21-23: mes_super_scalars, 24-31: reserved
         self.register_buffer('config_scalars', torch.zeros(32, dtype=torch.float32))
-        self.config_scalars[0] = 0.95 # Default gamma
+        self.config_scalars[0] = 0.95 # Default gamma (BDNF inverse)
         self.config_scalars[1] = 1.0  # Default importance weight
         self.config_scalars[2] = 1.0  # Default surprise weight
         self.config_scalars[5] = 0.05 # Default noise
         self.config_scalars[15] = 1.0 # Default engagement rate
         
-        if device:
-            self.to(device)
-            
+        # --- 3. Evolutionary State (Genes) ---
+        self.generation = 0
+        self.health = 1.0
+        self.best_loss = float('inf')
+        self.mutation_config = MutationConfig()
+        
+        # We store genes as simple attributes for speed, but they wrap the multi-allele logic
+        # Legacy Genome used BrainGene objects; here we'll use a simplified version.
+        self._init_genes()
+        
+        if device: self.to(device)
+
+    def _init_genes(self):
+        # (name, baseline, min, max)
+        gene_schemes = {
+            'bdnf': (0.5, 0.1, 2.0), 'creb': (0.5, 0.0, 1.0),
+            'drd2': (0.5, 0.1, 0.9), 'fkbp5': (0.3, 0.1, 5.0),
+            'gaba': (0.5, 0.1, 1.0), 'curve_trajectory': (0.5, 0.0, 1.0),
+            'mask_sparsity_bias': (0.5, 0.05, 0.95), 'metabolic_efficiency': (0.5, 0.1, 1.5),
+            'wormhole_jump_bias': (0.15, 0.0, 1.0), 'focus_x': (0.5, 0.0, 1.0),
+            'focus_y': (0.5, 0.0, 1.0), 'focus_z': (0.5, 0.0, 1.0),
+            'focus_sharpness': (0.5, 0.05, 1.5), 'temporal_trace_bias': (0.5, 0.0, 1.0),
+        }
+        self.genes = {}
+        for name, (base, mi, ma) in gene_schemes.items():
+            # Store alleles as buffers for state_dict compatibility
+            self.register_buffer(f'gene_{name}_alleles', torch.tensor([base, base], dtype=torch.float32))
+            self.register_buffer(f'gene_{name}_meta', torch.tensor([mi, ma, 1.0], dtype=torch.float32)) # min, max, methylation
+
+    def get_expression(self, name):
+        if f'gene_{name}_alleles' not in self._buffers: return 0.5
+        alleles = self._buffers[f'gene_{name}_alleles']
+        meta = self._buffers[f'gene_{name}_meta']
+        expr = alleles.mean().item() * meta[2].item()
+        if name == 'fkbp5': return min(expr, 3.0)
+        return expr
+
+    @property
+    def bdnf(self): return self.get_expression('bdnf')
+    @property
+    def creb(self): return self.get_expression('creb')
+    @property
+    def fkbp5(self): return self.get_expression('fkbp5')
+    @property
+    def gaba(self): return self.get_expression('gaba')
+    @property
+    def curve_trajectory(self): return self.get_expression('curve_trajectory')
+    @property
+    def mask_sparsity_bias(self): return self.get_expression('mask_sparsity_bias')
+    @property
+    def metabolic_efficiency(self): return self.get_expression('metabolic_efficiency')
+    @property
+    def wormhole_jump_bias(self): return self.get_expression('wormhole_jump_bias')
+    @property
+    def focus_x(self): return self.get_expression('focus_x')
+    @property
+    def focus_y(self): return self.get_expression('focus_y')
+    @property
+    def focus_z(self): return self.get_expression('focus_z')
+    @property
+    def focus_sharpness(self): return self.get_expression('focus_sharpness')
+    @property
+    def temporal_trace_bias(self): return self.get_expression('temporal_trace_bias')
+
     def update_metabolism(self, H, H_prev=None, bdnf_gamma=None):
-        """Update usage scores via C++ kernel survival_update_io."""
         H_c = H.contiguous()
         H_prev_t = H_prev.contiguous() if H_prev is not None else torch.empty(0, device=H.device, dtype=H_c.dtype)
-        
         if bdnf_gamma is not None:
             self.config_scalars[0] = float(bdnf_gamma)
-            
-        # survival_update_io handles the EMA update of self.usage
-        from organism import _cpp_try
-        out = _cpp_try(
-            'survival_update_io',
-            H_c,
-            self.usage,
-            [H_prev_t],
-            self.config_scalars[:3], # Points 0, 1, 2
-            tensors=(H_c, self.usage, H_prev_t, self.config_scalars)
-        )
-        # Note: In-place update might be handled by C++ or return value.
-        # Genome implementation assigned it: self.usage = out
-        if out is not None:
-            self.usage = out
+        out = _cpp_try('survival_update_io', H_c, self.usage, [H_prev_t], self.config_scalars[:3], tensors=(H_c, self.usage, H_prev_t, self.config_scalars))
+        if out is not None: self.usage = out
             
     def get_metabolic_mask(self, metabolic_pressure, tps_pressure):
-        """Generate sparse activation mask via C++ kernel survival_mask_io."""
         self.config_scalars[3] = float(metabolic_pressure)
         self.config_scalars[4] = float(tps_pressure)
-        
-        from organism import _cpp_try
-        out = _cpp_try(
-            'survival_mask_io',
-            self.usage,
-            self.reliability,
-            self.config_scalars[3:6], # Points 3, 4, 5
-            tensors=(self.usage, self.reliability, self.config_scalars)
-        )
-        return out
+        return _cpp_try('survival_mask_io', self.usage, self.reliability, self.config_scalars[3:6], tensors=(self.usage, self.reliability, self.config_scalars))
+
+    def build_curve_chain(self, total_nodes: int, length: int, hint: int = 0) -> List[int]:
+        total = max(1, int(total_nodes))
+        start = int((self.curve_trajectory * max(0, total - 1) + (self.generation * 1) + int(hint)) % total)
+        trajectory = max(0.0, min(1.0, self.curve_trajectory))
+        step = max(1, int(round(1 + trajectory * 5)))
+        jump_bias = max(0.0, min(1.0, self.wormhole_jump_bias))
+        chain = []
+        cursor = start
+        for i in range(length):
+            chain.append(int(cursor))
+            if (hash(f"{self.generation}_{i}") % 100) / 100.0 < jump_bias:
+                cursor = int((cursor + (-1 if hash(f"dir_{i}") % 2 == 0 else 1) * int(total // 4) + hint) % total)
+            else:
+                cursor = int((cursor + step) % total)
+        return chain
 
     def forward(self, x):
-        """Strategic Gating Forward Pass."""
         features = self.shared(x)
-        engagement = self.engagement_head(features)
-        importance = self.importance_head(features)
-        return engagement, importance
+        return self.engagement_head(features), self.importance_head(features)
 
 
 
@@ -525,9 +588,9 @@ class OrganismLevel(BaseCognitiveModule):
         self.R, self.D, self.C = R, D, C
         self.cfg = cfg
         
-        # Homeostatic Module: O(1) engagement & importance + metabolic governance
-        self.homeostasis = HomeostaticModule(L=1, R=R, input_dim=D*C, device=device)
-        self.strategic_gating = self.homeostasis # Alias for backward compatibility
+        # Governor: Unified lifecycle/metabolism management (The BIOS)
+        self.governor = Governor(L=1, R=R, input_dim=D*C, device=device)
+        self.strategic_gating = self.governor # Alias for backward compatibility
         self.omega_ref = 0.0  # Synced from parent CognitiveOrganism
         self.h_decay_rate = self.cfg.BYPASS_H_DECAY  # Light memory decay during bypass
         
@@ -707,10 +770,10 @@ class CognitiveOrganism(BaseCognitiveModule):
         else:
             self.neural_cache = None
 
-        # Non-Linear Cognitive Bridge: System 1 -> System 2 (The Uploader)
+        # Bridge: S1 -> S2 (The Uploader)
         self.bridge_s1_to_s2 = SwiGLU(self.d_s1 * C, expansion=2.0, out_dim=self.d_s2 * C)
-        self.homeostasis = HomeostaticModule(L=L, R=R, input_dim=self.d_s1 * C, device=self.device)
-        self.strategic_gating = self.homeostasis # Unified alias
+        self.governor = Governor(L=L, R=R, input_dim=self.d_s1 * C, device=self.device)
+        self.strategic_gating = self.governor # Unified alias
         
         # System 2: Slow/Reasoning Path (D_S2)
         self.levels = nn.ModuleList([OrganismLevel(R, self.d_s2, C, device=device, cfg=self.cfg) for _ in range(L)])
@@ -751,7 +814,7 @@ class CognitiveOrganism(BaseCognitiveModule):
             )
         if self.cfg.MES_ENABLED:
             self.readout_optimizer = torch.optim.SGD(
-                [*self.readout.parameters(), *self.strategic_gating.parameters()], 
+                [*self.readout.parameters(), *self.governor.parameters()], 
                 lr=self.cfg.LEARNING_RATE * self.cfg.LOCAL_LR_RATIO
             )
         if self.cfg.MES_ENABLED and self.hpc_enabled and self.hpc_encoder is not None:
@@ -832,11 +895,11 @@ class CognitiveOrganism(BaseCognitiveModule):
         # 11: temporal_signal, 12: temporal_cycle_scale
         # 13: thermal_penalty_ema, 14: last_freq_ghz, 15: current_engagement_rate
         # 16-20: forward_stack_scalars, 21-23: mes_super_scalars
-        self.homeostasis.config_scalars[6] = self.hpc_cfg.target_error
-        self.homeostasis.config_scalars[8] = 1.0 # last_cycle_scale
-        self.homeostasis.config_scalars[10] = 1.0 # surprise_cycle_scale
-        self.homeostasis.config_scalars[12] = 1.0 # temporal_cycle_scale
-        self.homeostasis.config_scalars[15] = 1.0 # engagement_rate
+        self.governor.config_scalars[6] = self.hpc_cfg.target_error
+        self.governor.config_scalars[8] = 1.0 # last_cycle_scale
+        self.governor.config_scalars[10] = 1.0 # surprise_cycle_scale
+        self.governor.config_scalars[12] = 1.0 # temporal_cycle_scale
+        self.governor.config_scalars[15] = 1.0 # engagement_rate
 
 
         # --- BIOLOGICAL FEATURE: Myelin Sheaths (Fast Pathway Insulation) ---
@@ -854,9 +917,8 @@ class CognitiveOrganism(BaseCognitiveModule):
         self._params_dirty = True
         
         # --- Autonomous Intelligence: Genome Activation ---
-        self.genome = Genome()
         self.metabolic_threshold = 0.0 # Safety Init
-        self.update_phenotype_from_genome()
+        self.update_phenotype_from_governor()
         # --------------------------------------------------
         
         # Suggested LR from genome (BDNF expression)
@@ -942,6 +1004,24 @@ class CognitiveOrganism(BaseCognitiveModule):
         if not self.exec_cfg.use_forward_stack:
             raise RuntimeError("USE_FORWARD_STACK must be enabled; no Python reasoning fallback path exists.")
         print(">>> LGH-Manifold Consolidated Memory Active.")
+
+    def update_phenotype_from_governor(self):
+        """Syncs model hyperparameters with the current Governor state."""
+        self.suggested_lr = self.governor.bdnf * Config.LEARNING_RATE
+        self.lambda_sparsity = self.governor.fkbp5 * Config.LAMBDA_COST
+        self.gaba_inhibition = self.governor.gaba
+        self.curve_trajectory_gene = self.governor.curve_trajectory
+        self.mask_sparsity_bias = self.governor.mask_sparsity_bias
+        self.focus_x = self.governor.focus_x
+        self.focus_y = self.governor.focus_y
+        self.focus_z = self.governor.focus_z
+        self.focus_sharpness = self.governor.focus_sharpness
+        
+        # Sync to levels
+        for level in self.levels:
+            level.h_decay_rate = 0.01 + (0.1 * (1.0 - self.governor.creb))
+            
+        print(f">>> GOVERNOR: Phenotype updated (Gen {self.governor.generation})")
 
     def _imprint_to_manifold(self, p, z, importance):
         """Placeholder for Manifold Imprinting (titans-style FAST learning)."""
@@ -1827,8 +1907,8 @@ class CognitiveOrganism(BaseCognitiveModule):
             pred = torch.sigmoid(self.curve_index_head(s1_anchor)).mean()
             pred_start = int(round(float(pred.item()) * max(0, self._lgh_morton.size_original - 1)))
             self._lgh_last_curve_anchor.fill_(pred_start)
-            if hasattr(self.genome, 'build_curve_chain'):
-                chain = self.genome.build_curve_chain(
+            if hasattr(self.governor, 'build_curve_chain'):
+                chain = self.governor.build_curve_chain(
                     total_nodes=self._lgh_morton.size_original,
                     length=int(self._lgh_curve_indices.numel()),
                     hint=pred_start
@@ -1855,8 +1935,8 @@ class CognitiveOrganism(BaseCognitiveModule):
             pred = torch.sigmoid(self.curve_index_head(s1_anchor)).mean()
             pred_start = int(round(float(pred.item()) * max(0, self._lgh_morton.size_original - 1)))
             prefetch_hint = pred_start + int(self.lgh_cfg.prefetch_distance)
-            if hasattr(self.genome, 'build_curve_chain'):
-                chain = self.genome.build_curve_chain(
+            if hasattr(self.governor, 'build_curve_chain'):
+                chain = self.governor.build_curve_chain(
                     total_nodes=self._lgh_morton.size_original,
                     length=int(self._lgh_curve_indices.numel()),
                     hint=prefetch_hint
@@ -1880,16 +1960,16 @@ class CognitiveOrganism(BaseCognitiveModule):
             return
         curve_gene = float(getattr(self, 'curve_trajectory_gene', 0.5))
         curve_gene = max(0.0, min(1.0, curve_gene))
-        if hasattr(self.genome, 'next_curve_anchor'):
-            start = int(self.genome.next_curve_anchor(self._lgh_morton.size_original))
+        if hasattr(self.governor, 'next_curve_anchor'):
+            start = int(self.governor.next_curve_anchor(self._lgh_morton.size_original))
         else:
             start = int(round(curve_gene * max(0, self._lgh_morton.size_original - 1)))
         focus_strength = float(self.lgh_cfg.focus_strength)
-        if hasattr(self.genome, 'focus_sharpness'):
-            focus_strength = max(0.0, min(1.0, 0.5 * self.lgh_cfg.focus_strength + 0.5 * float(getattr(self.genome, 'focus_sharpness', self.lgh_cfg.focus_strength))))
+        if hasattr(self.governor, 'focus_sharpness'):
+            focus_strength = max(0.0, min(1.0, 0.5 * self.lgh_cfg.focus_strength + 0.5 * float(getattr(self.governor, 'focus_sharpness', self.lgh_cfg.focus_strength))))
         focus_sharpness = float(self.lgh_cfg.focus_sharpness)
-        if hasattr(self.genome, 'focus_sharpness'):
-            focus_sharpness = max(0.01, float(getattr(self.genome, 'focus_sharpness', self.lgh_cfg.focus_sharpness)))
+        if hasattr(self.governor, 'focus_sharpness'):
+            focus_sharpness = max(0.01, float(getattr(self.governor, 'focus_sharpness', self.lgh_cfg.focus_sharpness)))
         new_curve = self._lgh_morton.curve_segment_morton(
             start,
             int(self._lgh_curve_indices.numel()),
@@ -2079,7 +2159,7 @@ class CognitiveOrganism(BaseCognitiveModule):
         surprise_error = torch.tanh(error.detach().abs().mean(dim=(1, 2), keepdim=True))
         surprise_gate_prob = torch.sigmoid(self.surprise_gate(h_ctx)).unsqueeze(-1)
         surprise_signal = (0.5 * surprise_error + 0.5 * surprise_gate_prob).clamp(0.0, 1.0)
-        self.homeostasis.config_scalars[9] = float(surprise_signal.mean().detach())
+        self.governor.config_scalars[9] = float(surprise_signal.mean().detach())
         temporal_signal = self._temporal_activity_signal(p)
         gaba = getattr(self, 'gaba_inhibition', 0.5)
         fkbp5 = getattr(self, 'fkbp5', 0.5)
@@ -2186,7 +2266,7 @@ class CognitiveOrganism(BaseCognitiveModule):
         cost_step = gate.sum() * self.cfg_param_cost_scale
         
         # Calculate aggregate engagement rate from all levels
-        self.homeostasis.config_scalars[15] = float(self._compute_engagement_rate())
+        self.governor.config_scalars[15] = float(self._compute_engagement_rate())
         
         # Log to Virtual Lab if enabled
         if self.virtual_lab.enabled:
@@ -2354,9 +2434,9 @@ class CognitiveOrganism(BaseCognitiveModule):
         if not bool(valid_dissonance.any().item()):
             return 0
 
-        # Relax reliability in genome
-        self.genome.reliability[self._layer_indices, self._block_indices] *= (1.0 - dissonance_weight)
-        self.genome.reliability[self._layer_indices, self._block_indices].clamp_(min=0.0)
+        # Relax reliability in governor
+        self.governor.reliability[self._layer_indices, self._block_indices] *= (1.0 - dissonance_weight)
+        self.governor.reliability[self._layer_indices, self._block_indices].clamp_(min=0.0)
         t_indices = self._last_hit_tables[valid_dissonance]
         a_indices = self._last_hit_addrs[valid_dissonance]
         cache.reliability[t_indices, a_indices] *= (1.0 - dissonance_weight)
@@ -2479,8 +2559,8 @@ class CognitiveOrganism(BaseCognitiveModule):
         # METABOLIC TAXATION (Homeostasis)
         # Every consolidation cycle, neurons that haven't fired lose a bit of energy
         # This prevents the 100M parameters from becoming "Stochastic Parrots"
-        if self.genome.usage is not None:
-            self.genome.usage.data *= (1.0 - self.runtime_cfg.metabolic_tax_rate)
+        if self.governor.usage is not None:
+            self.governor.usage.data *= (1.0 - self.runtime_cfg.metabolic_tax_rate)
         self._apply_audit_dissonance(cache, s2_out, is_audit)
         self._demyelinate_unreliable_cache(cache)
 
