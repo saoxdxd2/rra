@@ -114,6 +114,7 @@ class GenomeState:
         "focus_y": "focus_y",
         "focus_z": "focus_z",
         "focus_sharpness": "focus_sharpness",
+        "temporal_trace": "temporal_trace_bias",
     }
 
     def __init__(self, seed: Optional[int] = None):
@@ -140,6 +141,7 @@ class GenomeState:
             'focus_y': BrainGene('FOCUS_Y', baseline=0.5, min_val=0.0, max_val=1.0, rng=self.rng),
             'focus_z': BrainGene('FOCUS_Z', baseline=0.5, min_val=0.0, max_val=1.0, rng=self.rng),
             'focus_sharpness': BrainGene('FOCUS_SHARPNESS', baseline=0.5, min_val=0.05, max_val=1.5, rng=self.rng),
+            'temporal_trace_bias': BrainGene('TEMPORAL_TRACE_BIAS', baseline=0.5, min_val=0.0, max_val=1.0, rng=self.rng),
         }
         
         # Static Linkage Map (Could be dynamic in future)
@@ -152,6 +154,7 @@ class GenomeState:
             'curve_trajectory': {'mask_sparsity_bias': 0.1},
             'wormhole_jump_bias': {'curve_trajectory': 0.2, 'metabolic_efficiency': 0.1},
             'focus_sharpness': {'mask_sparsity_bias': 0.1, 'metabolic_efficiency': 0.1},
+            'temporal_trace_bias': {'metabolic_efficiency': 0.2, 'curve_trajectory': 0.1},
         }
 
     def state_dict(self):
@@ -212,7 +215,7 @@ class EvolutionPolicy:
             return 'mask_sparsity_bias', 1.0
         elif stress_dir == "SILICON_STARVATION":
             # Evolve toward shorter, cheaper manifold traversals.
-            target = state.rng.choice(['metabolic_efficiency', 'wormhole_jump_bias', 'mask_sparsity_bias'])
+            target = state.rng.choice(['metabolic_efficiency', 'wormhole_jump_bias', 'mask_sparsity_bias', 'temporal_trace_bias'])
             return target, 1.0
         elif stress_dir == "ENERGY_FAILURE":
             return 'fkbp5', 1.0
@@ -278,6 +281,8 @@ class Genome: # Renamed from GenomeEngine to maintain compat with organism.py
     def focus_z(self): return self.get_expression('focus_z')
     @property
     def focus_sharpness(self): return self.get_expression('focus_sharpness')
+    @property
+    def temporal_trace_bias(self): return self.get_expression('temporal_trace_bias')
 
     def get_expression(self, name):
         if name in self.state.genes:

@@ -1235,6 +1235,7 @@ class CognitiveOrganism(BaseCognitiveModule):
         self.focus_y = float(getattr(self.genome, 'focus_y', 0.5))
         self.focus_z = float(getattr(self.genome, 'focus_z', 0.5))
         self.focus_sharpness = float(getattr(self.genome, 'focus_sharpness', self.lgh_cfg.focus_sharpness))
+        self.temporal_trace_bias = float(getattr(self.genome, 'temporal_trace_bias', 0.5))
         
         # BDNF: Learning Rate proxy
         bdnf_expression = self.genome.bdnf
@@ -1269,7 +1270,8 @@ class CognitiveOrganism(BaseCognitiveModule):
             f">>> GABA={gaba:.2f} | mEff={self.metabolic_efficiency:.2f} | "
             f"Curve={self.curve_trajectory_gene:.2f} | MaskBias={self.mask_sparsity_bias:.2f} | "
             f"Wormhole={self.wormhole_jump_bias:.2f} | Focus=({self.focus_x:.2f},{self.focus_y:.2f},{self.focus_z:.2f}) "
-            f"| Energy Factor={energy_factor:.2f} -> LR={self.suggested_lr:.2e} | Omega_mom={self.omega_momentum:.4f}"
+            f"| TraceBias={self.temporal_trace_bias:.2f} | Energy Factor={energy_factor:.2f} "
+            f"-> LR={self.suggested_lr:.2e} | Omega_mom={self.omega_momentum:.4f}"
         )
 
     def get_engagement_rate(self):
@@ -1790,6 +1792,13 @@ class CognitiveOrganism(BaseCognitiveModule):
                 )
                 # Convert Morton positions to original topology ids for kernel mapping via inverse_order.
                 chain_morton = torch.as_tensor(chain, dtype=torch.long, device=self.device)
+                dt = int(self.step_counter.item()) if hasattr(self, 'step_counter') else 0
+                chain_morton = self._lgh_morton.temporal_fold_morton(
+                    chain_morton,
+                    delta_t=dt,
+                    temporal_bins=self.lgh_cfg.temporal_bins,
+                    fold_alpha=self.lgh_cfg.temporal_fold_alpha
+                )
                 chain_orig = self._lgh_morton.morton_to_original(chain_morton)
                 return chain_orig
         return None
@@ -1811,6 +1820,13 @@ class CognitiveOrganism(BaseCognitiveModule):
                     hint=prefetch_hint
                 )
                 chain_morton = torch.as_tensor(chain, dtype=torch.long, device=self.device)
+                dt = int(self.step_counter.item()) if hasattr(self, 'step_counter') else 0
+                chain_morton = self._lgh_morton.temporal_fold_morton(
+                    chain_morton,
+                    delta_t=dt + int(self.lgh_cfg.prefetch_distance),
+                    temporal_bins=self.lgh_cfg.temporal_bins,
+                    fold_alpha=self.lgh_cfg.temporal_fold_alpha
+                )
                 chain_orig = self._lgh_morton.morton_to_original(chain_morton)
                 return chain_orig
         return None
@@ -1937,6 +1953,10 @@ class CognitiveOrganism(BaseCognitiveModule):
         inv_order = self._lgh_inverse_order.contiguous()
         syn_trace = self._lgh_synaptic_trace
         time_phase = int(self.step_counter.item()) if hasattr(self, 'step_counter') else 0
+        trace_bias = max(0.0, min(1.0, float(getattr(self, 'temporal_trace_bias', 0.5))))
+        trace_gain = float(self.lgh_cfg.trace_gain) * (0.5 + trace_bias)
+        trace_decay = max(0.50, min(0.9999, float(self.lgh_cfg.trace_decay) + (trace_bias - 0.5) * 0.08))
+        wave_decay = max(0.05, float(self.lgh_cfg.wave_decay) * (0.75 + 0.5 * uncertainty))
 
         if uncertainty <= float(self.lgh_cfg.int4_uncertainty_threshold):
             q_bits = 4
@@ -1978,9 +1998,9 @@ class CognitiveOrganism(BaseCognitiveModule):
                     float(thermal_penalty),
                     float(self.lgh_cfg.low_entropy_fold_threshold),
                     int(self.lgh_cfg.wave_radius),
-                    float(self.lgh_cfg.wave_decay),
-                    float(self.lgh_cfg.trace_decay),
-                    float(self.lgh_cfg.trace_gain),
+                    float(wave_decay),
+                    float(trace_decay),
+                    float(trace_gain),
                     int(self.lgh_cfg.temporal_bins),
                     tensors=(p_brain, H, gate_cpp, manifold_q, manifold_scale, curve_idx, prefetch_curve_idx, inv_order, self._lgh_mdna_mask, syn_trace)
                 )
@@ -2010,9 +2030,9 @@ class CognitiveOrganism(BaseCognitiveModule):
                 float(thermal_penalty),
                 float(self.lgh_cfg.low_entropy_fold_threshold),
                 int(self.lgh_cfg.wave_radius),
-                float(self.lgh_cfg.wave_decay),
-                float(self.lgh_cfg.trace_decay),
-                float(self.lgh_cfg.trace_gain),
+                float(wave_decay),
+                float(trace_decay),
+                float(trace_gain),
                 int(self.lgh_cfg.temporal_bins),
                 tensors=(p_brain, H, gate_cpp, manifold_morton, curve_idx, prefetch_curve_idx, inv_order, self._lgh_mdna_mask, syn_trace)
             )
