@@ -859,6 +859,14 @@ class CognitiveOrganism(BaseCognitiveModule):
         self.cfg_lif_decay = float(Config.LIF_DECAY)
         self.cfg_lif_threshold = float(Config.LIF_THRESHOLD)
         self.cfg_lgh_enabled = bool(self.lgh_cfg.enabled)
+        self.cfg_lgh_prefetch_distance = int(self.lgh_cfg.prefetch_distance)
+        self.cfg_lgh_low_entropy_fold_threshold = float(self.lgh_cfg.low_entropy_fold_threshold)
+        self.cfg_lgh_wave_radius = int(self.lgh_cfg.wave_radius)
+        self.cfg_lgh_wave_decay = float(self.lgh_cfg.wave_decay)
+        self.cfg_lgh_trace_decay = float(self.lgh_cfg.trace_decay)
+        self.cfg_lgh_trace_gain = float(self.lgh_cfg.trace_gain)
+        self.cfg_lgh_temporal_bins = int(self.lgh_cfg.temporal_bins)
+        self.cfg_thermal_penalty = float(getattr(self.exec_cfg, 'thermal_penalty', 0.0))
         
         # Pre-allocate contiguous state buffer (System 2 States)
         self.max_batch_size = Config.BATCH_SIZE
@@ -1792,37 +1800,27 @@ class CognitiveOrganism(BaseCognitiveModule):
             z_lgh, H_next, halt_probs = cpp_loader.geometric_manifold_forward_avx512_int8(
                 p_brain_c, H_c, gate_c, q_manifold, q_scale, idx_c, pidx_c, mdna_c, trace_c,
                 step, int(h_cycles), int(l_cycles), float(dyn_threshold),
-                int(self.lgh_cfg.prefetch_distance),
-                float(self.exec_cfg.thermal_penalty if hasattr(self.exec_cfg, 'thermal_penalty') else 0.0), # fallback
-                float(self.lgh_cfg.low_entropy_fold_threshold),
-                int(self.lgh_cfg.wave_radius),
-                float(self.lgh_cfg.wave_decay),
-                float(self.lgh_cfg.trace_decay),
-                float(self.lgh_cfg.trace_gain),
-                int(self.lgh_cfg.temporal_bins)
+                self.cfg_lgh_prefetch_distance, self.cfg_thermal_penalty,
+                self.cfg_lgh_low_entropy_fold_threshold, self.cfg_lgh_wave_radius,
+                self.cfg_lgh_wave_decay, self.cfg_lgh_trace_decay, self.cfg_lgh_trace_gain,
+                self.cfg_lgh_temporal_bins
             )
         elif hasattr(cpp_loader, 'pulse_gated_forward'):
             # Phase 2 & 3: Hardware-Native Pulse + Zero-Copy Workspace
             z_lgh, H_next, halt_probs = cpp_loader.pulse_gated_forward(
                 p_brain_c, H_c, gate_c, mdna_c, idx_c, manifold, self._lgh_workspace,
                 step, int(h_cycles), int(l_cycles), float(dyn_threshold),
-                int(self.lgh_cfg.prefetch_distance),
-                float(self.exec_cfg.thermal_penalty if hasattr(self.exec_cfg, 'thermal_penalty') else 0.0),
-                float(self.lgh_cfg.low_entropy_fold_threshold),
-                int(self.lgh_cfg.temporal_bins)
+                self.cfg_lgh_prefetch_distance, self.cfg_thermal_penalty,
+                self.cfg_lgh_low_entropy_fold_threshold, self.cfg_lgh_temporal_bins
             )
         else:
             z_lgh, H_next, halt_probs = cpp_loader.geometric_manifold_forward_avx512(
                 p_brain_c, H_c, gate_c, manifold, idx_c, pidx_c, mdna_c, trace_c,
                 step, int(h_cycles), int(l_cycles), float(dyn_threshold),
-                int(self.lgh_cfg.prefetch_distance),
-                float(self.exec_cfg.thermal_penalty if hasattr(self.exec_cfg, 'thermal_penalty') else 0.0),
-                float(self.lgh_cfg.low_entropy_fold_threshold),
-                int(self.lgh_cfg.wave_radius),
-                float(self.lgh_cfg.wave_decay),
-                float(self.lgh_cfg.trace_decay),
-                float(self.lgh_cfg.trace_gain),
-                int(self.lgh_cfg.temporal_bins)
+                self.cfg_lgh_prefetch_distance, self.cfg_thermal_penalty,
+                self.cfg_lgh_low_entropy_fold_threshold, self.cfg_lgh_wave_radius,
+                self.cfg_lgh_wave_decay, self.cfg_lgh_trace_decay, self.cfg_lgh_trace_gain,
+                self.cfg_lgh_temporal_bins
             )
         
         return True, z_lgh, H_next, halt_probs
