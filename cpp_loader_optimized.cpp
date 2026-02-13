@@ -2561,7 +2561,6 @@ std::vector<at::Tensor> geometric_manifold_forward_avx512(
     at::Tensor manifold_morton,  // [N, M]
     at::Tensor curve_indices,    // [S]
     at::Tensor prefetch_curve_indices, // [S_prefetch]
-    at::Tensor morton_inverse_order, // [N] maps original topology idx -> Morton row
     at::Tensor mdna_mask,        // [L, R]
     at::Tensor synaptic_trace,   // [N] short-term trace per manifold row
     int64_t time_phase,
@@ -2583,7 +2582,6 @@ std::vector<at::Tensor> geometric_manifold_forward_avx512(
     check_cpu(manifold_morton, "manifold_morton");
     check_cpu(curve_indices, "curve_indices");
     check_cpu(prefetch_curve_indices, "prefetch_curve_indices");
-    check_cpu(morton_inverse_order, "morton_inverse_order");
     check_cpu(mdna_mask, "mdna_mask");
     check_cpu(synaptic_trace, "synaptic_trace");
     check_dim(p_brain, 3, "p_brain");
@@ -2592,7 +2590,6 @@ std::vector<at::Tensor> geometric_manifold_forward_avx512(
     check_dim(manifold_morton, 2, "manifold_morton");
     check_dim(curve_indices, 1, "curve_indices");
     check_dim(prefetch_curve_indices, 1, "prefetch_curve_indices");
-    check_dim(morton_inverse_order, 1, "morton_inverse_order");
     check_dim(mdna_mask, 2, "mdna_mask");
     check_dim(synaptic_trace, 1, "synaptic_trace");
     check_dtype(p_brain, at::kFloat, "p_brain");
@@ -2601,7 +2598,6 @@ std::vector<at::Tensor> geometric_manifold_forward_avx512(
     check_dtype(manifold_morton, at::kFloat, "manifold_morton");
     check_dtype(curve_indices, at::kLong, "curve_indices");
     check_dtype(prefetch_curve_indices, at::kLong, "prefetch_curve_indices");
-    check_dtype(morton_inverse_order, at::kLong, "morton_inverse_order");
     check_dtype(mdna_mask, at::kFloat, "mdna_mask");
     check_dtype(synaptic_trace, at::kFloat, "synaptic_trace");
 
@@ -2611,7 +2607,6 @@ std::vector<at::Tensor> geometric_manifold_forward_avx512(
     auto m_c = ensure_contig(manifold_morton);
     auto idx_c = ensure_contig(curve_indices);
     auto pidx_c = ensure_contig(prefetch_curve_indices);
-    auto inv_c = ensure_contig(morton_inverse_order);
     auto mdna_c = ensure_contig(mdna_mask);
     auto trace_c = ensure_contig(synaptic_trace);
 
@@ -2623,11 +2618,11 @@ std::vector<at::Tensor> geometric_manifold_forward_avx512(
     const int64_t D = h_c.size(3);
     const int64_t C = h_c.size(4);
     const int64_t N_atlas = m_c.size(0);
-    const int64_t N3 = inv_c.size(0);
+    const int64_t N3 = N_atlas / temporal_bins; // Derived from temporal bins and atlas size
     TORCH_CHECK(M == D * C, "p_brain feature dim must match H_state D*C.");
     TORCH_CHECK(m_c.size(1) == M, "manifold_morton feature dim must match p_brain feature dim.");
-    TORCH_CHECK(N3 > 0, "morton_inverse_order must have positive length.");
-    TORCH_CHECK((N_atlas % N3) == 0, "manifold_morton rows must be a multiple of morton_inverse_order length.");
+    TORCH_CHECK(N3 > 0, "N3 must be positive (manifold size / temporal bins).");
+    TORCH_CHECK((N_atlas % temporal_bins) == 0, "manifold_morton rows must be a multiple of temporal_bins.");
     TORCH_CHECK(trace_c.size(0) == N_atlas, "synaptic_trace must have length equal to manifold rows.");
     TORCH_CHECK(g_c.size(0) == L && g_c.size(1) == R, "gate must match [L, R].");
     TORCH_CHECK(mdna_c.size(0) == L && mdna_c.size(1) == R, "mdna_mask must match [L, R].");
@@ -2648,7 +2643,6 @@ std::vector<at::Tensor> geometric_manifold_forward_avx512(
     const float* m_ptr = m_c.data_ptr<float>();
     const int64_t* idx_ptr = idx_c.data_ptr<int64_t>();
     const int64_t* pidx_ptr = pidx_c.data_ptr<int64_t>();
-    const int64_t* inv_ptr = inv_c.data_ptr<int64_t>();
     const float* mdna_ptr = mdna_c.data_ptr<float>();
     float* trace_ptr = trace_c.data_ptr<float>();
 
@@ -2902,7 +2896,6 @@ std::vector<at::Tensor> geometric_manifold_forward_avx512_int8(
     at::Tensor manifold_scale,   // [N] float32
     at::Tensor curve_indices,    // [S] original topology indices
     at::Tensor prefetch_curve_indices, // [S_prefetch] original topology indices
-    at::Tensor morton_inverse_order, // [N]
     at::Tensor mdna_mask,        // [L, R]
     at::Tensor synaptic_trace,   // [N]
     int64_t time_phase,
@@ -2945,7 +2938,6 @@ std::vector<at::Tensor> geometric_manifold_forward_avx512_int8(
     check_dtype(manifold_scale, at::kFloat, "manifold_scale");
     check_dtype(curve_indices, at::kLong, "curve_indices");
     check_dtype(prefetch_curve_indices, at::kLong, "prefetch_curve_indices");
-    check_dtype(morton_inverse_order, at::kLong, "morton_inverse_order");
     check_dtype(mdna_mask, at::kFloat, "mdna_mask");
     check_dtype(synaptic_trace, at::kFloat, "synaptic_trace");
 
@@ -2956,7 +2948,6 @@ std::vector<at::Tensor> geometric_manifold_forward_avx512_int8(
     auto sc_c = ensure_contig(manifold_scale);
     auto idx_c = ensure_contig(curve_indices);
     auto pidx_c = ensure_contig(prefetch_curve_indices);
-    auto inv_c = ensure_contig(morton_inverse_order);
     auto mdna_c = ensure_contig(mdna_mask);
     auto trace_c = ensure_contig(synaptic_trace);
 
@@ -2968,12 +2959,12 @@ std::vector<at::Tensor> geometric_manifold_forward_avx512_int8(
     const int64_t D = h_c.size(3);
     const int64_t C = h_c.size(4);
     const int64_t N_atlas = q_c.size(0);
-    const int64_t N3 = inv_c.size(0);
+    const int64_t N3 = N_atlas / temporal_bins;
     TORCH_CHECK(M == D * C, "p_brain feature dim must match H_state D*C.");
     TORCH_CHECK(q_c.size(1) == M, "manifold_morton_q feature dim must match p_brain feature dim.");
     TORCH_CHECK(sc_c.size(0) == N_atlas, "manifold_scale must have shape [N_atlas].");
-    TORCH_CHECK(N3 > 0, "morton_inverse_order must have positive length.");
-    TORCH_CHECK((N_atlas % N3) == 0, "manifold_morton_q rows must be a multiple of morton_inverse_order length.");
+    TORCH_CHECK(N3 > 0, "N3 must be positive (manifold size / temporal bins).");
+    TORCH_CHECK((N_atlas % temporal_bins) == 0, "manifold_morton_q rows must be a multiple of temporal_bins.");
     TORCH_CHECK(trace_c.size(0) == N_atlas, "synaptic_trace must have length equal to manifold rows.");
     TORCH_CHECK(g_c.size(0) == L && g_c.size(1) == R, "gate must match [L, R].");
     TORCH_CHECK(mdna_c.size(0) == L && mdna_c.size(1) == R, "mdna_mask must match [L, R].");
@@ -2995,7 +2986,6 @@ std::vector<at::Tensor> geometric_manifold_forward_avx512_int8(
     const float* sc_ptr = sc_c.data_ptr<float>();
     const int64_t* idx_ptr = idx_c.data_ptr<int64_t>();
     const int64_t* pidx_ptr = pidx_c.data_ptr<int64_t>();
-    const int64_t* inv_ptr = inv_c.data_ptr<int64_t>();
     const float* mdna_ptr = mdna_c.data_ptr<float>();
     float* trace_ptr = trace_c.data_ptr<float>();
 
