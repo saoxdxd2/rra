@@ -572,7 +572,6 @@ class CognitiveOrganism(BaseCognitiveModule):
             LOCAL_LR_RATIO=Config.LOCAL_LR_RATIO,
             CACHE_HASH_BITS=Config.CACHE_HASH_BITS,
             NEURAL_CACHE_ENABLED=Config.NEURAL_CACHE_ENABLED,
-            EPISODIC_CAPACITY=Config.EPISODIC_CAPACITY,
             H_CYCLES=Config.H_CYCLES,
             L_CYCLES=Config.L_CYCLES,
             BYPASS_H_DECAY=Config.BYPASS_H_DECAY,
