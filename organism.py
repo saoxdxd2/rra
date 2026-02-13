@@ -8,7 +8,7 @@ import time
 import random
 import yaml
 import os
-from memory import HybridEpisodicMemory, MemoryGovernor, NeuralCache
+from memory import MemoryGovernor, NeuralCache
 from genome import Genome
 from morton import MortonBuffer
 import math
@@ -653,24 +653,6 @@ class CognitiveOrganism(BaseCognitiveModule):
         self.survival_cfg = SimpleNamespace(
             update_every=int(Config.SURVIVAL_UPDATE_EVERY),
         )
-        self.episodic_cfg = SimpleNamespace(
-            read_every=int(Config.EPISODIC_READ_EVERY),
-            read_top_k=int(Config.EPISODIC_READ_TOP_K),
-            max_scan=int(Config.EPISODIC_MAX_SCAN),
-            dense_mode=bool(Config.EPISODIC_DENSE_MODE),
-            key_latent_dim=int(Config.EPISODIC_KEY_LATENT_DIM),
-            value_latent_dim=int(Config.EPISODIC_VALUE_LATENT_DIM),
-            dense_capacity_multiplier=float(Config.EPISODIC_DENSE_CAPACITY_MULTIPLIER),
-            hybrid_mode=bool(Config.EPISODIC_HYBRID_MODE),
-            hot_capacity=int(Config.EPISODIC_HOT_CAPACITY),
-            hot_top_k=int(Config.EPISODIC_HOT_TOP_K),
-            cold_top_k=int(Config.EPISODIC_COLD_TOP_K),
-            hybrid_fallback_threshold=float(Config.EPISODIC_HYBRID_FALLBACK_THRESHOLD),
-        )
-        if not self.episodic_cfg.hybrid_mode:
-            raise RuntimeError("EPISODIC_HYBRID_MODE must be enabled; legacy episodic modes are removed.")
-        if not self.episodic_cfg.dense_mode:
-            raise RuntimeError("EPISODIC_DENSE_MODE must be enabled for HybridEpisodicMemory cold bank.")
         self.mes_cfg = SimpleNamespace(
             enabled=bool(Config.MES_ENABLED),
             global_backprop=bool(Config.GLOBAL_BACKPROP),
@@ -717,10 +699,10 @@ class CognitiveOrganism(BaseCognitiveModule):
         self.noise_scale = 0.0
         self.min_noise = 0.0
         self.max_noise = 2.0 # Allow massive noise for 1-batch datasets
-        self.cache_enabled = bool(self.cfg.NEURAL_CACHE_ENABLED)
+        self.cfg_cache_enabled = bool(self.cfg.NEURAL_CACHE_ENABLED)
              
         # Neural Cache (System 1)
-        if self.cache_enabled:
+        if self.cfg_cache_enabled:
             self.neural_cache = NeuralCache(
                 input_dim=self.d_s1 * C, 
                 output_dim=self.output_dim, 
@@ -788,7 +770,6 @@ class CognitiveOrganism(BaseCognitiveModule):
         # Cache config values to avoid self.cfg/self.runtime_cfg getattr overhead in hot path
         self.cfg_mes_enabled = bool(Config.MES_ENABLED)
         self.cfg_cache_enabled = bool(Config.NEURAL_CACHE_ENABLED)
-        self.cfg_episodic_enabled = True
         self.cfg_pruning_enabled = True
         self.cfg_h_cycles = int(Config.H_CYCLES)
         self.cfg_l_cycles = int(Config.L_CYCLES)
@@ -825,8 +806,8 @@ class CognitiveOrganism(BaseCognitiveModule):
         # HybridEpisodicMemory decommissioned (Merged into LGH-Manifold)
         self.memory_governor = MemoryGovernor(dim=self.d_s2 * C, device=self.device)
         self.memory_governor_predictor = self.memory_governor.predictor
-        self.H_cycles = self.cfg_h_cycles
-        self.L_cycles = self.cfg_l_cycles
+        self.cfg_h_cycles = self.cfg_h_cycles
+        self.cfg_l_cycles = self.cfg_l_cycles
         self.current_phase = 0
         self.register_buffer('step_counter', torch.zeros(1))
         self._current_engagement_rate = torch.tensor(1.0, device=self.device)
@@ -849,6 +830,7 @@ class CognitiveOrganism(BaseCognitiveModule):
         self.register_buffer('_last_surprise_cycle_scale', torch.tensor(1.0, dtype=torch.float32, device=self.device))
         self.register_buffer('_last_temporal_signal', torch.tensor(1.0, dtype=torch.float32, device=self.device))
         self.register_buffer('_last_temporal_cycle_scale', torch.tensor(1.0, dtype=torch.float32, device=self.device))
+        self._lifecycle_hooks = {}
 
     def _imprint_to_manifold(self, p, z, importance):
         """Placeholder for Manifold Imprinting (titans-style FAST learning)."""
@@ -860,7 +842,7 @@ class CognitiveOrganism(BaseCognitiveModule):
         return self.importance_threshold_ema
         self.register_buffer('_last_temporal_cycle_scale', torch.tensor(1.0, dtype=torch.float32, device=self.device))
         self.episodic_enabled = True
-        self.pruning_enabled = True
+        self.cfg_pruning_enabled = True
         
         # Parameter Stacking Cache (For C++ Fusion)
         self._stacked_params = None
@@ -951,7 +933,7 @@ class CognitiveOrganism(BaseCognitiveModule):
         
         # Eager mode is used - no torch.compile on CPU to avoid MSVC issues
         print(">>> HMI: Reasoning Core running in Eager Mode (cpp_loader accelerated).")
-        if not self.cache_enabled:
+        if not self.cfg_cache_enabled:
             print(">>> NeuralCache reflex path disabled (reasoning-first mode).")
         if not self.exec_cfg.use_fused_cycle:
             print(">>> fused_cognitive_cycle disabled (using forward_stack_io path).")
@@ -1248,22 +1230,16 @@ class CognitiveOrganism(BaseCognitiveModule):
             return None
         return self.neural_cache
 
-    def set_runtime_toggles(self, *, mes_enabled=None, cache_enabled=None, episodic_enabled=None, pruning_enabled=None, lgh_enabled=None):
+    def set_runtime_toggles(self, *, mes_enabled=None, cache_enabled=None, pruning_enabled=None, lgh_enabled=None):
         if mes_enabled is not None:
             enabled = bool(mes_enabled)
             self.mes_cfg.enabled = enabled
             self.cfg_mes_enabled = enabled
         if cache_enabled is not None:
             enabled = bool(cache_enabled)
-            self.cache_enabled = enabled
             self.cfg_cache_enabled = enabled
-        if episodic_enabled is not None:
-            enabled = bool(episodic_enabled)
-            self.episodic_enabled = enabled
-            self.cfg_episodic_enabled = enabled
         if pruning_enabled is not None:
             enabled = bool(pruning_enabled)
-            self.pruning_enabled = enabled
             self.cfg_pruning_enabled = enabled
         if lgh_enabled is not None:
             enabled = bool(lgh_enabled)
@@ -1349,7 +1325,7 @@ class CognitiveOrganism(BaseCognitiveModule):
         return bool(step == 1 or (step % update_every) == 0)
 
     def _maybe_update_survival(self, H_next, H_prev, should_update=None):
-        if not self.pruning_enabled:
+        if not self.cfg_pruning_enabled:
             return
         if should_update is None:
             should_update = self._should_update_survival()
@@ -1667,7 +1643,8 @@ class CognitiveOrganism(BaseCognitiveModule):
             return False, None, None, None
 
         # Prep Curve Indices
-        if hasattr(self.genome, 'next_curve_anchor') or hasattr(self.genome, 'build_curve_chain'):
+        genome = getattr(self, 'genome', None)
+        if genome is not None and (hasattr(genome, 'next_curve_anchor') or hasattr(genome, 'build_curve_chain')):
              self.update_phenotype_from_genome() # Refresh curves if genome-driven
 
         idx_c = self._lgh_curve_indices.contiguous()
@@ -2155,7 +2132,7 @@ class CognitiveOrganism(BaseCognitiveModule):
         tps_pressure = self._get_tps_pressure()
         thermal_penalty = self._update_thermal_penalty()
         
-        if not self.pruning_enabled:
+        if not self.cfg_pruning_enabled:
             gate = torch.ones(self.L, self.R, 1, 1, dtype=torch.float32, device=self.device)
         elif self.current_phase == 0:
             # Phase 0 (Warmup): Fixed Top-K for architecture stability
@@ -2172,7 +2149,7 @@ class CognitiveOrganism(BaseCognitiveModule):
 
         # L-Cycle: Cache Lookup (Instant Response)
         cache = self._cache()
-        if self.current_phase > 1 and cache is not None:
+        if self.current_phase > 1 and self.cfg_cache_enabled and cache is not None:
             p_last = p[:, -1]
             cache_val, hit_mask, max_sim, hit_addrs, hit_tables = cache.lookup(p_last)
             self._set_cache_trace(cache_val, hit_mask, hit_addrs, hit_tables)
@@ -2363,7 +2340,7 @@ class CognitiveOrganism(BaseCognitiveModule):
         p_stack = self._sync_stacked_params()
         if dyn_threshold is None:
             dyn_threshold = self._compute_dyn_halt_threshold()
-        use_l_cycles = self.L_cycles if l_cycles is None else max(1, int(l_cycles))
+        use_l_cycles = self.cfg_l_cycles if l_cycles is None else max(1, int(l_cycles))
         return self._call_forward_stack(z_L, z_H, p_stack, dyn_threshold, use_l_cycles)
 
     @staticmethod
