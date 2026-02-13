@@ -1141,7 +1141,7 @@ class CognitiveOrganism(BaseCognitiveModule):
 
     def _init_manifold(self):
         # Firmware-Driven Morton Curve Generation
-        if self.cfg_lgh_enabled:
+        if self.lgh_cfg.enabled:
             # Generate Base Morton Order from C++ Firmware (replaces MortonBuffer)
             full_order = cpp_loader.make_morton_order(
                 self.L, 
@@ -1849,14 +1849,14 @@ class CognitiveOrganism(BaseCognitiveModule):
             p_stack['delays'], p_stack['tables'], p_stack['conns'],
             p_stack['decays'], p_stack['halt_w'], p_stack['halt_b'],
             int(h_cycles), int(l_cycles),
-            self.cfg_lif_decay, self.cfg_lif_threshold, float(dyn_threshold),
+            float(Config.LIF_DECAY), float(Config.LIF_THRESHOLD), float(dyn_threshold),
             h_out_passed
         )
         z_L = out_fused.view(B, 1, self.R, self.d_s2, self.C).expand(-1, T, -1, -1, -1)
         return True, z_L, H_next_fused, halt_probs_cycle
 
     def _lgh_morton_manifold(self):
-        if (not self.cfg_lgh_enabled) or (self.lgh_manifold_morton is None):
+        if (not self.lgh_cfg.enabled) or (self.lgh_manifold_morton is None):
             return None
         return self.lgh_manifold_morton.contiguous()
 
@@ -1921,7 +1921,7 @@ class CognitiveOrganism(BaseCognitiveModule):
         return self._lgh_q_cache[key], self._lgh_q_scale[key]
 
     def _predict_curve_chain(self, p_s1):
-        if (not self.cfg_lgh_enabled) or self._lgh_curve_indices.numel() == 0:
+        if (not self.lgh_cfg.enabled) or self._lgh_curve_indices.numel() == 0:
             return None
         if p_s1.dim() != 3:
             return None
@@ -1949,7 +1949,7 @@ class CognitiveOrganism(BaseCognitiveModule):
         return None
 
     def _predict_prefetch_curve_chain(self, p_s1):
-        if (not self.cfg_lgh_enabled) or self._lgh_curve_indices.numel() == 0:
+        if (not self.lgh_cfg.enabled) or self._lgh_curve_indices.numel() == 0:
             return None
         if p_s1.dim() != 3:
             return None
@@ -1976,7 +1976,7 @@ class CognitiveOrganism(BaseCognitiveModule):
         return None
 
     def _refresh_lgh_curve_from_genome(self, predicted_curve=None):
-        if (not self.cfg_lgh_enabled) or self._lgh_curve_indices.numel() == 0:
+        if (not self.lgh_cfg.enabled) or self._lgh_curve_indices.numel() == 0:
             return
         if isinstance(predicted_curve, torch.Tensor) and predicted_curve.numel() == self._lgh_curve_indices.numel():
             self._lgh_curve_indices.copy_(predicted_curve.to(self._lgh_curve_indices.device, dtype=torch.long))
@@ -2007,7 +2007,7 @@ class CognitiveOrganism(BaseCognitiveModule):
         self._lgh_curve_indices.copy_(new_curve.to(self._lgh_curve_indices.device, dtype=torch.long))
 
     def _refresh_lgh_prefetch_curve(self, predicted_prefetch=None):
-        if (not self.cfg_lgh_enabled) or self._lgh_prefetch_curve_indices.numel() == 0:
+        if (not self.lgh_cfg.enabled) or self._lgh_prefetch_curve_indices.numel() == 0:
             return
         if isinstance(predicted_prefetch, torch.Tensor) and predicted_prefetch.numel() == self._lgh_prefetch_curve_indices.numel():
             self._lgh_prefetch_curve_indices.copy_(predicted_prefetch.to(self._lgh_prefetch_curve_indices.device, dtype=torch.long))
@@ -2017,7 +2017,7 @@ class CognitiveOrganism(BaseCognitiveModule):
             self._lgh_prefetch_curve_indices.copy_(shifted.to(self._lgh_prefetch_curve_indices.device, dtype=torch.long))
 
     def _refresh_lgh_mdna_mask(self, gate, modulation=None):
-        if (not self.cfg_lgh_enabled) or self._lgh_mdna_mask.numel() == 0:
+        if (not self.lgh_cfg.enabled) or self._lgh_mdna_mask.numel() == 0:
             return
         gate_2d = gate.reshape(self.L, self.R) if gate.dim() > 2 else gate
         gate_2d = torch.nan_to_num(gate_2d.float(), nan=0.0, posinf=1.0, neginf=0.0)
@@ -2097,15 +2097,15 @@ class CognitiveOrganism(BaseCognitiveModule):
         return self.noise_scale
 
     def forward(self, x, H, gate=None, mode='stability', learning_brain=None):
-        # 0. Hot-path caching
-        cfg_mes_enabled = self.cfg_mes_enabled
-        cfg_cache_enabled = self.cfg_cache_enabled
-        cfg_pruning_enabled = self.cfg_pruning_enabled
-        L, R, C = self.L, self.R, self.C
-        device = self.device
-        current_phase = self.current_phase
-        lambda_sparsity = self.lambda_sparsity
-        cfg_param_cost_scale = self.cfg_param_cost_scale
+        # --- Phase 0: Primary Reasoning ---
+        # Cache BIOS states locally for performance
+        cfg_mes_enabled = bool(Config.MES_ENABLED)
+        cfg_cache_enabled = bool(Config.NEURAL_CACHE_ENABLED)
+        cfg_pruning_enabled = True # Hardware Default
+        is_stability = (mode == 'stability')
+        
+        # 1. Primary Cognitive Cycle
+        cfg_param_cost_scale = float(Config.PARAM_COST_SCALE)
         
         self.step_counter += 1
         self._run_lifecycle_hooks('pre_forward', x=x, H=H, gate=gate, mode=mode)
@@ -2286,7 +2286,7 @@ class CognitiveOrganism(BaseCognitiveModule):
         # PRUNING 2.0: update survival usage on throttled cadence to reduce CPU stalls.
         self._maybe_update_survival(H_next, z_H_start, should_update=should_update_survival)
         
-        cost_step = gate.sum() * self.cfg_param_cost_scale
+        cost_step = gate.sum() * cfg_param_cost_scale
         
         # Calculate aggregate engagement rate from all levels
         self.governor.config_scalars[15] = float(self._compute_engagement_rate())

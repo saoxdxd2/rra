@@ -42,40 +42,19 @@ class LearningBrain(nn.Module):
             targets = targets.reshape(-1, targets.size(-1))
         return F.binary_cross_entropy_with_logits(out, targets)
 
-    def calculate_teacher_loss(self, student_logits: torch.Tensor, teacher_probs: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
-        """Distillation loss using cached bit projection matrix for efficiency."""
-        B_T, D = student_logits.shape
-        V = teacher_probs.shape[-1]
-        
-        # Create Once, Reuse Forever: Cache the bit projection matrix
-        if not hasattr(self, '_bit_proj_matrix') or self._bit_proj_matrix.device != student_logits.device:
-            bytes_range = torch.arange(V, device=student_logits.device)
-            bits = torch.arange(7, -1, -1, device=student_logits.device)
-            # Create the matrix once and register it as an internal buffer if appropriate, 
-            # though here we just cache it on the instance for simplicity and speed.
-            self._bit_proj_matrix = bytes_range.unsqueeze(-1).bitwise_and(2**bits).ne(0).float()
-            
-        teacher_bit_probs = torch.matmul(teacher_probs.view(-1, V), self._bit_proj_matrix)
-        
-        return F.binary_cross_entropy_with_logits(
-            student_logits, 
-            teacher_bit_probs,
-            reduction='mean'
-        )
 
-    def calculate_unified_loss(self, L_task: torch.Tensor, L_teacher: torch.Tensor, L_stability: torch.Tensor, omega: float, thermal_penalty: float = 0.0) -> Tuple[torch.Tensor, Dict[str, Any]]:
-        """Combines task, teacher, and stability losses into a single modulated objective."""
+    def calculate_unified_loss(self, L_task: torch.Tensor, L_stability: torch.Tensor, omega: float, thermal_penalty: float = 0.0) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        """Combines task and stability losses into a single modulated objective."""
         lambda_stability = Config.SURVIVAL_WEIGHT * (1.0 - omega * 0.8)
         
-        # Phase 4: Thermal Feedback - If throttled, increase sensitivity to stability/energy
+        # Phase 4: Thermal Feedback
         if thermal_penalty > 0:
             lambda_stability *= (1.0 + thermal_penalty)
 
-        L_total = (1.0 - omega) * L_teacher + omega * L_task + lambda_stability * L_stability
+        L_total = L_task + lambda_stability * L_stability
         
         return L_total, {
             'L_task': L_task.item() if hasattr(L_task, 'item') else L_task,
-            'L_teacher': L_teacher.item() if hasattr(L_teacher, 'item') else L_teacher,
             'L_stability': L_stability.item() if hasattr(L_stability, 'item') else L_stability,
             'omega': omega,
             'lambda_stability': lambda_stability,
@@ -123,8 +102,7 @@ class LearningBrain(nn.Module):
         
         loss_task = self.calculate_task_loss(out, targets)
         
-        if L_teacher is None:
-            L_teacher = loss_task
+        pass
         
         confusion_ratio = torch.clamp(loss_task.detach(), 0.0, Config.CONFUSION_NORM) / Config.CONFUSION_NORM
         warmup_factor = min(1.0, self._step / self._warmup_steps)
@@ -144,7 +122,6 @@ class LearningBrain(nn.Module):
         
         total_loss, loss_info = self.calculate_unified_loss(
             L_task=loss_task, 
-            L_teacher=L_teacher, 
             L_stability=combined_stability, 
             omega=omega,
             thermal_penalty=thermal_penalty

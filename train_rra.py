@@ -649,7 +649,7 @@ class RRATrainer:
             global_pulse_every=max(1, int(getattr(Config, 'GLOBAL_PULSE_EVERY', 250))),
             global_pulse_weight=float(getattr(Config, 'GLOBAL_PULSE_WEIGHT', 0.25)),
             omega_step_update_every=max(0, int(getattr(Config, 'OMEGA_STEP_UPDATE_EVERY', 250))),
-            genome_step_update_every=max(0, int(getattr(Config, 'GENOME_STEP_UPDATE_EVERY', 5000))),
+            governor_step_update_every=max(0, int(getattr(Config, 'GOVERNOR_STEP_UPDATE_EVERY', 5000))),
             train_loss_ema_decay=float(getattr(Config, 'TRAIN_LOSS_EMA_DECAY', 0.98)),
             sparsity_log_every=max(1, int(getattr(Config, 'SPARSITY_LOG_EVERY', 50))),
             thermal_freq_min_ghz=float(getattr(Config, 'LGH_THERMAL_FREQ_MIN_GHZ', 3.0)),
@@ -724,8 +724,8 @@ class RRATrainer:
             self.register_h_buffer(bsz)
         return self._h_buffer[:bsz]
     
-    def _update_lr_from_genome(self):
-        """Dynamically adjust learning rate based on genome expression."""
+    def _update_lr_from_governor(self):
+        """Dynamically adjust learning rate based on BIOS/Governor expression."""
         base_lr = float(self.model.suggested_lr)
         if self._lr_cap is None:
             new_lr = base_lr
@@ -737,7 +737,7 @@ class RRATrainer:
             old_lr = param_group['lr']
             param_group['lr'] = new_lr
             if abs(old_lr - new_lr) > 1e-6:
-                logger.info(f">>> LR Updated: {old_lr:.2e} -> {new_lr:.2e} (Genome BDNF)")
+                logger.info(f">>> LR Updated: {old_lr:.2e} -> {new_lr:.2e} (BIOS/Governor BDNF)")
         return new_lr
 
     def _optimizer_step(self):
@@ -943,7 +943,7 @@ class RRATrainer:
         """
         Lightweight in-epoch adaptation:
         - Frequent Omega updates from train-loss EMA.
-        - Infrequent genome evolutionary ticks (heavier path).
+        - Infrequent BIOS evolutionary ticks (governor).
         """
         if step < 1:
             return
@@ -961,12 +961,13 @@ class RRATrainer:
                     f"(loss_ema={ema:.4f})"
                 )
 
-        genome_every = int(self.cfg.genome_step_update_every)
-        if genome_every > 0 and (step % genome_every) == 0:
+        bios_every = int(self.cfg.governor_step_update_every)
+        if bios_every > 0 and (step % bios_every) == 0:
             thermal_penalty_model = float(self.model.get_thermal_penalty()) if hasattr(self.model, 'get_thermal_penalty') else 0.0
             thermal_penalty_watchdog, thermal_status = self._thermal_penalty()
             thermal_penalty = max(thermal_penalty_model, thermal_penalty_watchdog)
             simd_metrics = self._simd_cycle_metrics()
+            
             evolved = bool(
                 self.model.governor.evolutionary_step(
                     self.model,
@@ -981,16 +982,14 @@ class RRATrainer:
                     }
                 )
             )
-            self._update_lr_from_genome()
+            self._update_lr_from_governor()
             if thermal_status.get('throttled', False):
                 logger.warning(
                     f">>> HEAT STRESS @step={step}: freq={thermal_status.get('freq_ghz', 0.0):.2f}GHz "
                     f"< target={self.cfg.thermal_freq_min_ghz:.2f}GHz. Applying thermal evolution pressure."
                 )
             
-            # --- THERMAL-REACTIVE LEARNING RATE (Better than Elite) ---
-            # If frequency drops to 2.0GHz, immediately drop LR and increase sparsity.
-            # This prevents "Garbage Gradients" from CPU stalls.
+            # --- THERMAL-REACTIVE LEARNING RATE ---
             if thermal_status.get('freq_ghz', 4.0) < 2.0:
                 logger.critical(f">>> THERMAL EMERGENCY @step={step}: Freq={thermal_status.get('freq_ghz'):.2f}GHz. "
                                 "Emergency LR drop and Sparsity increase triggered.")
@@ -998,16 +997,14 @@ class RRATrainer:
                     param_group['lr'] *= 0.5
                 
                 if hasattr(self.model, 'mask_sparsity_bias'):
-                    # Increase sparsity bias to reduce compute load
                     self.model.mask_sparsity_bias = min(0.95, float(self.model.mask_sparsity_bias) + 0.2)
                 
-                # Set LR cap to prevent immediate recovery while still hot
                 self._lr_cap = self.optimizer.param_groups[0]['lr']
+
             logger.info(
-                f">>> STEP GENOME UPDATE @step={step}: evolved={evolved} "
+                f">>> STEP BIOS UPDATE @step={step}: evolved={evolved} "
                 f"(proxy_val={ema:.4f}, FKBP5={self.model.governor.fkbp5:.4f}, "
-                f"lambda_sparsity={self.model.lambda_sparsity:.6f}, thermal_penalty={thermal_penalty:.4f}, "
-                f"SIMDcpp={float(simd_metrics.get('simd_cycles_per_pulse', 0.0)):.2f})"
+                f"lambda_sparsity={self.model.lambda_sparsity:.6f}, thermal_penalty={thermal_penalty:.4f})"
             )
 
     def _sanitize_optimizer_state(self):
@@ -1571,7 +1568,7 @@ class RRATrainer:
         last_batch_idx = self.start_batch_idx - 1
         self.metrics = {'hits': 0, 'misses': 0, 'imprints': 0}
         self.sanitize_model_parameters()
-        self._update_lr_from_genome()
+        self._update_lr_from_governor()
 
         for batch_idx, (xb, tb) in enumerate(dataloader):
             if batch_idx < self.start_batch_idx:
@@ -1632,10 +1629,10 @@ class RRATrainer:
                     self._tb_add_scalar("Sparsity/gate_density_ema", self._gate_density_ema)
 
                 # --- Monitor Biological Variables ---
-                self._tb_add_scalar("Genome/BDNF", self.model.governor.bdnf)
-                self._tb_add_scalar("Genome/CREB", self.model.governor.creb)
-                self._tb_add_scalar("Genome/DRD2", self.model.governor.drd2)
-                self._tb_add_scalar("Genome/FKBP5", self.model.governor.fkbp5)
+                self._tb_add_scalar("BIOS/BDNF", self.model.governor.bdnf)
+                self._tb_add_scalar("BIOS/CREB", self.model.governor.creb)
+                self._tb_add_scalar("BIOS/DRD2", self.model.governor.drd2)
+                self._tb_add_scalar("BIOS/FKBP5", self.model.governor.fkbp5)
             
             if batch_idx % int(self.cfg.sparsity_log_every) == 0:
                 density_ema = self._gate_density_ema if self._gate_density_ema is not None else self._last_gate_density
@@ -1754,7 +1751,7 @@ class RRATrainer:
         if hasattr(self.model, 'regulate_sensory_noise'):
              self.model.regulate_sensory_noise(val_loss)
 
-        self._update_lr_from_genome()
+        self._update_lr_from_governor()
              
         return val_loss
         # -----------------------------------------------
