@@ -1825,21 +1825,16 @@ std::vector<at::Tensor> forward_stack_io(
     at::Tensor scalars
 ) {
     TORCH_CHECK(params.size() == 6, "forward_stack_io expects 6 params: delays,tables,conns,decays,halt_w,halt_b.");
-    check_cpu(scalars, "scalars");
-    check_dim(scalars, 1, "scalars");
-    check_dtype(scalars, at::kFloat, "scalars");
-    auto s_c = ensure_contig(scalars);
-    TORCH_CHECK(s_c.numel() >= 5, "forward_stack_io scalars must contain [dummy0,lif_decay,lif_threshold,halt_threshold,steps].");
-    const float* s_ptr = s_c.data_ptr<float>();
-    const int64_t dummy_0 = static_cast<int64_t>(std::llround(static_cast<double>(s_ptr[0])));
-    const double lif_decay = static_cast<double>(s_ptr[1]);
-    const double lif_threshold = static_cast<double>(s_ptr[2]);
-    const double halt_threshold = static_cast<double>(s_ptr[3]);
-    const int64_t steps = static_cast<int64_t>(std::llround(static_cast<double>(s_ptr[4])));
+    // Hardware Constants (NIS ISA) are now used directly in forward_stack.
+    // scalars tensor is ignored for BIOS values.
     return forward_stack(
         x_input, H_state,
         params[0], params[1], params[2], params[3], params[4], params[5],
-        dummy_0, lif_decay, lif_threshold, halt_threshold, steps
+        0, // dummy_0
+        NIS_LIF_DECAY,
+        NIS_LIF_THRESHOLD,
+        NIS_HALT_THRESHOLD,
+        NIS_L_CYCLES
     );
 }
 
@@ -2037,7 +2032,7 @@ std::vector<at::Tensor> _fused_cognitive_cycle_impl(
     (void)hb_ptr;
     (void)hp_ptr;
     
-    int total_steps = (int)(H_cycles * L_cycles);
+    int total_steps = (int)(NIS_H_CYCLES * NIS_L_CYCLES);
 
     // Precompute RAM slots once per [B, L, M] to avoid repeated address recomputation
     // inside every cognitive step.
@@ -2096,38 +2091,38 @@ std::vector<at::Tensor> _fused_cognitive_cycle_impl(
                 
                 float max_delta = 0.0f;
                 
-                for (int l = 0; l < L; l++) {
+                for (int l = 0; l < NIS_L; l++) {
                     const auto& active_rs = active_regions[static_cast<size_t>(l)];
                     if (active_rs.empty()) {
                         continue;
                     }
-                    const int64_t layer_offset = batch_offset + static_cast<int64_t>(l) * static_cast<int64_t>(R) * static_cast<int64_t>(M);
+                    const int64_t layer_offset = batch_offset + static_cast<int64_t>(l) * static_cast<int64_t>(NIS_R) * static_cast<int64_t>(M);
                 
                     // 1. Average State (Across R)
                     for (int m = 0; m < M; m++) {
                         float sum = 0.0f;
-                        for (int r = 0; r < R; r++) {
+                        for (int r = 0; r < NIS_R; r++) {
                             sum += h_ptr[layer_offset + r * M + m];
                         }
-                        h_avg[m] = sum / (float)R;
+                        h_avg[m] = sum / (float)NIS_R;
                     }
                     
-                    // 2. LIF Activation
+                    // 2. LIF Activation (BIOS Hard-Wired)
                     for (int m = 0; m < M; m++) {
                         const int64_t addr_idx = static_cast<int64_t>(b) * lm_stride + static_cast<int64_t>(l) * static_cast<int64_t>(M) + static_cast<int64_t>(m);
                         const int32_t slot = ram_slot_cache[static_cast<size_t>(addr_idx)];
                         float u_ff = t_ptr[l * M * ram_size + m * ram_size + slot];
                         float v_curr = h_avg[m];
-                        float v_next = (float)lif_decay * v_curr + u_ff;
+                        float v_next = NIS_LIF_DECAY * v_curr + u_ff;
                         
-                        s_spikes[m] = (v_next > lif_threshold) ? 1.0f : 0.0f;
+                        s_spikes[m] = (v_next > NIS_LIF_THRESHOLD) ? 1.0f : 0.0f;
                     }
                     
                     // 3. Update State (Decay + Spike Injection)
                     for (size_t ri = 0; ri < active_rs.size(); ri++) {
                         int r = active_rs[ri];
                         const int64_t state_base = layer_offset + static_cast<int64_t>(r) * static_cast<int64_t>(M);
-                        const int64_t decay_base = static_cast<int64_t>(l) * static_cast<int64_t>(R) * static_cast<int64_t>(M) + static_cast<int64_t>(r) * static_cast<int64_t>(M); 
+                        const int64_t decay_base = static_cast<int64_t>(l) * static_cast<int64_t>(NIS_R) * static_cast<int64_t>(M) + static_cast<int64_t>(r) * static_cast<int64_t>(M); 
                         
                         for (int m = 0; m < M; m++) {
                             float s = s_spikes[m];
