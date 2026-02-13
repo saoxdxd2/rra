@@ -552,8 +552,9 @@ class CognitiveOrganism(BaseCognitiveModule):
     def __init__(self, input_dim, L, R, D=None, C=Config.C, memory_depth=5, device=DEVICE, output_dim=None, vocab_size=None, d_s1=None, d_s2=None):
         super().__init__(device=device)
         self.cfg = SimpleNamespace(
-            D_S1=Config.D_S1,
-            D_S2=Config.D_S2,
+            D_S1=Config.WORKING_DIM // 8, # Derived for bit- latent breadcrumb
+            D_S2=Config.WORKING_DIM,
+            WORKING_DIM=Config.WORKING_DIM,
             C=Config.C,
             MES_ENABLED=Config.MES_ENABLED,
             LEARNING_RATE=Config.LEARNING_RATE,
@@ -670,9 +671,10 @@ class CognitiveOrganism(BaseCognitiveModule):
         self.output_dim = 8
         self.vocab_size = vocab_size
         
-        # Dual-Scale Dimensions
-        self.d_s1 = d_s1 or self.cfg.D_S1
-        self.d_s2 = d_s2 or D or self.cfg.D_S2
+        # Consolidated Dimensions
+        self.working_dim = d_s2 or D or self.cfg.WORKING_DIM
+        self.d_s1 = d_s1 or (self.working_dim // 8) # Fast path usually 1/8th
+        self.d_s2 = self.working_dim
         
         # Bit-Level Modeling (BLT Style)
         # We replace the Byte Embedding with a Bit-to-Latent projection
@@ -1987,7 +1989,16 @@ class CognitiveOrganism(BaseCognitiveModule):
             
         return self.noise_scale
 
-    def forward(self, x, H, gate=None, mode='stability', learning_brain=None):
+        # 0. Hot-path caching
+        cfg_mes_enabled = self.cfg_mes_enabled
+        cfg_cache_enabled = self.cfg_cache_enabled
+        cfg_pruning_enabled = self.cfg_pruning_enabled
+        L, R, C = self.L, self.R, self.C
+        device = self.device
+        current_phase = self.current_phase
+        lambda_sparsity = self.lambda_sparsity
+        cfg_param_cost_scale = self.cfg_param_cost_scale
+        
         self.step_counter += 1
         self._run_lifecycle_hooks('pre_forward', x=x, H=H, gate=gate, mode=mode)
         
@@ -1998,12 +2009,8 @@ class CognitiveOrganism(BaseCognitiveModule):
         p, B, T = self._encode_s1_input(x)
             
         # --- DYNAMIC SENSORY NOISE (Prevent Memorization) ---
-        # Apply noise to the latent space (p) to ensure it works for both 
-        # Token-based and Embedding-based inputs.
         if self.training and self.noise_scale > 0:
-            # Deterministic noise based on input hash and step counter
             step_seed = int(self.step_counter.item())
-            # Simple deterministic pseudo-noise: sin-based spread
             noise = (torch.sin(p * 100.0 + step_seed) * self.noise_scale).to(p.device)
             p = p + noise
         # ----------------------------------------------------
@@ -2011,24 +2018,25 @@ class CognitiveOrganism(BaseCognitiveModule):
         H = self._prepare_state(H, B)
             
         # --- BIOLOGICAL GATING: Blend signals for stabilization ---
-        combined_scores = self.genome.usage.clone() if self.genome.usage is not None else torch.ones(self.L, self.R, device=self.device)
+        genome_usage = self.genome.usage
+        combined_scores = genome_usage.clone() if genome_usage is not None else torch.ones(L, R, device=device)
         if learning_brain is not None and hasattr(learning_brain, 'knowledge_map'):
             # Blend behavioral usage with learning contribution (Knowledge Map)
             combined_scores = 0.5 * combined_scores + 0.5 * learning_brain.knowledge_map
         
         # Add tie-breaking pseudo-noise to prevent mass-extinction of equal-score neurons.
         # Deterministic: based on level/region indices to ensure reproducibility.
-        noise = torch.linspace(1e-8, 1e-7, combined_scores.numel(), device=self.device).view_as(combined_scores)
-        combined_scores = combined_scores + noise
+        noise_vec = torch.linspace(1e-8, 1e-7, combined_scores.numel(), device=device).view_as(combined_scores)
+        combined_scores = combined_scores + noise_vec
 
 
         # --- PERFORMANCE CONTROL: TPS Pressure ---
         tps_pressure = self._get_tps_pressure()
         thermal_penalty = self._update_thermal_penalty()
         
-        if not self.cfg_pruning_enabled:
-            gate = torch.ones(self.L, self.R, 1, 1, dtype=torch.float32, device=self.device)
-        elif self.current_phase == 0:
+        if not cfg_pruning_enabled:
+            gate = torch.ones(L, R, 1, 1, dtype=torch.float32, device=device)
+        elif current_phase == 0:
             # Phase 0 (Warmup): Fixed Top-K for architecture stability
             k = max(1, int(combined_scores.numel() * Config.PHASE_0_KEEP_RATIO))
             threshold = torch.topk(combined_scores.flatten(), k).values.min()
@@ -2036,19 +2044,18 @@ class CognitiveOrganism(BaseCognitiveModule):
         else:
             # Phase 1+ (Autonomous): Dynamic Metabolic + Performance Masking
             gate = self.genome.get_metabolic_mask(
-                metabolic_pressure=self.lambda_sparsity,
+                metabolic_pressure=lambda_sparsity,
                 tps_pressure=tps_pressure
             )
 
         # L-Cycle: Cache Lookup (Instant Response)
         cache = self._cache()
-        if self.current_phase > 1 and self.cfg_cache_enabled and cache is not None:
+        if current_phase > 1 and cfg_cache_enabled and cache is not None:
             p_last = p[:, -1]
             cache_val, hit_mask, max_sim, hit_addrs, hit_tables = cache.lookup(p_last)
             self._set_cache_trace(cache_val, hit_mask, hit_addrs, hit_tables)
             
             # --- SURPRISE-TRIGGERED AUDIT ---
-            # If hit similarity is low, force System 2 reasoning even if valid bits are found.
             surprise_trigger = bool((max_sim < 0.85).any().item())
             
             # Full sequence bypass if everything is cached and high confidence
@@ -2067,7 +2074,7 @@ class CognitiveOrganism(BaseCognitiveModule):
         surprise_error = torch.tanh(error.detach().abs().mean(dim=(1, 2), keepdim=True))
         surprise_gate_prob = torch.sigmoid(self.surprise_gate(h_ctx)).unsqueeze(-1)
         surprise_signal = (0.5 * surprise_error + 0.5 * surprise_gate_prob).clamp(0.0, 1.0)
-        self._last_surprise_signal.copy_(surprise_signal.mean().detach().to(self.device, dtype=torch.float32))
+        self._last_surprise_signal.copy_(surprise_signal.mean().detach().to(device, dtype=torch.float32))
         temporal_signal = self._temporal_activity_signal(p)
         gaba = getattr(self, 'gaba_inhibition', 0.5)
         fkbp5 = getattr(self, 'fkbp5', 0.5)

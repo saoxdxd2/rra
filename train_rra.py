@@ -1117,9 +1117,16 @@ class RRATrainer:
         return float(scaled_loss.item())
 
     def _step_phase_0_stability(self, xb, yb):
+        # Hot-path caching
+        cfg = self.cfg
+        mes_enabled = cfg.mes_enabled
+        lambda_stability = cfg.lambda_stability
+        lambda_energy = cfg.lambda_energy
+        agc_clip_factor = cfg.agc_clip_factor
+        
         self.optimizer.zero_grad()
         inp, H, out, H_next, cost, gate = self._forward_with_state(
-            xb, require_grad=(not self.cfg.mes_enabled)
+            xb, require_grad=(not mes_enabled)
         )
         out = self._finite(out, nan=0.0, posinf=20.0, neginf=-20.0)
         H_next = self._finite(H_next, nan=0.0, posinf=1e4, neginf=-1e4)
@@ -1144,21 +1151,21 @@ class RRATrainer:
         
         # Phase 0 only cares about Task + Stability
         # If throttled, double the energy penalty
-        energy_weight = self.cfg.lambda_energy * (1.0 + thermal_penalty)
-        total_loss = loss_task + (self.cfg.lambda_stability * l_stab) + (energy_weight * l_eng)
+        energy_weight = lambda_energy * (1.0 + thermal_penalty)
+        total_loss = loss_task + (lambda_stability * l_stab) + (energy_weight * l_eng)
         if not torch.isfinite(total_loss):
             logger.warning(f">>> Non-finite Phase-0 loss at global_step={self.global_step}. Skipping this batch.")
             self.optimizer.zero_grad(set_to_none=True)
             return None
         
-        if self.cfg.mes_enabled:
+        if mes_enabled:
             # Phase 0 MES: Use task targets directly for stability
             self.model.mes_step(xb, yb, precomputed_H_next=H_next)
         else:
             total_loss.backward()
             self._sanitize_gradients()
             # Apply AGC before optimizer step
-            adaptive_gradient_clip(self.model, clip_factor=self.cfg.agc_clip_factor)
+            adaptive_gradient_clip(self.model, clip_factor=agc_clip_factor)
             self._optimizer_step()
 
         loss_value = float(total_loss.item())
@@ -1172,12 +1179,19 @@ class RRATrainer:
         Modified to handle both teacher distillation and direct ground-truth training.
         If tb contains probabilities, it distills. If it contains bits, it trains toward them.
         """
+        # Hot-path caching
+        cfg = self.cfg
+        mes_enabled = cfg.mes_enabled
+        dynamic_energy_scale = cfg.dynamic_energy_scale
+        coherence_weight = cfg.coherence_weight
+        efficiency_bonus_cap = cfg.efficiency_bonus_cap
+        
         omega = float(self.model.omega)
         if self._mes_cooldown_steps > 0:
             self._mes_cooldown_steps -= 1
             if self._mes_cooldown_steps == 0:
                 logger.info(">>> MES cooldown ended. Re-enabling MES local updates.")
-        mes_active = bool(self.cfg.mes_enabled and self._mes_cooldown_steps <= 0)
+        mes_active = bool(mes_enabled and self._mes_cooldown_steps <= 0)
 
         self.optimizer.zero_grad(set_to_none=True)
 
@@ -1228,11 +1242,11 @@ class RRATrainer:
                 total_loss, loss_info = self.learning_brain.calculate_unified_loss(
                     L_task=loss_task,
                     L_teacher=l_teacher_eff,
-                    L_stability=(l_stab + self.cfg.coherence_weight * l_coh + l_myelin),
+                    L_stability=(l_stab + coherence_weight * l_coh + l_myelin),
                     omega=self.model.omega,
                     thermal_penalty=thermal_penalty
                 )
-                total_loss = total_loss + (self.cfg.dynamic_energy_scale * (1.0 + thermal_penalty) * (cost + l_eng))
+                total_loss = total_loss + (dynamic_energy_scale * (1.0 + thermal_penalty) * (cost + l_eng))
                 if hasattr(self.model, 'get_engagement_rate'):
                     engagement_rate = self.model.get_engagement_rate()
                     if isinstance(engagement_rate, torch.Tensor):
@@ -1243,7 +1257,7 @@ class RRATrainer:
                         )
                     elif not math.isfinite(float(engagement_rate)):
                         engagement_rate = 1.0
-                    efficiency_bonus = min((1.0 - engagement_rate) * 0.1, self.cfg.efficiency_bonus_cap)
+                    efficiency_bonus = min((1.0 - engagement_rate) * 0.1, efficiency_bonus_cap)
                     total_loss = total_loss - efficiency_bonus
                 total_loss = self._finite(total_loss, nan=10.0, posinf=1e4, neginf=-1e4)
             L_total_val = float(total_loss.item())
@@ -1339,10 +1353,16 @@ class RRATrainer:
         return float(L_total_val)
 
     def _step_phase_1_rra(self, xb, yb, batch_idx=0):
+        # Hot-path caching
+        cfg = self.cfg
+        mes_enabled = cfg.mes_enabled
+        reflex_dropout_rate = cfg.reflex_dropout_rate
+        agc_clip_factor = cfg.agc_clip_factor
+        
         B = xb.size(0)
         self.optimizer.zero_grad()
         
-        reflex_dropout = torch.rand(1).item() < self.cfg.reflex_dropout_rate
+        reflex_dropout = torch.rand(1).item() < reflex_dropout_rate
         hit_mask = torch.zeros(B, dtype=torch.bool, device=self.device)
         
         cache = self._cache()
@@ -1371,13 +1391,13 @@ class RRATrainer:
         targets = yb_miss[:, -1] # [B, 8]
         loss_task = self.learning_brain.calculate_task_loss(logits, targets)
         
-        if self.cfg.mes_enabled:
+        if mes_enabled:
             self.model.mes_step(xb_miss, yb_miss, precomputed_H_next=H_next_miss)
         else:
             if loss_task.requires_grad:
                 loss_task.backward()
                 # Apply AGC before optimizer step
-                adaptive_gradient_clip(self.model, clip_factor=self.cfg.agc_clip_factor)
+                adaptive_gradient_clip(self.model, clip_factor=agc_clip_factor)
                 self._optimizer_step()
         
         with torch.no_grad():
