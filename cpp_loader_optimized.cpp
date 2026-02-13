@@ -11,6 +11,7 @@
 #include <pybind11/pybind11.h>
 
 #include <immintrin.h>
+#include "brain_isa.h"
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -23,6 +24,50 @@ namespace Config {
     constexpr float EPSILON = 1e-8f;
     constexpr float THRESH_SPIKE = 0.5f;
     constexpr float MAX_RELu = 10.0f; // Clip value
+}
+
+/**
+ * NIS_Config: Unified configuration authority.
+ * Values are populated from brain_isa.h (static) and config.yaml (dynamic).
+ */
+struct NIS_Config {
+    static int64_t L;
+    static int64_t R;
+    static int64_t WORKING_DIM;
+    static int64_t C;
+    static int64_t MEMORY_DEPTH;
+    static int64_t BATCH_SIZE;
+    static int64_t SEQ_LEN;
+    static float LEARNING_RATE;
+    static float HALT_THRESHOLD;
+};
+
+// Initialize with brain_isa.h defaults
+int64_t NIS_Config::L = NIS_L;
+int64_t NIS_Config::R = NIS_R;
+int64_t NIS_Config::WORKING_DIM = NIS_WORKING_DIM;
+int64_t NIS_Config::C = NIS_C;
+int64_t NIS_Config::MEMORY_DEPTH = NIS_MEMORY_DEPTH;
+int64_t NIS_Config::BATCH_SIZE = 64;
+int64_t NIS_Config::SEQ_LEN = 512;
+float NIS_Config::LEARNING_RATE = 1e-4f;
+float NIS_Config::HALT_THRESHOLD = NIS_HALT_THRESHOLD;
+
+void init_nis_config(py::dict yaml_cfg) {
+    if (yaml_cfg.contains("model")) {
+        py::dict model = yaml_cfg["model"];
+        if (model.contains("L")) NIS_Config::L = model["L"].cast<int64_t>();
+        if (model.contains("R")) NIS_Config::R = model["R"].cast<int64_t>();
+        if (model.contains("working_dim")) NIS_Config::WORKING_DIM = model["working_dim"].cast<int64_t>();
+        if (model.contains("C")) NIS_Config::C = model["C"].cast<int64_t>();
+        if (model.contains("memory_depth")) NIS_Config::MEMORY_DEPTH = model["memory_depth"].cast<int64_t>();
+    }
+    if (yaml_cfg.contains("training")) {
+        py::dict train = yaml_cfg["training"];
+        if (train.contains("batch_size")) NIS_Config::BATCH_SIZE = train["batch_size"].cast<int64_t>();
+        if (train.contains("seq_len")) NIS_Config::SEQ_LEN = train["seq_len"].cast<int64_t>();
+        if (train.contains("lr")) NIS_Config::LEARNING_RATE = train["lr"].cast<float>();
+    }
 }
 namespace py = pybind11;
 
@@ -3344,10 +3389,35 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("set_perf_counters_enabled", &set_perf_counters_enabled);
     m.def("reset_perf_counters", &reset_perf_counters);
     m.def("get_perf_counters", &get_perf_counters);
+    m.def("init_nis_config", &init_nis_config);
+
+    py::class_<NIS_Config>(m, "NIS_Config")
+        .def_readwrite_static("L", &NIS_Config::L)
+        .def_readwrite_static("R", &NIS_Config::R)
+        .def_readwrite_static("WORKING_DIM", &NIS_Config::WORKING_DIM)
+        .def_readwrite_static("C", &NIS_Config::C)
+        .def_readwrite_static("MEMORY_DEPTH", &NIS_Config::MEMORY_DEPTH)
+        .def_readwrite_static("BATCH_SIZE", &NIS_Config::BATCH_SIZE)
+        .def_readwrite_static("SEQ_LEN", &NIS_Config::SEQ_LEN)
+        .def_readwrite_static("LEARNING_RATE", &NIS_Config::LEARNING_RATE)
+        .def_readwrite_static("HALT_THRESHOLD", &NIS_Config::HALT_THRESHOLD);
     m.def("ademamix_update", &ademamix_update);
     m.def("batched_ademamix_update", &batched_ademamix_update);
     m.def("pulse_gated_forward", &pulse_gated_forward);
     m.def("geometric_manifold_forward_avx512", &geometric_manifold_forward_avx512);
     m.def("geometric_manifold_forward_avx512_int8", &geometric_manifold_forward_avx512_int8);
     m.def("fused_cognitive_cycle", &_fused_cognitive_cycle_impl);
+
+    // NIS ISA Constants
+    m.attr("NIS_OP_ADD") = NIS_OP_ADD;
+    m.attr("NIS_OP_SCALE") = NIS_OP_SCALE;
+    m.attr("NIS_OP_GATE") = NIS_OP_GATE;
+    m.attr("NIS_OP_REFLECT") = NIS_OP_REFLECT;
+    m.attr("NIS_OP_JMP") = NIS_OP_JMP;
+
+    m.attr("NIS_L") = NIS_L;
+    m.attr("NIS_R") = NIS_R;
+    m.attr("NIS_WORKING_DIM") = NIS_WORKING_DIM;
+    m.attr("NIS_C") = NIS_C;
+    m.attr("NIS_MEMORY_DEPTH") = NIS_MEMORY_DEPTH;
 }

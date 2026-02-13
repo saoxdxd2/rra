@@ -3,23 +3,32 @@ import yaml
 import os
 
 # ---------------------------
-# Global Configuration Class
+# NIS ARCHITECTURE OVERRIDE
 # ---------------------------
+try:
+    import cpp_loader
+    ISA_AVAILABLE = True
+except ImportError:
+    cpp_loader = None
+    ISA_AVAILABLE = False
+
 def load_config(config_path='conf/config.yaml'):
     if os.path.exists(config_path):
         with open(config_path, 'r') as f:
+            import yaml
             return yaml.safe_load(f)
     return {}
 
 _CONFIG_DATA = load_config()
 
 class Config:
-    # Architecture (Removing legacy restrictions)
-    L = _CONFIG_DATA.get('model', {}).get('L', 32) 
-    R = _CONFIG_DATA.get('model', {}).get('R', 8) 
-    WORKING_DIM = _CONFIG_DATA.get('model', {}).get('working_dim', 512)
-    C = _CONFIG_DATA.get('model', {}).get('C', 4)
-    MEMORY_DEPTH = _CONFIG_DATA.get('model', {}).get('memory_depth', 5)
+    # Architecture (Unified via NIS brain_isa.h)
+    L = getattr(cpp_loader, 'NIS_L', _CONFIG_DATA.get('model', {}).get('L', 32)) if ISA_AVAILABLE else _CONFIG_DATA.get('model', {}).get('L', 32)
+    R = getattr(cpp_loader, 'NIS_R', _CONFIG_DATA.get('model', {}).get('R', 8)) if ISA_AVAILABLE else _CONFIG_DATA.get('model', {}).get('R', 8)
+    WORKING_DIM = getattr(cpp_loader, 'NIS_WORKING_DIM', _CONFIG_DATA.get('model', {}).get('working_dim', 512)) if ISA_AVAILABLE else _CONFIG_DATA.get('model', {}).get('working_dim', 512)
+    C = getattr(cpp_loader, 'NIS_C', _CONFIG_DATA.get('model', {}).get('C', 4)) if ISA_AVAILABLE else _CONFIG_DATA.get('model', {}).get('C', 4)
+    MEMORY_DEPTH = getattr(cpp_loader, 'NIS_MEMORY_DEPTH', _CONFIG_DATA.get('model', {}).get('memory_depth', 5)) if ISA_AVAILABLE else _CONFIG_DATA.get('model', {}).get('memory_depth', 5)
+    
     H_CYCLES = _CONFIG_DATA.get('model', {}).get('H_cycles', 2)
     L_CYCLES = _CONFIG_DATA.get('model', {}).get('L_cycles', 4)
     RMS_NORM_EPS = float(_CONFIG_DATA.get('model', {}).get('rms_norm_eps', 1e-5))
