@@ -238,8 +238,7 @@ class Governor(nn.Module):
         if bdnf_gamma is not None: self.config_scalars[0] = float(bdnf_gamma)
         
         # Unified command 3 = CMD_SURVIVAL_UPDATE
-        from accelerator import Accelerator
-        acc = Accelerator.get_instance()
+        acc = _ACCEL
         out = acc.call('unified_dispatch_io', H_c, self.usage, [H_prev_t], self.config_scalars, 3)
         if isinstance(out, (list, tuple)) and len(out) > 0:
             self.usage = out[0]
@@ -1130,10 +1129,9 @@ class CognitiveOrganism(BaseCognitiveModule):
         B, T = z_L.size(0), z_L.size(1)
         # Sequence-aware workspace views
         h_o = self._lgh_h_view[:B].view(B, self.L, self.R, self.d_s2, self.C)
-        y_o = self._lgh_y_view[:B].view(B, Config.SEQ_LEN, self.R, self.d_s2, self.C)
+        y_o = self._lgh_y_view[:B, :T].reshape(B, T, self.R, self.d_s2, self.C)
         
-        from accelerator import Accelerator
-        acc = Accelerator.get_instance()
+        acc = _ACCEL
         
         # IO Parameters: Base parameters + Zero-Copy output views
         io_params = [
@@ -1563,6 +1561,7 @@ class CognitiveOrganism(BaseCognitiveModule):
     def _prepare_state(self, H, batch_size):
         """Normalize incoming H to contiguous [B, L, R, D, C]."""
         if self._preflight_ready:
+            if H is None: return self._new_state(batch_size)
             return H if H.is_contiguous() else H.contiguous()
 
         if H is None:
@@ -1657,12 +1656,11 @@ class CognitiveOrganism(BaseCognitiveModule):
         H_c = H.contiguous()
         gate_c = gate_cpp.float().contiguous()
         
-        from accelerator import Accelerator
-        acc = Accelerator.get_instance()
+        acc = _ACCEL
         
         # Sequence-aware workspace views (Zero-Copy)
         h_o = self._lgh_h_view[:B].view(B, self.L, self.R, self.d_s2, self.C)
-        y_o = self._lgh_y_view[:B].view(B, T, self.R, self.d_s2, self.C)
+        y_o = self._lgh_y_view[:B, :T].reshape(B, T, self.R, self.d_s2, self.C)
         
         # params: [mask, delays, tables, conns, decays, hw, hb, h_out, y_out]
         io_params = [

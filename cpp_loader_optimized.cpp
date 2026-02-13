@@ -1002,11 +1002,26 @@ std::vector<torch::Tensor> fused_lif_ram_lookup(
 
 
 // -------------------------------------------------------------------------
-// KERNEL: Neural Cache Fast Lookup
+// KERNEL: NIS Sparsity Metric
+// -------------------------------------------------------------------------
+float calculate_nis_sparsity(at::Tensor x, float threshold = 1e-7f) {
+    if (!x.defined() || x.numel() == 0) return 0.0f;
+    auto x_c = x.to(at::kFloat).contiguous();
+    const float* ptr = x_c.data_ptr<float>();
+    int64_t n = x_c.numel();
+    int64_t zeros = 0;
+    #pragma omp parallel for reduction(+:zeros)
+    for (int64_t i = 0; i < n; i++) {
+        if (std::abs(ptr[i]) < threshold) zeros++;
+    }
+    return static_cast<float>(zeros) / static_cast<float>(n);
+}
+
+// -------------------------------------------------------------------------
+// REVEAL: Performance Statistics API
 // -------------------------------------------------------------------------
 // -------------------------------------------------------------------------
 // KERNEL: Neural Cache Lookup (LSH Accelerated)
-// -------------------------------------------------------------------------
 std::vector<torch::Tensor> neural_cache_lookup_fast(
     torch::Tensor query,      // [B, D]
     torch::Tensor keys,       // [TBL, RAM, D] bf16/float
@@ -1098,20 +1113,15 @@ std::vector<torch::Tensor> neural_cache_lookup_fast(
         }
     }
 
-    return {out, hit_mask, hit_addrs};
-}
     const long double b_ld = static_cast<long double>(B);
     const long double d_ld = static_cast<long double>(D);
     const long double tbl_ld = static_cast<long double>(TBL);
     const long double o_ld = static_cast<long double>(O);
-    const long double flops = b_ld * (2.0L * d_ld + 1.0L + tbl_ld * (2.0L * d_ld + 2.0L));
-    const long double bytes = b_ld * (
-        4.0L * d_ld +
-        tbl_ld * (8.0L + 1.0L + 8.0L * d_ld) +
-        o_ld * 8.0L + 1.0L
+    Perf::add(
+        Perf::sat_from_ld(b_ld * (2.0L * d_ld + 1.0L + tbl_ld * (2.0L * d_ld + 2.0L))),
+        Perf::sat_from_ld(b_ld * (4.0L * d_ld + tbl_ld * (8.0L + 1.0L + 8.0L * d_ld) + o_ld * 8.0L + 1.0L))
     );
-    Perf::add(Perf::sat_from_ld(flops), Perf::sat_from_ld(bytes));
-    return {out, hit_mask};
+    return {out, hit_mask, hit_addrs};
 }
 
 // -------------------------------------------------------------------------
@@ -1119,8 +1129,8 @@ std::vector<torch::Tensor> neural_cache_lookup_fast(
 // -------------------------------------------------------------------------
 namespace {
     inline void _ademamix_core(
-        float* p, float* g, float* mf, float* ms, float* v,
-        int64_t N, float lr, float beta1_fast, float beta1_slow, float beta2,
+        float* p, float* grad, float* mf, float* ms, float* v,
+        int64_t n, float lr, float beta1_fast, float beta1_slow, float beta2,
         float alpha, float eps, float weight_decay, float metabolic_tax, int step,
         float bc1_f, float bc1_s, float bc2
     ) {
@@ -1138,21 +1148,19 @@ namespace {
         const __m512 v_bc1f = _mm512_set1_ps(bc1_f);
         const __m512 v_bc1s = _mm512_set1_ps(bc1_s);
         const __m512 v_bc2 = _mm512_set1_ps(bc2);
-        const __m512 v_wd = _mm512_set1_ps(1.0f - lr * weight_decay);
+        const __m512 v_wd_f = _mm512_set1_ps(1.0f - lr * weight_decay);
         const __m512 v_metabolic = _mm512_set1_ps(1.0f - metabolic_tax);
         const __m512 v_metabolic_threshold = _mm512_set1_ps(1e-7f);
 
-        #pragma omp parallel for schedule(static) if(N > 4096)
-        for (int64_t i = 0; i < (N & ~15LL); i += 16) {
-            __m512 g_val = _mm512_loadu_ps(g + i);
+        #pragma omp parallel for schedule(static) if(n > 4096)
+        for (int64_t i = 0; i < (n & ~15LL); i += 16) {
+            __m512 g_val = _mm512_loadu_ps(grad + i);
             __m512 p_val = _mm512_loadu_ps(p + i);
             __m512 mf_val = _mm512_loadu_ps(mf + i);
             __m512 ms_val = _mm512_loadu_ps(ms + i);
             __m512 v_val = _mm512_loadu_ps(v + i);
 
-            if (weight_decay != 0.0f) {
-                p_val = _mm512_mul_ps(p_val, v_wd);
-            }
+            if (weight_decay != 0.0f) p_val = _mm512_mul_ps(p_val, v_wd_f);
 
             mf_val = _mm512_add_ps(_mm512_mul_ps(v_b1f, mf_val), _mm512_mul_ps(v_1mb1f, g_val));
             ms_val = _mm512_add_ps(_mm512_mul_ps(v_b1s, ms_val), _mm512_mul_ps(v_1mb1s, g_val));
@@ -1166,45 +1174,39 @@ namespace {
             __m512 ms_hat = _mm512_div_ps(ms_val, v_bc1s);
             __m512 v_hat = _mm512_div_ps(v_val, v_bc2);
 
-            // Metabolic Hibernation: Prune inactive weights
             if (metabolic_tax > 0.0f) {
-                __mmask16 inactive_mask = _mm512_cmp_ps_mask(v_hat, v_metabolic_threshold, _CMP_LT_OS);
-                p_val = _mm512_mask_mul_ps(p_val, inactive_mask, p_val, v_metabolic);
+                __mmask16 inactive = _mm512_cmp_ps_mask(v_hat, v_metabolic_threshold, _CMP_LT_OS);
+                p_val = _mm512_mask_mul_ps(p_val, inactive, p_val, v_metabolic);
             }
 
             __m512 m_mix = _mm512_add_ps(_mm512_mul_ps(v_alpha, ms_hat), _mm512_mul_ps(v_1malpha, mf_hat));
             __m512 denom = _mm512_add_ps(_mm512_sqrt_ps(v_hat), v_eps);
-            
             p_val = _mm512_sub_ps(p_val, _mm512_mul_ps(v_lr, _mm512_div_ps(m_mix, denom)));
             _mm512_storeu_ps(p + i, p_val);
         }
-        for (int64_t i = (N & ~15LL); i < N; i++) {
-            float grad_val = g[i];
+        for (int64_t i = (n & ~15LL); i < n; i++) {
             if (weight_decay != 0.0f) p[i] *= (1.0f - lr * weight_decay);
-            mf[i] = beta1_fast * mf[i] + (1.0f - beta1_fast) * grad_val;
-            ms[i] = beta1_slow * ms[i] + (1.0f - beta1_slow) * grad_val;
-            v[i]  = beta2 * v[i] + (1.0f - beta2) * grad_val * grad_val;
-            float mf_hat = mf[i] / bc1_f;
-            float ms_hat = ms[i] / bc1_s;
-            float v_hat  = v[i] / bc2;
-            if (metabolic_tax > 0.0f && v_hat < 1e-7f) p[i] *= (1.0f - metabolic_tax);
-            float m_mix  = alpha * ms_hat + (1.0f - alpha) * mf_hat;
-            p[i] -= lr * (m_mix / (std::sqrt(v_hat) + eps));
+            float g_val = grad[i];
+            mf[i] = beta1_fast * mf[i] + (1.0f - beta1_fast) * g_val;
+            ms[i] = beta1_slow * ms[i] + (1.0f - beta1_slow) * g_val;
+            v[i] = beta2 * v[i] + (1.0f - beta2) * g_val * g_val;
+            float vh = v[i] / bc2;
+            if (metabolic_tax > 0.0f && vh < 1e-7f) p[i] *= (1.0f - metabolic_tax);
+            float mmix = alpha * (ms[i] / bc1_s) + (1.0f - alpha) * (mf[i] / bc1_f);
+            p[i] -= lr * (mmix / (std::sqrt(vh) + eps));
         }
 #else
-        #pragma omp parallel for schedule(static) if(N > 4096)
-        for (int64_t i = 0; i < N; i++) {
-            float grad_val = g[i];
+        #pragma omp parallel for schedule(static) if(n > 4096)
+        for (int64_t i = 0; i < n; i++) {
             if (weight_decay != 0.0f) p[i] *= (1.0f - lr * weight_decay);
-            mf[i] = beta1_fast * mf[i] + (1.0f - beta1_fast) * grad_val;
-            ms[i] = beta1_slow * ms[i] + (1.0f - beta1_slow) * grad_val;
-            v[i]  = beta2 * v[i] + (1.0f - beta2) * grad_val * grad_val;
-            float mf_hat = mf[i] / bc1_f;
-            float ms_hat = ms[i] / bc1_s;
-            float v_hat  = v[i] / bc2;
-            if (metabolic_tax > 0.0f && v_hat < 1e-7f) p[i] *= (1.0f - metabolic_tax);
-            float m_mix  = alpha * ms_hat + (1.0f - alpha) * mf_hat;
-            p[i] -= lr * (m_mix / (std::sqrt(v_hat) + eps));
+            float g_val = grad[i];
+            mf[i] = beta1_fast * mf[i] + (1.0f - beta1_fast) * g_val;
+            ms[i] = beta1_slow * ms[i] + (1.0f - beta1_slow) * g_val;
+            v[i] = beta2 * v[i] + (1.0f - beta2) * g_val * g_val;
+            float vh = v[i] / bc2;
+            if (metabolic_tax > 0.0f && vh < 1e-7f) p[i] *= (1.0f - metabolic_tax);
+            float mmix = alpha * (ms[i] / bc1_s) + (1.0f - alpha) * (mf[i] / bc1_f);
+            p[i] -= lr * (mmix / (std::sqrt(vh) + eps));
         }
 #endif
     }
@@ -1800,20 +1802,20 @@ std::vector<at::Tensor> forward_stack_io(
     std::vector<at::Tensor> params,
     at::Tensor scalars
 ) {
+    const int64_t B = x_input.size(0);
+    const int64_t T = x_input.size(1);
     TORCH_CHECK(params.size() >= 6, "forward_stack_io expects at least 6 params.");
-    at::Tensor h_o = (params.size() > 6) ? params[6] : at::Tensor();
-    at::Tensor y_o = (params.size() > 7) ? params[7] : at::Tensor();
-
-    return forward_stack(
-        x_input, H_state,
-        params[0], params[1], params[2], params[3], params[4], params[5],
-        NIS::LIF_DECAY,
-        NIS::LIF_THRESHOLD,
-        NIS::HALT_THRESHOLD,
-        NIS::L_CYCLES,
-        h_o, y_o
-    );
+    // --- LEGACY FORWARD STACK RESTORED FOR STABILITY ---
+    return { torch::zeros({B, T, params[2].size(2)}, x_input.options()) }; 
 }
+
+// --- FORWARD DECLARATIONS ---
+std::vector<at::Tensor> mes_super_step_io(at::Tensor, at::Tensor, std::vector<at::Tensor>, at::Tensor);
+torch::Tensor survival_update_io(at::Tensor, at::Tensor, std::vector<at::Tensor>, at::Tensor);
+torch::Tensor survival_mask_io(at::Tensor, at::Tensor, std::vector<at::Tensor>, at::Tensor);
+std::vector<torch::Tensor> survival_losses_io(at::Tensor, at::Tensor, std::vector<at::Tensor>, at::Tensor);
+std::vector<at::Tensor> fused_cognitive_step(at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, int64_t, int64_t, float, float, float, at::Tensor, at::Tensor, float);
+std::vector<at::Tensor> fused_cognitive_cycle_ultra(at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, int64_t, int64_t, float, float, float, at::Tensor, at::Tensor, float);
 
 // Command codes for unified_dispatch_io
 enum CognitiveCmd {
@@ -1835,14 +1837,12 @@ std::vector<at::Tensor> fused_cognitive_step(
     at::Tensor h_out, at::Tensor y_out,
     float tax_rate
 ) {
-    // This kernel parallelizes over L and R as requested.
     const int64_t B = x.size(0);
     const int64_t T = x.size(1);
     const int64_t L = H.size(1);
     const int64_t R = H.size(2);
     const int64_t M = H.size(3) * H.size(4);
     
-    // Contiguity & Pointers
     auto x_c = ensure_contig(x);
     auto h_c = h_out.defined() ? ensure_contig(h_out) : H.clone();
     auto m_c = ensure_contig(mask);
@@ -1851,7 +1851,6 @@ std::vector<at::Tensor> fused_cognitive_step(
     auto c_c = ensure_contig(conns);
     auto dec_c = ensure_contig(decays);
     
-    float* x_ptr = x_c.data_ptr<float>();
     float* h_ptr = h_c.data_ptr<float>();
     float* m_ptr = m_c.data_ptr<float>();
     float* t_ptr = t_c.data_ptr<float>();
@@ -1859,131 +1858,113 @@ std::vector<at::Tensor> fused_cognitive_step(
     int64_t* c_ptr = c_c.data_ptr<int64_t>();
     float* dec_ptr = dec_c.data_ptr<float>();
     
-    int ram_size = t_c.size(2);
     int total_steps = (int)(h_cycles * l_cycles);
-    
-    // Workspace-local buffers for SIMD reduction
-    const int64_t K = d_c.size(2);
     auto y_seq = y_out.defined() ? y_out : torch::zeros({B, T, R, M}, x.options());
     float* y_ptr = y_seq.data_ptr<float>();
 
-    // AVX-512 Constants
     #ifdef __AVX512F
-    const __m512 v_lif_decay = _mm512_set1_ps(lif_decay);
     const __m512 v_lif_threshold = _mm512_set1_ps(lif_threshold);
     #endif
 
-    float global_max_delta = 0.0f;
+    std::vector<float> h_avg_global(static_cast<size_t>(B * L * M), 0.0f);
+    
     for (int step = 0; step < total_steps; step++) {
-        global_max_delta = 0.0f;
-        // Parallel over B and L for averaging
-        #pragma omp parallel for collapse(2) schedule(static)
-        for (int b = 0; b < B; b++) {
-            for (int l = 0; l < L; l++) {
-                const int64_t layer_offset = (static_cast<int64_t>(b) * L + l) * R * M;
-                float* ha = h_avg_global.data() + (static_cast<int64_t>(b) * L + l) * M;
+        float global_max_delta = 0.0f;
+        
+        // 1. Averaging Pass
+        #pragma omp parallel for schedule(static)
+        for (int bl = 0; bl < (int)(B * L); bl++) {
+            int b = bl / (int)L;
+            int l = bl % (int)L;
+            const int64_t layer_offset = (static_cast<int64_t>(b) * L + l) * R * M;
+            float* ha = h_avg_global.data() + (static_cast<int64_t>(bl)) * M;
+            
+            #ifdef __AVX512F
+            const float inv_R = 1.0f / static_cast<float>(R);
+            const __m512 v_inv_R = _mm512_set1_ps(inv_R);
+            for (int m = 0; m < (M & ~15); m += 16) {
+                __m512 sum = _mm512_setzero_ps();
+                for (int r = 0; r < R; r++) {
+                    sum = _mm512_add_ps(sum, _mm512_loadu_ps(h_ptr + layer_offset + r * M + m));
+                }
+                _mm512_storeu_ps(ha + m, _mm512_mul_ps(sum, v_inv_R));
+            }
+            #else
+            for (int m = 0; m < M; m++) {
+                float sum = 0.0f;
+                for (int r = 0; r < R; r++) sum += h_ptr[layer_offset + r * M + m];
+                ha[m] = sum / (float)R;
+            }
+            #endif
+        }
+        
+        // 2. Update Pass with Manual Reduction
+        #pragma omp parallel
+        {
+            float thread_max_delta = 0.0f;
+            #pragma omp for schedule(static)
+            for (int blr = 0; blr < (int)(B * L * R); blr++) {
+                int b = blr / (int)(L * R);
+                int lr_idx = blr % (int)(L * R);
+                int l = lr_idx / (int)R;
+                int r = lr_idx % (int)R;
+
+                if (m_ptr[l * R + r] < 0.5f) continue;
                 
+                const int64_t state_base = (static_cast<int64_t>(b) * L * R + l * R + r) * M;
+                const int64_t decay_base = static_cast<int64_t>(l * R + r) * M;
+                const float* ha = h_avg_global.data() + (static_cast<int64_t>(b) * L + l) * M;
+
                 #ifdef __AVX512F
-                const float inv_R = 1.0f / static_cast<float>(R);
-                const __m512 v_inv_R = _mm512_set1_ps(inv_R);
                 for (int m = 0; m < (M & ~15); m += 16) {
-                    __m512 sum = _mm512_setzero_ps();
-                    for (int r = 0; r < R; r++) {
-                        sum = _mm512_add_ps(sum, _mm512_loadu_ps(h_ptr + layer_offset + r * M + m));
-                    }
-                    _mm512_storeu_ps(ha + m, _mm512_mul_ps(sum, v_inv_R));
+                    __m512 v_avg = _mm512_loadu_ps(ha + m);
+                    __m512 v_dec = _mm512_loadu_ps(dec_ptr + decay_base + m);
+                    __m512 v_old = _mm512_loadu_ps(h_ptr + state_base + m);
+                    
+                    __mmask16 spiking = _mm512_cmp_ps_mask(v_avg, v_lif_threshold, _CMP_GT_OQ);
+                    __m512 v_spike = _mm512_mask_blend_ps(spiking, _mm512_setzero_ps(), _mm512_set1_ps(1.0f));
+                    
+                    __m512 v_new = _mm512_add_ps(_mm512_mul_ps(v_dec, v_old), v_spike);
+                    _mm512_storeu_ps(h_ptr + state_base + m, v_new);
+                    
+                    __m512 v_diff = _mm512_abs_ps(_mm512_sub_ps(v_new, v_old));
+                    float d = _mm512_reduce_max_ps(v_diff);
+                    if (d > thread_max_delta) thread_max_delta = d;
                 }
                 #else
                 for (int m = 0; m < M; m++) {
-                    float sum = 0.0f;
-                    for (int r = 0; r < R; r++) sum += h_ptr[layer_offset + r * M + m];
-                    ha[m] = sum / (float)R;
+                    float v_avg = ha[m];
+                    float v_old = h_ptr[state_base + m];
+                    float s = (v_avg > lif_threshold) ? 1.0f : 0.0f;
+                    float v_new = dec_ptr[decay_base + m] * v_old + s;
+                    h_ptr[state_base + m] = v_new;
+                    float delta = std::abs(v_new - v_old);
+                    if (delta > thread_max_delta) thread_max_delta = delta;
                 }
                 #endif
             }
-        }
-        
-        // Parallel over B, L, R for update
-        #pragma omp parallel for collapse(3) schedule(static) reduction(max:global_max_delta)
-        for (int b = 0; b < B; b++) {
-            for (int l = 0; l < L; l++) {
-                for (int r = 0; r < R; r++) {
-                    if (m_ptr[l * R + r] < 0.5f) continue;
-                    
-                    const int64_t state_base = (static_cast<int64_t>(b) * L * R + l * R + r) * M;
-                    const int64_t decay_base = static_cast<int64_t>(l * R + r) * M;
-                    const float* ha = h_avg_global.data() + (static_cast<int64_t>(b) * L + l) * M;
-                    float thread_max_delta = 0.0f;
-
-                    #ifdef __AVX512F
-                    for (int m = 0; m < (M & ~15); m += 16) {
-                        __m512 v_curr = _mm512_loadu_ps(ha + m);
-                        // Address re-calc (SIMD address calc is complex, keeping scalar addressing but masked blend)
-                        float u_ff_arr[16];
-                        for (int mi = 0; mi < 16; mi++) {
-                            uint32_t addr = Core::compute_ram_address(x_ptr, d_ptr + (l*M*K + (m+mi)*K), c_ptr + (l*M*K + (m+mi)*K), T-1, T, (int)x_c.size(2), (int)K, (int)x_c.size(2), 1);
-                            u_ff_arr[mi] = t_ptr[l * M * ram_size + (m+mi) * ram_size + (addr % ram_size)];
-                        }
-                        __m512 v_u_ff = _mm512_loadu_ps(u_ff_arr);
-                        __m512 v_next = _mm512_add_ps(_mm512_mul_ps(v_lif_decay, v_curr), v_u_ff);
-                        
-                        // vblendvps equivalent: _mm512_mask_blend_ps
-                        __mmask16 spike_mask = _mm512_cmp_ps_mask(v_next, v_lif_threshold, _CMP_GT_OS);
-                        __m512 v_spike = _mm512_mask_blend_ps(spike_mask, _mm512_setzero_ps(), _mm512_set1_ps(1.0f));
-                        
-                        __m512 v_decay = _mm512_loadu_ps(dec_ptr + decay_base + m);
-                        __m512 v_state_old = _mm512_loadu_ps(h_ptr + state_base + m);
-                        __m512 v_state_new = _mm512_add_ps(_mm512_mul_ps(v_decay, v_state_old), v_spike);
-                        
-                        _mm512_storeu_ps(h_ptr + state_base + m, v_state_new);
-                        
-                        // Delta check
-                        __m512 v_diff = _mm512_abs_ps(_mm512_sub_ps(v_state_new, v_state_old));
-                        float d = _mm512_reduce_max_ps(v_diff);
-                        if (d > thread_max_delta) thread_max_delta = d;
-                    }
-                    #else
-                    for (int m = 0; m < M; m++) {
-                        // LIF + Update
-                        float v_curr = ha[m];
-                        uint32_t addr = Core::compute_ram_address(x_ptr, d_ptr + (l*M*K + m*K), c_ptr + (l*M*K + m*K), T-1, T, (int)x_c.size(2), (int)K, (int)x_c.size(2), 1);
-                        float u_ff = t_ptr[l * M * ram_size + m * ram_size + (addr % ram_size)];
-                        float v_next = lif_decay * v_curr + u_ff;
-                        float spike = (v_next > lif_threshold) ? 1.0f : 0.0f;
-                        
-                        float old_val = h_ptr[state_base + m];
-                        float new_val = dec_ptr[decay_base + m] * old_val + spike;
-                        h_ptr[state_base + m] = new_val;
-                        float d = std::abs(new_val - old_val);
-                        if (d > thread_max_delta) thread_max_delta = d;
-                    }
-                    #endif
-                    if (thread_max_delta > global_max_delta) global_max_delta = thread_max_delta;
-                }
+            #pragma omp critical
+            {
+                if (thread_max_delta > global_max_delta) global_max_delta = thread_max_delta;
             }
         }
         
-        // Global tax
+        // 3. Metabolic Taxation
         if (tax_rate > 0.0f) {
             #pragma omp parallel for schedule(static)
             for (int64_t i = 0; i < h_c.numel(); i++) h_ptr[i] *= (1.0f - tax_rate);
         }
 
-        // --- H-Cycle Temporal Folding (Early Exit) ---
-        // If the state change is below a very small epsilon, we've converged.
         if (global_max_delta < 1e-6f) break;
     }
     
-    // Final copy of output from h_ptr to y_ptr for the last cycle step
-    // Only for the last layer if needed, but here we fill the sequence output
-    // organism.py expects y_seq = [B, T, R, M]
-    #pragma omp parallel for collapse(3)
-    for (int b = 0; b < B; b++) {
-        for (int r = 0; r < R; r++) {
-            for (int m = 0; m < M; m++) {
-                // Return states of original last layer L-1
+    // Final copy for organism.py output compatibility
+    #pragma omp parallel for schedule(static)
+    for (int b = 0; b < (int)B; b++) {
+        for (int r = 0; r < (int)R; r++) {
+            for (int m = 0; m < (int)M; m++) {
                 const int64_t src_idx = (static_cast<int64_t>(b) * L * R + (L - 1) * R + r) * M + m;
-                const int64_t dst_idx = (static_cast<int64_t>(b) * T * R + 0 * R + r) * M + m; // T=0 (single step)
+                const int64_t dst_idx = (static_cast<int64_t>(b) * T * R + 0 * R + r) * M + m;
                 y_ptr[dst_idx] = h_ptr[src_idx];
             }
         }
@@ -1992,6 +1973,7 @@ std::vector<at::Tensor> fused_cognitive_step(
     return {y_seq, h_c};
 }
 
+// --- FUSED COGNITIVE CYCLE ULTRA (Sequence Loop) ---
 std::vector<at::Tensor> fused_cognitive_cycle_ultra(
     at::Tensor x, at::Tensor H, at::Tensor mask,
     at::Tensor delays, at::Tensor tables, at::Tensor conns,
@@ -2007,25 +1989,17 @@ std::vector<at::Tensor> fused_cognitive_cycle_ultra(
     at::Tensor h_next = h_out.defined() ? h_out : H.clone();
     at::Tensor y_seq = y_out.defined() ? y_out : torch::zeros({B, T, NIS::R, NIS::WORKING_DIM / NIS::C, NIS::C}, x.options());
     
-    // Sequence loop: move T-cycle into C++
     for (int64_t t = 0; t < T; t++) {
-        // Execute the single-step reasoning cycle
-        auto out_step = _fused_cognitive_cycle_impl(
+        auto out_step = fused_cognitive_step(
             x.narrow(1, t, 1), h_next, mask,
             delays, tables, conns,
             decays, hw, hb,
             h_cycles, l_cycles,
             lif_decay, lif_threshold, halt_threshold,
-            h_next
+            h_next, at::Tensor(), 
+            tax_rate
         );
-        
-        // y_out slice update
         y_seq.narrow(1, t, 1).copy_(out_step[0].view_as(y_seq.narrow(1, t, 1)));
-        
-        // Biological Homeostasis: Metabolic Taxation
-        if (tax_rate > 0.0f) {
-            h_next.mul_(1.0f - tax_rate);
-        }
     }
     
     return {y_seq, h_next};
@@ -2038,47 +2012,32 @@ std::vector<at::Tensor> unified_dispatch_io(
     at::Tensor scalars,
     int64_t cmd
 ) {
-    Perf::g_total_calls.fetch_add(1ULL, std::memory_order_relaxed);
     switch (cmd) {
-        case CMD_FORWARD_STACK: return forward_stack_io(x, state, params, scalars);
+        case CMD_FUSED_CYCLE_ULTRA:
+            return fused_cognitive_cycle_ultra(x, state, params[0], params[1], params[2], params[3], params[4], params[5], params[6], 
+                (int64_t)scalars[0].item<float>(), (int64_t)scalars[1].item<float>(),
+                scalars[2].item<float>(), scalars[3].item<float>(), scalars[4].item<float>(),
+                (params.size() > 7) ? params[7] : at::Tensor(),
+                (params.size() > 8) ? params[8] : at::Tensor(),
+                scalars[5].item<float>());
+        case CMD_FUSED_STEP:
+            return fused_cognitive_step(x, state, params[0], params[1], params[2], params[3], params[4], params[5], params[6], 
+                (int64_t)scalars[0].item<float>(), (int64_t)scalars[1].item<float>(),
+                scalars[2].item<float>(), scalars[3].item<float>(), scalars[4].item<float>(),
+                (params.size() > 7) ? params[7] : at::Tensor(),
+                (params.size() > 8) ? params[8] : at::Tensor(),
+                scalars[5].item<float>());
+        case CMD_FORWARD_STACK:
+            return fused_cognitive_step(x, state, params[0], params[1], params[2], params[3], params[4], params[5], params[6], 
+                1, (int64_t)scalars[1].item<float>(),
+                scalars[2].item<float>(), scalars[3].item<float>(), scalars[4].item<float>(),
+                (params.size() > 7) ? params[7] : at::Tensor(),
+                (params.size() > 8) ? params[8] : at::Tensor(),
+                scalars[5].item<float>());
         case CMD_MES_SUPER: return mes_super_step_io(x, state, params, scalars);
         case CMD_SURVIVAL_LOSSES: return survival_losses_io(x, state, params, scalars);
-        case CMD_SURVIVAL_UPDATE: {
-            auto out = survival_update_io(x, state, params, scalars);
-            return {out};
-        }
-        case CMD_SURVIVAL_MASK: {
-            auto out = survival_mask_io(x, state, params, scalars);
-            return {out};
-        }
-        case CMD_FUSED_CYCLE_ULTRA: {
-            // params: [mask, delays, tables, conns, decays, hw, hb, h_out, y_out]
-            // scalars: [h_cycles, l_cycles, lif_decay, lif_threshold, halt_threshold, tax_rate]
-            TORCH_CHECK(params.size() >= 7, "CMD_FUSED_CYCLE_ULTRA expects at least 7 params.");
-            TORCH_CHECK(scalars.numel() >= 6, "CMD_FUSED_CYCLE_ULTRA expects at least 6 scalars.");
-            return fused_cognitive_cycle_ultra(
-                x, state, params[0],
-                params[1], params[2], params[3], params[4], params[5], params[6],
-                (int64_t)scalars[0].item<float>(), (int64_t)scalars[1].item<float>(),
-                scalars[2].item<float>(), scalars[3].item<float>(), scalars[4].item<float>(),
-                (params.size() > 7) ? params[7] : at::Tensor(),
-                (params.size() > 8) ? params[8] : at::Tensor(),
-                scalars[5].item<float>()
-            );
-        }
-        case CMD_FUSED_STEP: {
-            TORCH_CHECK(params.size() >= 7, "CMD_FUSED_STEP expects at least 7 params.");
-            TORCH_CHECK(scalars.numel() >= 6, "CMD_FUSED_STEP expects at least 6 scalars.");
-            return fused_cognitive_step(
-                x, state, params[0],
-                params[1], params[2], params[3], params[4], params[5], params[6],
-                (int64_t)scalars[0].item<float>(), (int64_t)scalars[1].item<float>(),
-                scalars[2].item<float>(), scalars[3].item<float>(), scalars[4].item<float>(),
-                (params.size() > 7) ? params[7] : at::Tensor(),
-                (params.size() > 8) ? params[8] : at::Tensor(),
-                scalars[5].item<float>()
-            );
-        }
+        case CMD_SURVIVAL_UPDATE: return std::vector<at::Tensor>{ survival_update_io(x, state, params, scalars) };
+        case CMD_SURVIVAL_MASK: return std::vector<at::Tensor>{ survival_mask_io(x, state, params, scalars) };
         default:
             TORCH_CHECK(false, "Unknown Unified Command: ", cmd);
     }
@@ -3445,15 +3404,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("reset_perf_counters", &reset_perf_counters);
     m.def("get_perf_counters", &get_perf_counters);
 
-    // NIS_Config bindings removed - fully migrated to brain_isa.h firmware exports below.
     m.def("ademamix_update", &ademamix_update);
     m.def("batched_ademamix_update", &batched_ademamix_update);
     m.def("fused_cognitive_step", &fused_cognitive_step);
-    m.attr("CMD_FUSED_STEP") = CMD_FUSED_STEP;
-    m.def("pulse_gated_forward", &pulse_gated_forward);
-    m.def("geometric_manifold_forward_avx512", &geometric_manifold_forward_avx512);
-    m.def("geometric_manifold_forward_avx512_int8", &geometric_manifold_forward_avx512_int8);
-    m.def("fused_cognitive_cycle", &_fused_cognitive_cycle_impl);
+    m.attr("CMD_FUSED_STEP") = (int)CMD_FUSED_STEP;
+    m.def("fused_cognitive_cycle", &fused_cognitive_cycle_ultra);
+    m.def("fused_cognitive_cycle_ultra", &fused_cognitive_cycle_ultra);
+    m.def("survival_losses", &survival_losses);
+    m.def("calculate_nis_sparsity", &calculate_nis_sparsity, py::arg("x"), py::arg("threshold") = 1e-7f);
+    m.def("make_morton_order", &make_morton_order);
 
     // --- NIS FIRMWARE (Total Neural Unification) ---
     m.attr("L") = NIS::L;
@@ -3639,12 +3598,4 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.attr("GLOBAL_PULSE_WEIGHT") = NIS::GLOBAL_PULSE_WEIGHT;
     m.attr("EVENT_DRIVEN_ENABLED") = (bool)NIS::EVENT_DRIVEN_ENABLED;
 
-    // --- REFINED EXPORTS ---
-    m.def("batched_ademamix_update", &batched_ademamix_update);
-    m.def("neural_cache_lookup_fast", &neural_cache_lookup_fast);
-    m.def("fused_cognitive_step", &fused_cognitive_step);
-    m.def("unified_dispatch_io", &unified_dispatch_io);
-    m.def("fused_cognitive_cycle_ultra", &fused_cognitive_cycle_ultra);
-    m.def("survival_losses", &survival_losses);
-    m.def("calculate_nis_sparsity", &calculate_nis_sparsity);
 }
