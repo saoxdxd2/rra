@@ -16,6 +16,8 @@ class MutationConfig:
     stress_multiplier: float = 0.3
     max_intensity: float = 0.2
     thermal_penalty_weight: float = 0.25
+    simd_penalty_weight: float = 0.15
+    simd_starvation_threshold: float = 1200.0
     
 class EventLogger:
     """Basic observability implementation."""
@@ -107,6 +109,11 @@ class GenomeState:
         "curve_trajectory": "curve_trajectory",
         "mask_sparsity": "mask_sparsity_bias",
         "thermal_efficiency": "metabolic_efficiency",
+        "wormhole_jump": "wormhole_jump_bias",
+        "focus_x": "focus_x",
+        "focus_y": "focus_y",
+        "focus_z": "focus_z",
+        "focus_sharpness": "focus_sharpness",
     }
 
     def __init__(self, seed: Optional[int] = None):
@@ -128,6 +135,11 @@ class GenomeState:
             'curve_trajectory': BrainGene('CURVE_TRAJECTORY', baseline=0.5, min_val=0.0, max_val=1.0, rng=self.rng),
             'mask_sparsity_bias': BrainGene('MASK_SPARSITY_BIAS', baseline=0.5, min_val=0.05, max_val=0.95, rng=self.rng),
             'metabolic_efficiency': BrainGene('METABOLIC_EFFICIENCY', baseline=0.5, min_val=0.1, max_val=1.5, rng=self.rng),
+            'wormhole_jump_bias': BrainGene('WORMHOLE_JUMP_BIAS', baseline=0.15, min_val=0.0, max_val=1.0, rng=self.rng),
+            'focus_x': BrainGene('FOCUS_X', baseline=0.5, min_val=0.0, max_val=1.0, rng=self.rng),
+            'focus_y': BrainGene('FOCUS_Y', baseline=0.5, min_val=0.0, max_val=1.0, rng=self.rng),
+            'focus_z': BrainGene('FOCUS_Z', baseline=0.5, min_val=0.0, max_val=1.0, rng=self.rng),
+            'focus_sharpness': BrainGene('FOCUS_SHARPNESS', baseline=0.5, min_val=0.05, max_val=1.5, rng=self.rng),
         }
         
         # Static Linkage Map (Could be dynamic in future)
@@ -138,6 +150,8 @@ class GenomeState:
             'gaba': {'drd2': 0.4},
             'metabolic_efficiency': {'fkbp5': -0.4, 'mask_sparsity_bias': 0.2},
             'curve_trajectory': {'mask_sparsity_bias': 0.1},
+            'wormhole_jump_bias': {'curve_trajectory': 0.2, 'metabolic_efficiency': 0.1},
+            'focus_sharpness': {'mask_sparsity_bias': 0.1, 'metabolic_efficiency': 0.1},
         }
 
     def state_dict(self):
@@ -175,11 +189,13 @@ class EvolutionPolicy:
         val_loss = metrics.get('val_loss', 1.0)
         cost_step = metrics.get('cost_step', 0.0)
         thermal_penalty = metrics.get('thermal_penalty', 0.0)
+        simd_cycles_per_pulse = float(metrics.get('simd_cycles_per_pulse', 0.0))
         thermal_status = metrics.get('thermal_status', {}) if isinstance(metrics.get('thermal_status', {}), dict) else {}
         throttled = bool(thermal_status.get('throttled', False))
         
         if val_loss > 1.5: return "TASK_FAILURE"
         if throttled or thermal_penalty > 0.25: return "THERMAL_FAILURE"
+        if simd_cycles_per_pulse > self.config.simd_starvation_threshold: return "SILICON_STARVATION"
         # Enterprise tuning: Lower threshold for energy failure to force efficiency early?
         if cost_step > 0.5: return "ENERGY_FAILURE" 
         return "STAGNATION"
@@ -194,6 +210,10 @@ class EvolutionPolicy:
         elif stress_dir == "THERMAL_FAILURE":
             # Favor cooler sparse masks under heat stress.
             return 'mask_sparsity_bias', 1.0
+        elif stress_dir == "SILICON_STARVATION":
+            # Evolve toward shorter, cheaper manifold traversals.
+            target = state.rng.choice(['metabolic_efficiency', 'wormhole_jump_bias', 'mask_sparsity_bias'])
+            return target, 1.0
         elif stress_dir == "ENERGY_FAILURE":
             return 'fkbp5', 1.0
         else:
@@ -248,6 +268,16 @@ class Genome: # Renamed from GenomeEngine to maintain compat with organism.py
     def mask_sparsity_bias(self): return self.get_expression('mask_sparsity_bias')
     @property
     def metabolic_efficiency(self): return self.get_expression('metabolic_efficiency')
+    @property
+    def wormhole_jump_bias(self): return self.get_expression('wormhole_jump_bias')
+    @property
+    def focus_x(self): return self.get_expression('focus_x')
+    @property
+    def focus_y(self): return self.get_expression('focus_y')
+    @property
+    def focus_z(self): return self.get_expression('focus_z')
+    @property
+    def focus_sharpness(self): return self.get_expression('focus_sharpness')
 
     def get_expression(self, name):
         if name in self.state.genes:
@@ -273,7 +303,20 @@ class Genome: # Renamed from GenomeEngine to maintain compat with organism.py
         start = self.next_curve_anchor(total, hint=hint)
         trajectory = max(0.0, min(1.0, self.curve_trajectory))
         step = max(1, int(round(1 + trajectory * 5)))
-        return [int((start + i * step) % total) for i in range(length)]
+        jump_bias = max(0.0, min(1.0, self.wormhole_jump_bias))
+        jump_prob = min(0.75, 0.10 + 0.55 * jump_bias)
+        chain = []
+        cursor = int(start)
+        for _ in range(length):
+            chain.append(int(cursor))
+            if self.state.rng.random() < jump_prob:
+                # Topological shortcut: long-range jump (wormhole).
+                jump_span = self.state.rng.randint(max(1, total // 8), max(1, (total * 3) // 4))
+                direction = -1 if self.state.rng.random() < 0.5 else 1
+                cursor = int((cursor + direction * jump_span + hint) % total)
+            else:
+                cursor = int((cursor + step) % total)
+        return chain
 
     # --- Execution Logic ---
     
@@ -339,9 +382,17 @@ class Genome: # Renamed from GenomeEngine to maintain compat with organism.py
             thermal_status = {}
         throttled = bool(thermal_status.get('throttled', False))
         freq_ghz = float(thermal_status.get('freq_ghz', 0.0))
+        simd_cycles = max(0.0, float(performance_metrics.get('simd_cycles', 0.0)))
+        simd_pulse_ops = max(1.0, float(performance_metrics.get('simd_pulse_ops', 1.0)))
+        simd_cycles_per_pulse = max(0.0, float(performance_metrics.get('simd_cycles_per_pulse', simd_cycles / simd_pulse_ops)))
+        simd_pressure = max(0.0, (simd_cycles_per_pulse - self.policy.config.simd_starvation_threshold) / max(1.0, self.policy.config.simd_starvation_threshold))
         dense_penalty = max(0.0, 1.0 - float(self.mask_sparsity_bias))
         thermal_weight = self.policy.config.thermal_penalty_weight * (2.0 if throttled else 1.0)
-        effective_loss = val_loss + thermal_weight * (thermal_penalty + dense_penalty)
+        effective_loss = (
+            val_loss
+            + thermal_weight * (thermal_penalty + dense_penalty)
+            + self.policy.config.simd_penalty_weight * simd_pressure
+        )
         
         # 1. Improvement Branch
         if effective_loss < self.state.best_loss:
@@ -362,6 +413,10 @@ class Genome: # Renamed from GenomeEngine to maintain compat with organism.py
                     "effective_loss": effective_loss,
                     "thermal_penalty": thermal_penalty,
                     "dense_penalty": dense_penalty,
+                    "simd_cycles": simd_cycles,
+                    "simd_pulse_ops": simd_pulse_ops,
+                    "simd_cycles_per_pulse": simd_cycles_per_pulse,
+                    "simd_pressure": simd_pressure,
                     "throttled": throttled,
                     "freq_ghz": freq_ghz,
                     "health": self.state.health
@@ -370,7 +425,8 @@ class Genome: # Renamed from GenomeEngine to maintain compat with organism.py
             print(
                 f">>> GENOME: Improvement! Gen {self.state.generation} | Loss: {val_loss:.4f} "
                 f"| Effective: {effective_loss:.4f} | Thermal: {thermal_penalty:.4f} "
-                f"| DensePenalty: {dense_penalty:.4f} | Throttled={throttled}"
+                f"| DensePenalty: {dense_penalty:.4f} | SIMDcpp={simd_cycles_per_pulse:.2f} "
+                f"| Throttled={throttled}"
             )
             return True
             

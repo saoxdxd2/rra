@@ -21,6 +21,10 @@ model:
   lgh_mask_max_keep: 0.90 # Upper bound on active mDNA gate ratio.
   lgh_morton_depth: 1 # Z-depth for Morton buffer (LxRxdepth).
   lgh_prefetch_distance: 2 # Prefetch distance (segments ahead) for LGH kernel.
+  lgh_align_multiple: 64 # Pad manifold rows to hardware-aligned multiples (cacheline friendly).
+  lgh_low_entropy_fold_threshold: 0.015 # Skip LGH pulse when temporal delta falls below this threshold.
+  lgh_focus_strength: 0.35 # Strength of foveated manifold focus (core vs periphery density).
+  lgh_focus_sharpness: 2.0 # Sharpness of foveated focus falloff.
   mes_super_kernel: true # Use C++ MES super-step when available.
   audit_period_steps: 25 # Less frequent deterministic audit cadence.
   audit_random_prob: 0.01 # Small stochastic audit probability.
@@ -92,6 +96,10 @@ runtime:
   lgh_thermal_ema_decay: 0.95 # EMA smoothing for thermal pressure signal.
   lgh_thermal_penalty_weight: 0.25 # Weight of thermal penalty in evolution fitness.
   lgh_thermal_sample_every_s: 2.0 # Thermal watchdog sampling cadence.
+  lgh_simd_cycle_penalty_weight: 0.15 # Silicon-survival penalty weight for expensive AVX-512 paths.
+  lgh_simd_starvation_threshold: 1200.0 # Cycles-per-pulse threshold that triggers starvation pressure.
+  lgh_int4_uncertainty_threshold: 0.05 # Below this uncertainty, quantize manifold as effective int4.
+  lgh_fp32_uncertainty_threshold: 0.18 # Above this uncertainty, use float32 manifold path.
   strict_cpu_only: true # This codebase uses CPU C++ kernels as the production path.
   virtual_lab_enabled: false # Disable heavy benchmark/event logging by default for training runs.
   preflight_enabled: true # Run a startup smoke-check before long training.

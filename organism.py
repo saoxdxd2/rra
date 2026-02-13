@@ -628,9 +628,15 @@ class CognitiveOrganism(BaseCognitiveModule):
             mask_max_keep=float(Config.LGH_MASK_MAX_KEEP),
             morton_depth=max(1, int(Config.LGH_MORTON_DEPTH)),
             prefetch_distance=max(1, int(Config.LGH_PREFETCH_DISTANCE)),
+            align_multiple=max(1, int(getattr(Config, 'LGH_ALIGN_MULTIPLE', 64))),
+            low_entropy_fold_threshold=float(getattr(Config, 'LGH_LOW_ENTROPY_FOLD_THRESHOLD', 0.015)),
+            focus_strength=float(getattr(Config, 'LGH_FOCUS_STRENGTH', 0.35)),
+            focus_sharpness=float(getattr(Config, 'LGH_FOCUS_SHARPNESS', 2.0)),
             thermal_freq_min_ghz=float(Config.LGH_THERMAL_FREQ_MIN_GHZ),
             thermal_ema_decay=float(Config.LGH_THERMAL_EMA_DECAY),
             thermal_penalty_weight=float(Config.LGH_THERMAL_PENALTY_WEIGHT),
+            int4_uncertainty_threshold=float(getattr(Config, 'LGH_INT4_UNCERTAINTY_THRESHOLD', 0.05)),
+            fp32_uncertainty_threshold=float(getattr(Config, 'LGH_FP32_UNCERTAINTY_THRESHOLD', 0.18)),
         )
         self.hpc_cfg = SimpleNamespace(
             enabled=bool(Config.HPC_ENABLED),
@@ -831,8 +837,9 @@ class CognitiveOrganism(BaseCognitiveModule):
         self.register_buffer('_lgh_mdna_modulation', torch.ones(self.L, self.R, dtype=torch.float32, device=self.device))
         self.register_buffer('_lgh_last_curve_anchor', torch.tensor(0, dtype=torch.long, device=self.device))
         self._lgh_q_step = -1
-        self._lgh_q_cache = None
-        self._lgh_q_scale = None
+        self._lgh_q_cache = {}
+        self._lgh_q_scale = {}
+        self._lgh_q_meta = {}
         self._lgh_use_int8 = bool(getattr(Config, 'RAM_INT8_INFER', True))
         
         self.rope = RotaryEmbedding(self.d_s2 * C, device=device)
@@ -993,20 +1000,26 @@ class CognitiveOrganism(BaseCognitiveModule):
 
     def _init_manifold(self):
         self._lgh_shape3d = (self.L, self.R, self.lgh_cfg.morton_depth)
-        self._lgh_morton = MortonBuffer(self._lgh_shape3d, device=self.device)
+        self._lgh_morton = MortonBuffer(
+            self._lgh_shape3d,
+            device=self.device,
+            align_multiple=self.lgh_cfg.align_multiple
+        )
         if self.cfg_lgh_enabled:
             n = int(self._lgh_morton.size)
             m = int(self.d_s2 * self.C)
             self.lgh_manifold_morton = nn.Parameter(torch.randn(n, m, device=self.device) * 0.01)
-            curve_len = min(self.lgh_cfg.curve_length, n)
+            curve_len = min(self.lgh_cfg.curve_length, int(self._lgh_morton.size_original))
             curve_orig = self._lgh_morton.curve_segment_original(0, curve_len, wrap=self.lgh_cfg.curve_wrap)
             self.register_buffer('_lgh_curve_indices', curve_orig.to(dtype=torch.long))
+            self.register_buffer('_lgh_prefetch_curve_indices', curve_orig.to(dtype=torch.long))
             self.register_buffer('_lgh_mdna_mask', torch.ones(self.L, self.R, dtype=torch.float32, device=self.device))
             self.register_buffer('_lgh_morton_order', self._lgh_morton.order.clone().to(dtype=torch.long))
             self.register_buffer('_lgh_inverse_order', self._lgh_morton.inverse_order.clone().to(dtype=torch.long))
         else:
             self.lgh_manifold_morton = None
             self.register_buffer('_lgh_curve_indices', torch.empty(0, dtype=torch.long, device=self.device))
+            self.register_buffer('_lgh_prefetch_curve_indices', torch.empty(0, dtype=torch.long, device=self.device))
             self.register_buffer('_lgh_mdna_mask', torch.empty(0, dtype=torch.float32, device=self.device))
             self.register_buffer('_lgh_morton_order', torch.empty(0, dtype=torch.long, device=self.device))
             self.register_buffer('_lgh_inverse_order', torch.empty(0, dtype=torch.long, device=self.device))
@@ -1201,6 +1214,11 @@ class CognitiveOrganism(BaseCognitiveModule):
         self.curve_trajectory_gene = float(getattr(self.genome, 'curve_trajectory', 0.5))
         self.mask_sparsity_bias = float(getattr(self.genome, 'mask_sparsity_bias', 0.5))
         self.metabolic_efficiency = float(metabolic_efficiency)
+        self.wormhole_jump_bias = float(getattr(self.genome, 'wormhole_jump_bias', 0.1))
+        self.focus_x = float(getattr(self.genome, 'focus_x', 0.5))
+        self.focus_y = float(getattr(self.genome, 'focus_y', 0.5))
+        self.focus_z = float(getattr(self.genome, 'focus_z', 0.5))
+        self.focus_sharpness = float(getattr(self.genome, 'focus_sharpness', self.lgh_cfg.focus_sharpness))
         
         # BDNF: Learning Rate proxy
         bdnf_expression = self.genome.bdnf
@@ -1222,6 +1240,7 @@ class CognitiveOrganism(BaseCognitiveModule):
         energy_factor = self.metabolic_efficiency / (1.0 + self.lambda_sparsity * 10.0)
         self.suggested_lr = self.suggested_lr * energy_factor
         self._refresh_lgh_curve_from_genome()
+        self._refresh_lgh_prefetch_curve()
         
         # --- BDNF-Scaled Omega Momentum ---
         # Omega changes faster when BDNF is high (higher plasticity)
@@ -1233,7 +1252,8 @@ class CognitiveOrganism(BaseCognitiveModule):
         print(
             f">>> GABA={gaba:.2f} | mEff={self.metabolic_efficiency:.2f} | "
             f"Curve={self.curve_trajectory_gene:.2f} | MaskBias={self.mask_sparsity_bias:.2f} | "
-            f"Energy Factor={energy_factor:.2f} -> LR={self.suggested_lr:.2e} | Omega_mom={self.omega_momentum:.4f}"
+            f"Wormhole={self.wormhole_jump_bias:.2f} | Focus=({self.focus_x:.2f},{self.focus_y:.2f},{self.focus_z:.2f}) "
+            f"| Energy Factor={energy_factor:.2f} -> LR={self.suggested_lr:.2e} | Omega_mom={self.omega_momentum:.4f}"
         )
 
     def get_engagement_rate(self):
@@ -1688,21 +1708,53 @@ class CognitiveOrganism(BaseCognitiveModule):
             return None
         return self.lgh_manifold_morton.contiguous()
 
-    def _quantize_lgh_manifold(self):
+    def _lgh_focus_point(self):
+        gx = float(getattr(self, 'focus_x', 0.5))
+        gy = float(getattr(self, 'focus_y', 0.5))
+        gz = float(getattr(self, 'focus_z', 0.5))
+        return (max(0.0, min(1.0, gx)), max(0.0, min(1.0, gy)), max(0.0, min(1.0, gz)))
+
+    def _quantize_lgh_manifold(self, bits=8, focus_row=None, focus_strength=None, focus_sharpness=None):
         manifold = self._lgh_morton_manifold()
         if manifold is None or manifold.numel() == 0:
             return None, None
+        bits = int(bits)
+        if bits <= 4:
+            bits = 4
+        elif bits < 8:
+            bits = 8
+        else:
+            bits = 8
         step = int(self.step_counter.item())
-        if self._lgh_q_cache is not None and self._lgh_q_scale is not None and self._lgh_q_step == step:
-            return self._lgh_q_cache, self._lgh_q_scale
+        focus_row_i = int(max(0, min(int(self._lgh_morton.size - 1), int(focus_row)))) if focus_row is not None else -1
+        focus_strength_f = float(self.lgh_cfg.focus_strength if focus_strength is None else focus_strength)
+        focus_strength_f = max(0.0, min(1.0, focus_strength_f))
+        focus_sharp_f = float(self.lgh_cfg.focus_sharpness if focus_sharpness is None else focus_sharpness)
+        focus_sharp_f = max(0.01, focus_sharp_f)
+        key = (bits, focus_row_i, round(focus_strength_f, 3), round(focus_sharp_f, 3))
+        if self._lgh_q_step == step and key in self._lgh_q_cache and key in self._lgh_q_scale:
+            return self._lgh_q_cache[key], self._lgh_q_scale[key]
         with torch.no_grad():
+            qmax_base = 7.0 if bits <= 4 else 127.0
+            qmax = torch.full((manifold.size(0),), qmax_base, dtype=torch.float32, device=manifold.device)
+            if focus_row_i >= 0 and focus_strength_f > 0.0:
+                rows = torch.arange(manifold.size(0), device=manifold.device, dtype=torch.float32)
+                denom = max(1.0, float(max(1, manifold.size(0) - 1)))
+                dist = (rows - float(focus_row_i)).abs() / denom
+                core = torch.exp(-focus_sharp_f * dist * dist)
+                target_high = 127.0
+                qmax = qmax + (focus_strength_f * core * (target_high - qmax))
             absmax = manifold.abs().amax(dim=1).clamp_min(1e-8)
-            scale = absmax / 127.0
-            q = torch.clamp(torch.round(manifold / scale.unsqueeze(-1)), -127, 127).to(torch.int8).contiguous()
+            scale = absmax / qmax.clamp_min(1.0)
+            q = torch.round(manifold / scale.unsqueeze(-1))
+            q = torch.maximum(q, -qmax.unsqueeze(-1))
+            q = torch.minimum(q, qmax.unsqueeze(-1))
+            q = q.to(torch.int8).contiguous()
         self._lgh_q_step = step
-        self._lgh_q_cache = q
-        self._lgh_q_scale = scale.contiguous()
-        return self._lgh_q_cache, self._lgh_q_scale
+        self._lgh_q_cache[key] = q
+        self._lgh_q_scale[key] = scale.contiguous()
+        self._lgh_q_meta[key] = {'bits': bits, 'focus_row': focus_row_i}
+        return self._lgh_q_cache[key], self._lgh_q_scale[key]
 
     def _predict_curve_chain(self, p_s1):
         if (not self.cfg_lgh_enabled) or self._lgh_curve_indices.numel() == 0:
@@ -1712,15 +1764,36 @@ class CognitiveOrganism(BaseCognitiveModule):
         with torch.no_grad():
             s1_anchor = p_s1[:, -1, :].float()
             pred = torch.sigmoid(self.curve_index_head(s1_anchor)).mean()
-            pred_start = int(round(float(pred.item()) * max(0, self._lgh_morton.size - 1)))
+            pred_start = int(round(float(pred.item()) * max(0, self._lgh_morton.size_original - 1)))
             self._lgh_last_curve_anchor.fill_(pred_start)
             if hasattr(self.genome, 'build_curve_chain'):
                 chain = self.genome.build_curve_chain(
-                    total_nodes=self._lgh_morton.size,
+                    total_nodes=self._lgh_morton.size_original,
                     length=int(self._lgh_curve_indices.numel()),
                     hint=pred_start
                 )
                 # Convert Morton positions to original topology ids for kernel mapping via inverse_order.
+                chain_morton = torch.as_tensor(chain, dtype=torch.long, device=self.device)
+                chain_orig = self._lgh_morton.morton_to_original(chain_morton)
+                return chain_orig
+        return None
+
+    def _predict_prefetch_curve_chain(self, p_s1):
+        if (not self.cfg_lgh_enabled) or self._lgh_curve_indices.numel() == 0:
+            return None
+        if p_s1.dim() != 3:
+            return None
+        with torch.no_grad():
+            s1_anchor = p_s1[:, -1, :].float()
+            pred = torch.sigmoid(self.curve_index_head(s1_anchor)).mean()
+            pred_start = int(round(float(pred.item()) * max(0, self._lgh_morton.size_original - 1)))
+            prefetch_hint = pred_start + int(self.lgh_cfg.prefetch_distance)
+            if hasattr(self.genome, 'build_curve_chain'):
+                chain = self.genome.build_curve_chain(
+                    total_nodes=self._lgh_morton.size_original,
+                    length=int(self._lgh_curve_indices.numel()),
+                    hint=prefetch_hint
+                )
                 chain_morton = torch.as_tensor(chain, dtype=torch.long, device=self.device)
                 chain_orig = self._lgh_morton.morton_to_original(chain_morton)
                 return chain_orig
@@ -1735,15 +1808,34 @@ class CognitiveOrganism(BaseCognitiveModule):
         curve_gene = float(getattr(self, 'curve_trajectory_gene', 0.5))
         curve_gene = max(0.0, min(1.0, curve_gene))
         if hasattr(self.genome, 'next_curve_anchor'):
-            start = int(self.genome.next_curve_anchor(self._lgh_morton.size))
+            start = int(self.genome.next_curve_anchor(self._lgh_morton.size_original))
         else:
-            start = int(round(curve_gene * max(0, self._lgh_morton.size - 1)))
+            start = int(round(curve_gene * max(0, self._lgh_morton.size_original - 1)))
+        focus_strength = float(self.lgh_cfg.focus_strength)
+        if hasattr(self.genome, 'focus_sharpness'):
+            focus_strength = max(0.0, min(1.0, 0.5 * self.lgh_cfg.focus_strength + 0.5 * float(getattr(self.genome, 'focus_sharpness', self.lgh_cfg.focus_strength))))
+        focus_sharpness = float(self.lgh_cfg.focus_sharpness)
+        if hasattr(self.genome, 'focus_sharpness'):
+            focus_sharpness = max(0.01, float(getattr(self.genome, 'focus_sharpness', self.lgh_cfg.focus_sharpness)))
         new_curve = self._lgh_morton.curve_segment_original(
             start,
             int(self._lgh_curve_indices.numel()),
-            wrap=self.lgh_cfg.curve_wrap
+            wrap=self.lgh_cfg.curve_wrap,
+            focus_point=self._lgh_focus_point(),
+            focus_strength=focus_strength,
+            focus_sharpness=focus_sharpness
         )
         self._lgh_curve_indices.copy_(new_curve.to(self._lgh_curve_indices.device, dtype=torch.long))
+
+    def _refresh_lgh_prefetch_curve(self, predicted_prefetch=None):
+        if (not self.cfg_lgh_enabled) or self._lgh_prefetch_curve_indices.numel() == 0:
+            return
+        if isinstance(predicted_prefetch, torch.Tensor) and predicted_prefetch.numel() == self._lgh_prefetch_curve_indices.numel():
+            self._lgh_prefetch_curve_indices.copy_(predicted_prefetch.to(self._lgh_prefetch_curve_indices.device, dtype=torch.long))
+            return
+        if self._lgh_curve_indices.numel() > 0:
+            shifted = torch.roll(self._lgh_curve_indices, shifts=-1, dims=0)
+            self._lgh_prefetch_curve_indices.copy_(shifted.to(self._lgh_prefetch_curve_indices.device, dtype=torch.long))
 
     def _refresh_lgh_mdna_mask(self, gate, modulation=None):
         if (not self.cfg_lgh_enabled) or self._lgh_mdna_mask.numel() == 0:
@@ -1783,6 +1875,16 @@ class CognitiveOrganism(BaseCognitiveModule):
     def get_thermal_penalty(self):
         return float(self._update_thermal_penalty())
 
+    def _lgh_uncertainty(self, p_curve):
+        if not isinstance(p_curve, torch.Tensor) or p_curve.dim() != 3:
+            return 1.0
+        with torch.no_grad():
+            if p_curve.size(1) >= 2:
+                d = (p_curve[:, -1, :] - p_curve[:, -2, :]).abs().mean()
+            else:
+                d = p_curve[:, -1, :].abs().mean()
+            return float(torch.nan_to_num(d, nan=1.0, posinf=1.0, neginf=0.0).item())
+
     def _run_lgh_cycle(self, p_brain, H, gate, B, T, h_cycles, l_cycles, dyn_threshold, p_s1=None):
         if not (self.cfg_lgh_enabled and self.lgh_cfg.replace_forward_stack):
             return False, None, None, None
@@ -1795,20 +1897,45 @@ class CognitiveOrganism(BaseCognitiveModule):
         gate_cpp = gate.reshape(self.L, self.R) if gate.dim() > 2 else gate
         gate_cpp = gate_cpp.float().contiguous()
         p_curve = p_s1 if isinstance(p_s1, torch.Tensor) else p_brain[:, :, :self.d_s1 * self.C]
+        uncertainty = self._lgh_uncertainty(p_curve)
         pred_curve = self._predict_curve_chain(p_curve)
+        pred_prefetch = self._predict_prefetch_curve_chain(p_curve)
         self._refresh_lgh_curve_from_genome(predicted_curve=pred_curve)
+        self._refresh_lgh_prefetch_curve(predicted_prefetch=pred_prefetch)
         s1_anchor = p_curve[:, -1, :].detach()
         hyper_mod = torch.sigmoid(self.hyper_control_head(s1_anchor)).mean(dim=0).view(self.L, self.R)
+        if uncertainty <= float(self.lgh_cfg.int4_uncertainty_threshold):
+            pulse_width_gain = 1.00  # fast/wide pulse
+        elif uncertainty >= float(self.lgh_cfg.fp32_uncertainty_threshold):
+            pulse_width_gain = 0.35  # deep/narrow pulse
+        else:
+            pulse_width_gain = 0.65
+        hyper_mod = (hyper_mod * pulse_width_gain).clamp(0.0, 1.0)
         self._refresh_lgh_mdna_mask(gate_cpp, modulation=hyper_mod)
         thermal_penalty = self.get_thermal_penalty()
         curve_idx = self._lgh_curve_indices.contiguous()
+        prefetch_curve_idx = self._lgh_prefetch_curve_indices.contiguous()
         inv_order = self._lgh_inverse_order.contiguous()
 
+        if uncertainty <= float(self.lgh_cfg.int4_uncertainty_threshold):
+            q_bits = 4
+        elif uncertainty >= float(self.lgh_cfg.fp32_uncertainty_threshold):
+            q_bits = 32
+        else:
+            q_bits = 8
+
         out = None
-        if self._lgh_use_int8 and _cpp_has('geometric_manifold_forward_avx512_int8'):
-            manifold_q, manifold_scale = self._quantize_lgh_manifold()
+        if self._lgh_use_int8 and q_bits < 32 and _cpp_has('geometric_manifold_forward_avx512_int8'):
+            focus_strength = float(self.lgh_cfg.focus_strength)
+            focus_sharpness = float(getattr(self.genome, 'focus_sharpness', self.lgh_cfg.focus_sharpness))
+            manifold_q, manifold_scale = self._quantize_lgh_manifold(
+                bits=q_bits,
+                focus_row=int(self._lgh_last_curve_anchor.item()),
+                focus_strength=focus_strength,
+                focus_sharpness=focus_sharpness
+            )
             if manifold_q is not None and manifold_scale is not None and _cpp_ready(
-                p_brain, H, gate_cpp, manifold_q, manifold_scale, curve_idx, inv_order, self._lgh_mdna_mask
+                p_brain, H, gate_cpp, manifold_q, manifold_scale, curve_idx, prefetch_curve_idx, inv_order, self._lgh_mdna_mask
             ):
                 out = _cpp_try(
                     'geometric_manifold_forward_avx512_int8',
@@ -1818,6 +1945,7 @@ class CognitiveOrganism(BaseCognitiveModule):
                     manifold_q,
                     manifold_scale.float().contiguous(),
                     curve_idx,
+                    prefetch_curve_idx,
                     inv_order,
                     self._lgh_mdna_mask.contiguous(),
                     int(h_cycles),
@@ -1825,13 +1953,14 @@ class CognitiveOrganism(BaseCognitiveModule):
                     float(dyn_threshold),
                     int(self.lgh_cfg.prefetch_distance),
                     float(thermal_penalty),
-                    tensors=(p_brain, H, gate_cpp, manifold_q, manifold_scale, curve_idx, inv_order, self._lgh_mdna_mask)
+                    float(self.lgh_cfg.low_entropy_fold_threshold),
+                    tensors=(p_brain, H, gate_cpp, manifold_q, manifold_scale, curve_idx, prefetch_curve_idx, inv_order, self._lgh_mdna_mask)
                 )
 
         if out is None:
             if not _cpp_has(
                 'geometric_manifold_forward_avx512',
-                p_brain, H, gate_cpp, manifold_morton, curve_idx, inv_order, self._lgh_mdna_mask
+                p_brain, H, gate_cpp, manifold_morton, curve_idx, prefetch_curve_idx, inv_order, self._lgh_mdna_mask
             ):
                 return False, None, None, None
             out = _cpp_try(
@@ -1841,6 +1970,7 @@ class CognitiveOrganism(BaseCognitiveModule):
                 gate_cpp,
                 manifold_morton.float().contiguous(),
                 curve_idx,
+                prefetch_curve_idx,
                 inv_order,
                 self._lgh_mdna_mask.contiguous(),
                 int(h_cycles),
@@ -1848,7 +1978,8 @@ class CognitiveOrganism(BaseCognitiveModule):
                 float(dyn_threshold),
                 int(self.lgh_cfg.prefetch_distance),
                 float(thermal_penalty),
-                tensors=(p_brain, H, gate_cpp, manifold_morton, curve_idx, inv_order, self._lgh_mdna_mask)
+                float(self.lgh_cfg.low_entropy_fold_threshold),
+                tensors=(p_brain, H, gate_cpp, manifold_morton, curve_idx, prefetch_curve_idx, inv_order, self._lgh_mdna_mask)
             )
         if not isinstance(out, (list, tuple)) or len(out) != 3:
             return False, None, None, None

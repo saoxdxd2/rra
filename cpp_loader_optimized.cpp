@@ -189,6 +189,9 @@ namespace Perf {
     static std::atomic<uint64_t> g_survival_losses_calls{0};
     static std::atomic<uint64_t> g_fused_cognitive_calls{0};
     static std::atomic<uint64_t> g_lgh_calls{0};
+    static std::atomic<uint64_t> g_lgh_tsc_cycles{0};
+    static std::atomic<uint64_t> g_lgh_pulse_ops{0};
+    static std::atomic<uint64_t> g_lgh_temporal_folds{0};
 
     inline uint64_t sat_from_ld(long double v) {
         if (!(v > 0.0L)) {
@@ -237,6 +240,9 @@ namespace Perf {
         g_survival_losses_calls.store(0ULL, std::memory_order_relaxed);
         g_fused_cognitive_calls.store(0ULL, std::memory_order_relaxed);
         g_lgh_calls.store(0ULL, std::memory_order_relaxed);
+        g_lgh_tsc_cycles.store(0ULL, std::memory_order_relaxed);
+        g_lgh_pulse_ops.store(0ULL, std::memory_order_relaxed);
+        g_lgh_temporal_folds.store(0ULL, std::memory_order_relaxed);
     }
 
     py::dict snapshot() {
@@ -264,6 +270,9 @@ namespace Perf {
         out["survival_losses_calls"] = py::int_(g_survival_losses_calls.load(std::memory_order_relaxed));
         out["fused_cognitive_calls"] = py::int_(g_fused_cognitive_calls.load(std::memory_order_relaxed));
         out["lgh_calls"] = py::int_(g_lgh_calls.load(std::memory_order_relaxed));
+        out["lgh_tsc_cycles"] = py::int_(g_lgh_tsc_cycles.load(std::memory_order_relaxed));
+        out["lgh_pulse_ops"] = py::int_(g_lgh_pulse_ops.load(std::memory_order_relaxed));
+        out["lgh_temporal_folds"] = py::int_(g_lgh_temporal_folds.load(std::memory_order_relaxed));
         return out;
     }
 }
@@ -2462,6 +2471,35 @@ inline __m512 lgh_pulse_eval_avx512(__m512 merged, __m512 scale_v, __mmask16 k_m
     return _mm512_maskz_mul_ps(k_mdna, merged, scale_v);
 }
 #endif
+
+inline int64_t lgh_popcount64(uint64_t v) {
+#if defined(_MSC_VER)
+    return static_cast<int64_t>(__popcnt64(v));
+#else
+    return static_cast<int64_t>(__builtin_popcountll(v));
+#endif
+}
+
+inline bool lgh_should_temporal_fold(
+    const float* p_ptr,
+    int64_t p_base_cur,
+    int64_t p_base_prev,
+    int64_t M,
+    float threshold
+) {
+    if (!(threshold > 0.0f) || p_base_prev < 0) {
+        return false;
+    }
+    const int64_t stride = (M >= 256) ? 8 : ((M >= 64) ? 4 : 1);
+    float accum = 0.0f;
+    int64_t samples = 0;
+    for (int64_t m = 0; m < M; m += stride) {
+        accum += std::abs(p_ptr[p_base_cur + m] - p_ptr[p_base_prev + m]);
+        samples++;
+    }
+    const float mean_delta = accum / static_cast<float>(std::max<int64_t>(1, samples));
+    return mean_delta < threshold;
+}
 } // namespace
 
 std::vector<at::Tensor> geometric_manifold_forward_avx512(
@@ -2470,19 +2508,22 @@ std::vector<at::Tensor> geometric_manifold_forward_avx512(
     at::Tensor gate,             // [L, R]
     at::Tensor manifold_morton,  // [N, M]
     at::Tensor curve_indices,    // [S]
+    at::Tensor prefetch_curve_indices, // [S_prefetch]
     at::Tensor morton_inverse_order, // [N] maps original topology idx -> Morton row
     at::Tensor mdna_mask,        // [L, R]
     int64_t h_cycles,
     int64_t l_cycles,
     double halt_threshold,
     int64_t prefetch_distance,
-    double thermal_penalty
+    double thermal_penalty,
+    double temporal_fold_threshold
 ) {
     check_cpu(p_brain, "p_brain");
     check_cpu(H_state, "H_state");
     check_cpu(gate, "gate");
     check_cpu(manifold_morton, "manifold_morton");
     check_cpu(curve_indices, "curve_indices");
+    check_cpu(prefetch_curve_indices, "prefetch_curve_indices");
     check_cpu(morton_inverse_order, "morton_inverse_order");
     check_cpu(mdna_mask, "mdna_mask");
     check_dim(p_brain, 3, "p_brain");
@@ -2490,6 +2531,7 @@ std::vector<at::Tensor> geometric_manifold_forward_avx512(
     check_dim(gate, 2, "gate");
     check_dim(manifold_morton, 2, "manifold_morton");
     check_dim(curve_indices, 1, "curve_indices");
+    check_dim(prefetch_curve_indices, 1, "prefetch_curve_indices");
     check_dim(morton_inverse_order, 1, "morton_inverse_order");
     check_dim(mdna_mask, 2, "mdna_mask");
     check_dtype(p_brain, at::kFloat, "p_brain");
@@ -2497,6 +2539,7 @@ std::vector<at::Tensor> geometric_manifold_forward_avx512(
     check_dtype(gate, at::kFloat, "gate");
     check_dtype(manifold_morton, at::kFloat, "manifold_morton");
     check_dtype(curve_indices, at::kLong, "curve_indices");
+    check_dtype(prefetch_curve_indices, at::kLong, "prefetch_curve_indices");
     check_dtype(morton_inverse_order, at::kLong, "morton_inverse_order");
     check_dtype(mdna_mask, at::kFloat, "mdna_mask");
 
@@ -2505,6 +2548,7 @@ std::vector<at::Tensor> geometric_manifold_forward_avx512(
     auto g_c = ensure_contig(gate);
     auto m_c = ensure_contig(manifold_morton);
     auto idx_c = ensure_contig(curve_indices);
+    auto pidx_c = ensure_contig(prefetch_curve_indices);
     auto inv_c = ensure_contig(morton_inverse_order);
     auto mdna_c = ensure_contig(mdna_mask);
 
@@ -2537,23 +2581,32 @@ std::vector<at::Tensor> geometric_manifold_forward_avx512(
     const float* g_ptr = g_c.data_ptr<float>();
     const float* m_ptr = m_c.data_ptr<float>();
     const int64_t* idx_ptr = idx_c.data_ptr<int64_t>();
+    const int64_t* pidx_ptr = pidx_c.data_ptr<int64_t>();
     const int64_t* inv_ptr = inv_c.data_ptr<int64_t>();
     const float* mdna_ptr = mdna_c.data_ptr<float>();
 
     const int64_t S = idx_c.numel();
+    const int64_t S_prefetch = pidx_c.numel();
     const int64_t prefetch_d = std::max<int64_t>(1, prefetch_distance);
     const float thermal = static_cast<float>(std::max(0.0, std::min(0.95, thermal_penalty)));
     const float thermal_scale = 1.0f - 0.5f * thermal;
     const float cycle_scale = static_cast<float>(std::max<int64_t>(1, h_cycles) * std::max<int64_t>(1, l_cycles));
     const float eps = 1e-8f;
+    const float temporal_fold = static_cast<float>(std::max(0.0, temporal_fold_threshold));
 
     Perf::g_lgh_calls.fetch_add(1ULL, std::memory_order_relaxed);
+    const uint64_t tsc_start = __rdtsc();
 
     // Curve prototype in Morton space with prefetching.
     if (S > 0) {
         for (int64_t s = 0; s < S; s++) {
             const int64_t row = lgh_map_curve_row(idx_ptr[s], inv_ptr, N);
             const float* row_ptr = m_ptr + row * M;
+            if (S_prefetch > 0) {
+                const int64_t p_row = lgh_map_curve_row(pidx_ptr[s % S_prefetch], inv_ptr, N);
+                const float* p_ptr_prefetch = m_ptr + p_row * M;
+                _mm_prefetch(reinterpret_cast<const char*>(p_ptr_prefetch), _MM_HINT_T0);
+            }
             if (s + prefetch_d < S) {
                 const int64_t next_row = lgh_map_curve_row(idx_ptr[s + prefetch_d], inv_ptr, N);
                 const float* next_ptr = m_ptr + next_row * M;
@@ -2595,21 +2648,42 @@ std::vector<at::Tensor> geometric_manifold_forward_avx512(
 
     // Region-level scale from averaged mDNA*gate.
     std::vector<uint64_t> mdna_words(static_cast<size_t>(R), 0ULL);
+    std::vector<int64_t> mdna_active_lanes(static_cast<size_t>(R), 0);
     for (int64_t r = 0; r < R; r++) {
         mdna_words[static_cast<size_t>(r)] = lgh_region_mdna_word(mdna_ptr, L, R, r);
+        mdna_active_lanes[static_cast<size_t>(r)] =
+            std::max<int64_t>(1, (lgh_popcount64(mdna_words[static_cast<size_t>(r)]) * M) / 64);
         region_scale_ptr[r] = lgh_region_scale(g_ptr, mdna_ptr, L, R, r, thermal_scale);
     }
 
     std::vector<float> halt_acc(static_cast<size_t>(B * T), 0.0f);
+    uint64_t pulse_ops = 0ULL;
+    uint64_t folded_steps = 0ULL;
 
     // Pulse-gated AVX512 evaluation.
     for (int64_t b = 0; b < B; b++) {
         for (int64_t t = 0; t < T; t++) {
             const int64_t p_base = (b * T + t) * M;
+            const int64_t p_prev_base = (t > 0) ? ((b * T + (t - 1)) * M) : -1;
+            if (t > 0 && lgh_should_temporal_fold(p_ptr, p_base, p_prev_base, M, temporal_fold)) {
+                const int64_t bt_prev = b * T + (t - 1);
+                const int64_t bt_cur = b * T + t;
+                for (int64_t r = 0; r < R; r++) {
+                    const int64_t src_base = ((b * T + (t - 1)) * R + r) * M;
+                    const int64_t dst_base = ((b * T + t) * R + r) * M;
+                    std::memcpy(out_ptr + dst_base, out_ptr + src_base, static_cast<size_t>(M) * sizeof(float));
+                }
+                halt_acc[static_cast<size_t>(bt_cur)] = halt_acc[static_cast<size_t>(bt_prev)];
+                folded_steps++;
+                continue;
+            }
             for (int64_t r = 0; r < R; r++) {
                 const float scale = region_scale_ptr[r] * cycle_scale;
                 const int64_t out_base = ((b * T + t) * R + r) * M;
                 const uint64_t mdna_word = mdna_words[static_cast<size_t>(r)];
+                if (scale > eps) {
+                    pulse_ops += static_cast<uint64_t>(mdna_active_lanes[static_cast<size_t>(r)]);
+                }
 #ifdef __AVX512F
                 const __m512 scale_v = _mm512_set1_ps(scale);
                 int64_t m = 0;
@@ -2708,6 +2782,10 @@ std::vector<at::Tensor> geometric_manifold_forward_avx512(
     const long double flops = bt_ld * r_ld * m_ld * 4.0L + bt_ld * l_ld * r_ld * m_ld * 3.0L;
     const long double bytes = bt_ld * r_ld * m_ld * 16.0L + bt_ld * l_ld * r_ld * m_ld * 8.0L;
     Perf::add(Perf::sat_from_ld(flops), Perf::sat_from_ld(bytes));
+    const uint64_t tsc_end = __rdtsc();
+    Perf::g_lgh_tsc_cycles.fetch_add((tsc_end >= tsc_start) ? (tsc_end - tsc_start) : 0ULL, std::memory_order_relaxed);
+    Perf::g_lgh_pulse_ops.fetch_add(pulse_ops, std::memory_order_relaxed);
+    Perf::g_lgh_temporal_folds.fetch_add(folded_steps, std::memory_order_relaxed);
 
     auto out_5d = out.view({B, T, R, D, C});
     return {out_5d, h_next, halt_probs};
@@ -2720,13 +2798,15 @@ std::vector<at::Tensor> geometric_manifold_forward_avx512_int8(
     at::Tensor manifold_morton_q, // [N, M] int8
     at::Tensor manifold_scale,   // [N] float32
     at::Tensor curve_indices,    // [S] original topology indices
+    at::Tensor prefetch_curve_indices, // [S_prefetch] original topology indices
     at::Tensor morton_inverse_order, // [N]
     at::Tensor mdna_mask,        // [L, R]
     int64_t h_cycles,
     int64_t l_cycles,
     double halt_threshold,
     int64_t prefetch_distance,
-    double thermal_penalty
+    double thermal_penalty,
+    double temporal_fold_threshold
 ) {
     check_cpu(p_brain, "p_brain");
     check_cpu(H_state, "H_state");
@@ -2734,6 +2814,7 @@ std::vector<at::Tensor> geometric_manifold_forward_avx512_int8(
     check_cpu(manifold_morton_q, "manifold_morton_q");
     check_cpu(manifold_scale, "manifold_scale");
     check_cpu(curve_indices, "curve_indices");
+    check_cpu(prefetch_curve_indices, "prefetch_curve_indices");
     check_cpu(morton_inverse_order, "morton_inverse_order");
     check_cpu(mdna_mask, "mdna_mask");
     check_dim(p_brain, 3, "p_brain");
@@ -2742,6 +2823,7 @@ std::vector<at::Tensor> geometric_manifold_forward_avx512_int8(
     check_dim(manifold_morton_q, 2, "manifold_morton_q");
     check_dim(manifold_scale, 1, "manifold_scale");
     check_dim(curve_indices, 1, "curve_indices");
+    check_dim(prefetch_curve_indices, 1, "prefetch_curve_indices");
     check_dim(morton_inverse_order, 1, "morton_inverse_order");
     check_dim(mdna_mask, 2, "mdna_mask");
     check_dtype(p_brain, at::kFloat, "p_brain");
@@ -2750,6 +2832,7 @@ std::vector<at::Tensor> geometric_manifold_forward_avx512_int8(
     check_dtype(manifold_morton_q, at::kChar, "manifold_morton_q");
     check_dtype(manifold_scale, at::kFloat, "manifold_scale");
     check_dtype(curve_indices, at::kLong, "curve_indices");
+    check_dtype(prefetch_curve_indices, at::kLong, "prefetch_curve_indices");
     check_dtype(morton_inverse_order, at::kLong, "morton_inverse_order");
     check_dtype(mdna_mask, at::kFloat, "mdna_mask");
 
@@ -2759,6 +2842,7 @@ std::vector<at::Tensor> geometric_manifold_forward_avx512_int8(
     auto q_c = ensure_contig(manifold_morton_q);
     auto sc_c = ensure_contig(manifold_scale);
     auto idx_c = ensure_contig(curve_indices);
+    auto pidx_c = ensure_contig(prefetch_curve_indices);
     auto inv_c = ensure_contig(morton_inverse_order);
     auto mdna_c = ensure_contig(mdna_mask);
 
@@ -2793,17 +2877,21 @@ std::vector<at::Tensor> geometric_manifold_forward_avx512_int8(
     const int8_t* q_ptr = q_c.data_ptr<int8_t>();
     const float* sc_ptr = sc_c.data_ptr<float>();
     const int64_t* idx_ptr = idx_c.data_ptr<int64_t>();
+    const int64_t* pidx_ptr = pidx_c.data_ptr<int64_t>();
     const int64_t* inv_ptr = inv_c.data_ptr<int64_t>();
     const float* mdna_ptr = mdna_c.data_ptr<float>();
 
     const int64_t S = idx_c.numel();
+    const int64_t S_prefetch = pidx_c.numel();
     const int64_t prefetch_d = std::max<int64_t>(1, prefetch_distance);
     const float thermal = static_cast<float>(std::max(0.0, std::min(0.95, thermal_penalty)));
     const float thermal_scale = 1.0f - 0.5f * thermal;
     const float cycle_scale = static_cast<float>(std::max<int64_t>(1, h_cycles) * std::max<int64_t>(1, l_cycles));
     const float eps = 1e-8f;
+    const float temporal_fold = static_cast<float>(std::max(0.0, temporal_fold_threshold));
 
     Perf::g_lgh_calls.fetch_add(1ULL, std::memory_order_relaxed);
+    const uint64_t tsc_start = __rdtsc();
 
     // Build float prototype from Morton-ordered int8 manifold.
     if (S > 0) {
@@ -2811,6 +2899,11 @@ std::vector<at::Tensor> geometric_manifold_forward_avx512_int8(
             const int64_t row = lgh_map_curve_row(idx_ptr[s], inv_ptr, N);
             const int8_t* row_ptr = q_ptr + row * M;
             const float row_scale = sc_ptr[row];
+            if (S_prefetch > 0) {
+                const int64_t p_row = lgh_map_curve_row(pidx_ptr[s % S_prefetch], inv_ptr, N);
+                const int8_t* p_ptr_prefetch = q_ptr + p_row * M;
+                _mm_prefetch(reinterpret_cast<const char*>(p_ptr_prefetch), _MM_HINT_T0);
+            }
             if (s + prefetch_d < S) {
                 const int64_t next_row = lgh_map_curve_row(idx_ptr[s + prefetch_d], inv_ptr, N);
                 const int8_t* next_ptr = q_ptr + next_row * M;
@@ -2839,20 +2932,41 @@ std::vector<at::Tensor> geometric_manifold_forward_avx512_int8(
     }
 
     std::vector<uint64_t> mdna_words(static_cast<size_t>(R), 0ULL);
+    std::vector<int64_t> mdna_active_lanes(static_cast<size_t>(R), 0);
     for (int64_t r = 0; r < R; r++) {
         mdna_words[static_cast<size_t>(r)] = lgh_region_mdna_word(mdna_ptr, L, R, r);
+        mdna_active_lanes[static_cast<size_t>(r)] =
+            std::max<int64_t>(1, (lgh_popcount64(mdna_words[static_cast<size_t>(r)]) * M) / 64);
         region_scale_ptr[r] = lgh_region_scale(g_ptr, mdna_ptr, L, R, r, thermal_scale);
     }
 
     std::vector<float> halt_acc(static_cast<size_t>(B * T), 0.0f);
+    uint64_t pulse_ops = 0ULL;
+    uint64_t folded_steps = 0ULL;
 
     for (int64_t b = 0; b < B; b++) {
         for (int64_t t = 0; t < T; t++) {
             const int64_t p_base = (b * T + t) * M;
+            const int64_t p_prev_base = (t > 0) ? ((b * T + (t - 1)) * M) : -1;
+            if (t > 0 && lgh_should_temporal_fold(p_ptr, p_base, p_prev_base, M, temporal_fold)) {
+                const int64_t bt_prev = b * T + (t - 1);
+                const int64_t bt_cur = b * T + t;
+                for (int64_t r = 0; r < R; r++) {
+                    const int64_t src_base = ((b * T + (t - 1)) * R + r) * M;
+                    const int64_t dst_base = ((b * T + t) * R + r) * M;
+                    std::memcpy(out_ptr + dst_base, out_ptr + src_base, static_cast<size_t>(M) * sizeof(float));
+                }
+                halt_acc[static_cast<size_t>(bt_cur)] = halt_acc[static_cast<size_t>(bt_prev)];
+                folded_steps++;
+                continue;
+            }
             for (int64_t r = 0; r < R; r++) {
                 const float scale = region_scale_ptr[r] * cycle_scale;
                 const int64_t out_base = ((b * T + t) * R + r) * M;
                 const uint64_t mdna_word = mdna_words[static_cast<size_t>(r)];
+                if (scale > eps) {
+                    pulse_ops += static_cast<uint64_t>(mdna_active_lanes[static_cast<size_t>(r)]);
+                }
 #ifdef __AVX512F
                 const __m512 scale_v = _mm512_set1_ps(scale);
                 int64_t m = 0;
@@ -2949,6 +3063,10 @@ std::vector<at::Tensor> geometric_manifold_forward_avx512_int8(
     const long double flops = bt_ld * r_ld * m_ld * 4.0L + bt_ld * l_ld * r_ld * m_ld * 3.0L;
     const long double bytes = bt_ld * r_ld * m_ld * 13.0L + bt_ld * l_ld * r_ld * m_ld * 8.0L;
     Perf::add(Perf::sat_from_ld(flops), Perf::sat_from_ld(bytes));
+    const uint64_t tsc_end = __rdtsc();
+    Perf::g_lgh_tsc_cycles.fetch_add((tsc_end >= tsc_start) ? (tsc_end - tsc_start) : 0ULL, std::memory_order_relaxed);
+    Perf::g_lgh_pulse_ops.fetch_add(pulse_ops, std::memory_order_relaxed);
+    Perf::g_lgh_temporal_folds.fetch_add(folded_steps, std::memory_order_relaxed);
 
     auto out_5d = out.view({B, T, R, D, C});
     return {out_5d, h_next, halt_probs};

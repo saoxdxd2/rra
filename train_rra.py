@@ -645,6 +645,8 @@ class RRATrainer:
             thermal_freq_min_ghz=float(getattr(Config, 'LGH_THERMAL_FREQ_MIN_GHZ', 3.0)),
             thermal_sample_every_s=float(getattr(Config, 'LGH_THERMAL_SAMPLE_EVERY_S', 2.0)),
             thermal_penalty_weight=float(getattr(Config, 'LGH_THERMAL_PENALTY_WEIGHT', 0.25)),
+            simd_cycle_penalty_weight=float(getattr(Config, 'LGH_SIMD_CYCLE_PENALTY_WEIGHT', 0.15)),
+            simd_starvation_threshold=float(getattr(Config, 'LGH_SIMD_STARVATION_THRESHOLD', 1200.0)),
         )
         
         # Use AdEMAMix optimizer with Omega-linked dual-momentum
@@ -662,6 +664,7 @@ class RRATrainer:
         self._last_gate_density = 1.0
         self._last_gate_sparsity = 0.0
         self._gate_density_ema = None
+        self._perf_prev = {}
         
         # Adaptive Curriculum Tracking
         self.streak_counter = 0
@@ -681,6 +684,19 @@ class RRATrainer:
             sample_every_s=self.cfg.thermal_sample_every_s,
         )
         self.thermal_watchdog.start()
+        if cpp_loader is not None and hasattr(cpp_loader, 'get_perf_counters'):
+            try:
+                snap = cpp_loader.get_perf_counters()
+                if isinstance(snap, dict):
+                    self._perf_prev = dict(snap)
+            except Exception:
+                self._perf_prev = {}
+        if hasattr(self.model, 'genome') and hasattr(self.model.genome, 'policy'):
+            try:
+                self.model.genome.policy.config.simd_penalty_weight = float(self.cfg.simd_cycle_penalty_weight)
+                self.model.genome.policy.config.simd_starvation_threshold = float(self.cfg.simd_starvation_threshold)
+            except Exception:
+                pass
 
         # Create Once, Reuse Forever: Persistent Hidden State Buffer
         self.register_h_buffer(self.cfg.batch_size)
@@ -788,6 +804,39 @@ class RRATrainer:
         if throttled:
             freq_penalty += self.cfg.thermal_penalty_weight * dense_pressure
         return float(max(0.0, freq_penalty)), snap
+
+    def _simd_cycle_metrics(self):
+        metrics = {
+            'simd_cycles': 0.0,
+            'simd_pulse_ops': 0.0,
+            'simd_cycles_per_pulse': 0.0,
+            'simd_temporal_folds': 0.0,
+        }
+        if cpp_loader is None or (not hasattr(cpp_loader, 'get_perf_counters')):
+            return metrics
+        try:
+            snap = cpp_loader.get_perf_counters()
+            if not isinstance(snap, dict):
+                return metrics
+            prev = self._perf_prev if isinstance(self._perf_prev, dict) else {}
+            cyc_now = int(snap.get('lgh_tsc_cycles', 0))
+            pulse_now = int(snap.get('lgh_pulse_ops', 0))
+            fold_now = int(snap.get('lgh_temporal_folds', 0))
+            cyc_prev = int(prev.get('lgh_tsc_cycles', 0))
+            pulse_prev = int(prev.get('lgh_pulse_ops', 0))
+            fold_prev = int(prev.get('lgh_temporal_folds', 0))
+            d_cyc = max(0, cyc_now - cyc_prev)
+            d_pulse = max(0, pulse_now - pulse_prev)
+            d_fold = max(0, fold_now - fold_prev)
+            cpp_val = float(d_cyc) / float(max(1, d_pulse))
+            metrics['simd_cycles'] = float(d_cyc)
+            metrics['simd_pulse_ops'] = float(d_pulse)
+            metrics['simd_cycles_per_pulse'] = float(cpp_val)
+            metrics['simd_temporal_folds'] = float(d_fold)
+            self._perf_prev = dict(snap)
+        except Exception:
+            return metrics
+        return metrics
 
     @staticmethod
     def _finite(x, nan=0.0, posinf=None, neginf=None):
@@ -902,6 +951,7 @@ class RRATrainer:
             thermal_penalty_model = float(self.model.get_thermal_penalty()) if hasattr(self.model, 'get_thermal_penalty') else 0.0
             thermal_penalty_watchdog, thermal_status = self._thermal_penalty()
             thermal_penalty = max(thermal_penalty_model, thermal_penalty_watchdog)
+            simd_metrics = self._simd_cycle_metrics()
             evolved = bool(
                 self.model.genome.evolutionary_step(
                     self.model,
@@ -909,6 +959,9 @@ class RRATrainer:
                         'val_loss': float(ema),
                         'thermal_penalty': thermal_penalty,
                         'thermal_status': thermal_status,
+                        'simd_cycles': float(simd_metrics.get('simd_cycles', 0.0)),
+                        'simd_pulse_ops': float(simd_metrics.get('simd_pulse_ops', 0.0)),
+                        'simd_cycles_per_pulse': float(simd_metrics.get('simd_cycles_per_pulse', 0.0)),
                         'tps_pressure': float(self.model._get_tps_pressure()) if hasattr(self.model, '_get_tps_pressure') else 0.0,
                     }
                 )
@@ -922,7 +975,8 @@ class RRATrainer:
             logger.info(
                 f">>> STEP GENOME UPDATE @step={step}: evolved={evolved} "
                 f"(proxy_val={ema:.4f}, FKBP5={self.model.genome.fkbp5:.4f}, "
-                f"lambda_sparsity={self.model.lambda_sparsity:.6f}, thermal_penalty={thermal_penalty:.4f})"
+                f"lambda_sparsity={self.model.lambda_sparsity:.6f}, thermal_penalty={thermal_penalty:.4f}, "
+                f"SIMDcpp={float(simd_metrics.get('simd_cycles_per_pulse', 0.0)):.2f})"
             )
 
     def _sanitize_optimizer_state(self):
@@ -1589,6 +1643,7 @@ class RRATrainer:
         thermal_penalty_model = float(self.model.get_thermal_penalty()) if hasattr(self.model, 'get_thermal_penalty') else 0.0
         thermal_penalty_watchdog, thermal_status = self._thermal_penalty()
         thermal_penalty = max(thermal_penalty_model, thermal_penalty_watchdog)
+        simd_metrics = self._simd_cycle_metrics()
         
         # Log validation loss to VirtualLab
         if self.model.virtual_lab.enabled:
@@ -1597,6 +1652,7 @@ class RRATrainer:
                 'loss_task': torch.tensor(epoch_loss),
                 'thermal_penalty': thermal_penalty,
                 'thermal_freq_ghz': float(thermal_status.get('freq_ghz', 0.0)),
+                'simd_cycles_per_pulse': float(simd_metrics.get('simd_cycles_per_pulse', 0.0)),
                 't': self.cfg.seq_len,
             })
             self._tb_add_scalar("VirtualLab/val_loss", val_loss)
@@ -1624,6 +1680,9 @@ class RRATrainer:
                 'val_loss': val_loss,
                 'thermal_penalty': thermal_penalty,
                 'thermal_status': thermal_status,
+                'simd_cycles': float(simd_metrics.get('simd_cycles', 0.0)),
+                'simd_pulse_ops': float(simd_metrics.get('simd_pulse_ops', 0.0)),
+                'simd_cycles_per_pulse': float(simd_metrics.get('simd_cycles_per_pulse', 0.0)),
                 'tps_pressure': float(self.model._get_tps_pressure()) if hasattr(self.model, '_get_tps_pressure') else 0.0,
             }
         )
