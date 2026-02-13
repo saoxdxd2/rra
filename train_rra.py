@@ -701,10 +701,10 @@ class RRATrainer:
                     self._perf_prev = dict(snap)
             except Exception:
                 self._perf_prev = {}
-        if hasattr(self.model, 'genome') and hasattr(self.model.genome, 'policy'):
+        if hasattr(self.model, 'genome') and hasattr(self.model.governor, 'policy'):
             try:
-                self.model.genome.policy.config.simd_penalty_weight = float(self.cfg.simd_cycle_penalty_weight)
-                self.model.genome.policy.config.simd_starvation_threshold = float(self.cfg.simd_starvation_threshold)
+                self.model.governor.policy.config.simd_penalty_weight = float(self.cfg.simd_cycle_penalty_weight)
+                self.model.governor.policy.config.simd_starvation_threshold = float(self.cfg.simd_starvation_threshold)
             except Exception:
                 pass
 
@@ -968,7 +968,7 @@ class RRATrainer:
             thermal_penalty = max(thermal_penalty_model, thermal_penalty_watchdog)
             simd_metrics = self._simd_cycle_metrics()
             evolved = bool(
-                self.model.genome.evolutionary_step(
+                self.model.governor.evolutionary_step(
                     self.model,
                     {
                         'val_loss': float(ema),
@@ -1005,7 +1005,7 @@ class RRATrainer:
                 self._lr_cap = self.optimizer.param_groups[0]['lr']
             logger.info(
                 f">>> STEP GENOME UPDATE @step={step}: evolved={evolved} "
-                f"(proxy_val={ema:.4f}, FKBP5={self.model.genome.fkbp5:.4f}, "
+                f"(proxy_val={ema:.4f}, FKBP5={self.model.governor.fkbp5:.4f}, "
                 f"lambda_sparsity={self.model.lambda_sparsity:.6f}, thermal_penalty={thermal_penalty:.4f}, "
                 f"SIMDcpp={float(simd_metrics.get('simd_cycles_per_pulse', 0.0)):.2f})"
             )
@@ -1135,7 +1135,7 @@ class RRATrainer:
 
         
         # Stability losses from MetabolicGovernor
-        l_stab, l_eng, l_coh = self.model.metabolism.calculate_losses(H_next, gate=gate, H_prev=H)
+        l_stab, l_eng, l_coh = self.learning_brain.calculate_metabolic_losses(H_next, H_prev=H)
         l_stab = self._finite(l_stab, nan=0.0, posinf=1e4, neginf=0.0)
         l_eng = self._finite(l_eng, nan=0.0, posinf=1e4, neginf=0.0)
         
@@ -1228,11 +1228,11 @@ class RRATrainer:
             with torch.no_grad():
                 loss_task = self.learning_brain.calculate_task_loss(out, yb)
                 loss_task = self._finite(loss_task, nan=10.0, posinf=10.0, neginf=10.0)
-                l_stab, l_eng, l_coh = self.model.metabolism.calculate_losses(H_next, gate=gate, H_prev=H)
+                l_stab, l_eng, l_coh = self.learning_brain.calculate_metabolic_losses(H_next, H_prev=H)
                 l_stab = self._finite(l_stab, nan=0.0, posinf=1e4, neginf=0.0)
                 l_eng = self._finite(l_eng, nan=0.0, posinf=1e4, neginf=0.0)
                 l_coh = self._finite(l_coh, nan=0.0, posinf=1e4, neginf=0.0)
-                l_myelin = self.model.metabolism.calculate_myelin_cost(self.model)
+                l_myelin = self.learning_brain.calculate_myelin_cost(self.model)
                 if not isinstance(l_myelin, torch.Tensor):
                     l_myelin = torch.tensor(float(l_myelin), device=out.device, dtype=out.dtype)
                 l_myelin = self._finite(l_myelin, nan=0.0, posinf=1e4, neginf=0.0)
@@ -1632,10 +1632,10 @@ class RRATrainer:
                     self._tb_add_scalar("Sparsity/gate_density_ema", self._gate_density_ema)
 
                 # --- Monitor Biological Variables ---
-                self._tb_add_scalar("Genome/BDNF", self.model.genome.bdnf)
-                self._tb_add_scalar("Genome/CREB", self.model.genome.creb)
-                self._tb_add_scalar("Genome/DRD2", self.model.genome.drd2)
-                self._tb_add_scalar("Genome/FKBP5", self.model.genome.fkbp5)
+                self._tb_add_scalar("Genome/BDNF", self.model.governor.bdnf)
+                self._tb_add_scalar("Genome/CREB", self.model.governor.creb)
+                self._tb_add_scalar("Genome/DRD2", self.model.governor.drd2)
+                self._tb_add_scalar("Genome/FKBP5", self.model.governor.fkbp5)
             
             if batch_idx % int(self.cfg.sparsity_log_every) == 0:
                 density_ema = self._gate_density_ema if self._gate_density_ema is not None else self._last_gate_density
@@ -1736,7 +1736,7 @@ class RRATrainer:
              self._tb_add_scalar("Omega/epoch_value", new_omega, step=self.current_epoch)
 
         # Meta-Evolutionary Loop
-        self.model.genome.evolutionary_step(
+        self.model.governor.evolutionary_step(
             self.model,
             {
                 'val_loss': val_loss,

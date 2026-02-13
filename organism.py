@@ -210,7 +210,11 @@ class Governor(nn.Module):
     @property
     def creb(self): return self.get_expression('creb')
     @property
+    def creb_gamma(self): return self.creb
+    @property
     def fkbp5(self): return self.get_expression('fkbp5')
+    @property
+    def drd2(self): return self.get_expression('drd2')
     @property
     def gaba(self): return self.get_expression('gaba')
     @property
@@ -942,6 +946,7 @@ class CognitiveOrganism(BaseCognitiveModule):
         self._lgh_q_scale = {}
         self._lgh_q_meta = {}
         self._lgh_use_int8 = bool(getattr(Config, 'RAM_INT8_INFER', True))
+        self.register_buffer('_mes_super_scalars', torch.zeros(32, device=self.device))
         
         self.rope = RotaryEmbedding(self.d_s2 * C, device=device)
         self.virtual_lab = VirtualLab(enabled=bool(Config.VIRTUAL_LAB_ENABLED))
@@ -966,7 +971,7 @@ class CognitiveOrganism(BaseCognitiveModule):
         self._tps_pressure_step = -1
         self.importance_threshold_ema = 0.5
         self.mes_throttle_count = 0
-        # All scalars are now consolidated in self.homeostasis.config_scalars
+        # All scalars are now consolidated in self.governor.config_scalars
         # 6: hpc_error_ema, 7: hpc_last_error, 8: hpc_last_cycle_scale
         # 9: surprise_signal, 10: surprise_cycle_scale
         # 11: temporal_signal, 12: temporal_cycle_scale
@@ -991,6 +996,7 @@ class CognitiveOrganism(BaseCognitiveModule):
         self.omega = 0.0  # Start as Sponge
         self.omega_momentum = self.runtime_cfg.omega_step  # How fast omega changes
         self.omega_history = []  # Track evolution
+        self._stacked_params = None
         self._params_dirty = True
         
         # --- Autonomous Intelligence: Genome Activation ---
@@ -1299,7 +1305,7 @@ class CognitiveOrganism(BaseCognitiveModule):
             
             # --- STRESS MODULATION (FKBP5) ---
             # High stress (FKBP5) makes it harder to become autonomous
-            fkbp5 = self.genome.fkbp5 if hasattr(self, 'genome') else 0.5
+            fkbp5 = self.governor.fkbp5 if hasattr(self, 'genome') else 0.5
             stress_damping = 1.0 / (1.0 + fkbp5)
             
             if generalization_gap < 0.1:
@@ -1328,17 +1334,17 @@ class CognitiveOrganism(BaseCognitiveModule):
 
         # BDNF -> Learning Rate (Handled in Trainer usually, but can be scaled here)
         # CREB -> Memory Focus (Currently influence curiosity/stability weights)
-        creb = self.genome.creb
+        creb = self.governor.creb
         # Metabolism gamma is now handled internally by Genome based on CREB
         
         # DRD2 -> Gating Threshold (Confidence)
-        drd2 = self.genome.drd2
+        drd2 = self.governor.drd2
         # Map 0.1-0.9 to 1.0-6.0 range for STRICT_CONFIDENCE
         self.confidence_multiplier = 1.0 + (drd2 * 5.0) # Higher DRD2 -> higher confidence multiplier
         
         # FKBP5 -> Target Sparsity Pressure (Metabolic Hunger) & Resonance Error Sensitivity
-        fkbp5 = self.genome.fkbp5
-        metabolic_efficiency = getattr(self.genome, 'metabolic_efficiency', 0.5)
+        fkbp5 = self.governor.fkbp5
+        metabolic_efficiency = getattr(self.governor, 'metabolic_efficiency', 0.5)
         # Map FKBP5 to lambda_sparsity
         self.lambda_sparsity = (0.01 * fkbp5) / max(0.25, metabolic_efficiency)
         
@@ -1348,26 +1354,26 @@ class CognitiveOrganism(BaseCognitiveModule):
         self.fkbp5 = fkbp5
         
         # GABA -> Inhibition Control (Transparency Gate threshold modifier)
-        gaba = self.genome.gaba
+        gaba = self.governor.gaba
         # Higher GABA = more inhibitory = higher engagement threshold = more bypasses
         self.gaba_inhibition = gaba
-        self.curve_trajectory_gene = float(getattr(self.genome, 'curve_trajectory', 0.5))
-        self.mask_sparsity_bias = float(getattr(self.genome, 'mask_sparsity_bias', 0.5))
+        self.curve_trajectory_gene = float(getattr(self.governor, 'curve_trajectory', 0.5))
+        self.mask_sparsity_bias = float(getattr(self.governor, 'mask_sparsity_bias', 0.5))
         self.metabolic_efficiency = float(metabolic_efficiency)
-        self.wormhole_jump_bias = float(getattr(self.genome, 'wormhole_jump_bias', 0.1))
-        self.focus_x = float(getattr(self.genome, 'focus_x', 0.5))
-        self.focus_y = float(getattr(self.genome, 'focus_y', 0.5))
-        self.focus_z = float(getattr(self.genome, 'focus_z', 0.5))
-        self.focus_sharpness = float(getattr(self.genome, 'focus_sharpness', self.lgh_cfg.focus_sharpness))
-        self.temporal_trace_bias = float(getattr(self.genome, 'temporal_trace_bias', 0.5))
+        self.wormhole_jump_bias = float(getattr(self.governor, 'wormhole_jump_bias', 0.1))
+        self.focus_x = float(getattr(self.governor, 'focus_x', 0.5))
+        self.focus_y = float(getattr(self.governor, 'focus_y', 0.5))
+        self.focus_z = float(getattr(self.governor, 'focus_z', 0.5))
+        self.focus_sharpness = float(getattr(self.governor, 'focus_sharpness', self.lgh_cfg.focus_sharpness))
+        self.temporal_trace_bias = float(getattr(self.governor, 'temporal_trace_bias', 0.5))
         
         # BDNF: Learning Rate proxy
-        bdnf_expression = self.genome.bdnf
+        bdnf_expression = self.governor.bdnf
         # Map BDNF [0.1, 2.0] to learning rate [1e-5, 1e-2]
         self.suggested_lr = 1e-5 + (bdnf_expression / 2.0) * (1e-2 - 1e-5)
         
         # Perfection Penalty: dynamic multiplier if loss is too low
-        if getattr(self.genome, 'best_loss', 1.0) < 0.001:
+        if getattr(self.governor, 'best_loss', 1.0) < 0.001:
              print(">>> METABOLIC HUNGER: Perfection Penalty Active (2x Sparsity Pressure)")
              self.lambda_sparsity *= 2.0
         
@@ -1387,7 +1393,7 @@ class CognitiveOrganism(BaseCognitiveModule):
         # Omega changes faster when BDNF is high (higher plasticity)
         self.omega_momentum = self.runtime_cfg.omega_step * bdnf_expression
         
-        print(f">>> Phenotype Updated (Gen {self.genome.generation}): CREB={creb:.2f} (Stab={self.genome.creb_gamma:.3f}), "
+        print(f">>> Phenotype Updated (Gen {self.governor.generation}): CREB={creb:.2f} (Stab={self.governor.creb_gamma:.3f}), "
               f"DRD2={drd2:.2f} (Conf={self.confidence_multiplier:.2f}), "
               f"FKBP5={fkbp5:.2f} (Sparsity={self.lambda_sparsity:.6f}, Thresh={self.metabolic_threshold:.6f})")
         print(
@@ -1509,7 +1515,7 @@ class CognitiveOrganism(BaseCognitiveModule):
         if should_update is None:
             should_update = self._should_update_survival()
         if should_update:
-            self.homeostasis.update_metabolism(H_next, H_prev=H_prev, bdnf_gamma=self.genome.creb_gamma)
+            self.governor.update_metabolism(H_next, H_prev=H_prev, bdnf_gamma=self.governor.creb_gamma)
 
     def _hpc_active(self):
         return bool(self.hpc_enabled and (self.L > 1) and (self.hpc_encoder is not None) and (self.hpc_decoder is not None))
@@ -1559,22 +1565,22 @@ class CognitiveOrganism(BaseCognitiveModule):
             if hasattr(cpp_loader, 'get_hpc_error_ema'):
                 # Note: Currently C++ EMA is a placeholder, updating it here via Python's logic
                 # for parity until the kernel is updated.
-                self.homeostasis.config_scalars[6] = self.homeostasis.config_scalars[6] * decay + float(global_safe * (1.0 - decay))
+                self.governor.config_scalars[6] = self.governor.config_scalars[6] * decay + float(global_safe * (1.0 - decay))
             else:
-                self.homeostasis.config_scalars[6] = self.homeostasis.config_scalars[6] * decay + float(global_safe * (1.0 - decay))
+                self.governor.config_scalars[6] = self.governor.config_scalars[6] * decay + float(global_safe * (1.0 - decay))
             
-            self.homeostasis.config_scalars[7] = float(global_safe)
-            self.homeostasis.hpc_layer_error_ema.mul_(decay).add_(layer_safe * (1.0 - decay))
+            self.governor.config_scalars[7] = float(global_safe)
+            self.governor.hpc_layer_error_ema.mul_(decay).add_(layer_safe * (1.0 - decay))
         
         # Facade property update
-        self.error_ema = float(self.homeostasis.config_scalars[6])
+        self.error_ema = float(self.governor.config_scalars[6])
 
     def _hpc_cycle_scale(self):
         if not self._hpc_active():
-            self.homeostasis.config_scalars[8] = 1.0
+            self.governor.config_scalars[8] = 1.0
             return 1.0
         target_error = max(1e-6, self.hpc_cfg.target_error)
-        ema_error = float(self.homeostasis.config_scalars[6])
+        ema_error = float(self.governor.config_scalars[6])
         if not math.isfinite(ema_error):
             ema_error = target_error
         ratio = ema_error / target_error
@@ -1583,7 +1589,7 @@ class CognitiveOrganism(BaseCognitiveModule):
         min_scale = max(0.1, min(min_scale, max_scale))
         max_scale = max(min_scale, max_scale)
         scale = max(min_scale, min(max_scale, ratio))
-        self.homeostasis.config_scalars[8] = float(scale)
+        self.governor.config_scalars[8] = float(scale)
         return float(scale)
 
     def _dynamic_cycle_counts(self):
@@ -1596,7 +1602,7 @@ class CognitiveOrganism(BaseCognitiveModule):
 
     def _apply_surprise_cycle_control(self, h_cycles, l_cycles, surprise_signal, is_audit=False):
         if (not self.hpc_cfg.surprise_gate) or is_audit:
-            self.homeostasis.config_scalars[10] = 1.0
+            self.governor.config_scalars[10] = 1.0
             return h_cycles, l_cycles, False
         threshold = max(1e-6, self.hpc_cfg.surprise_threshold)
         score = float(surprise_signal.mean().item())
@@ -1612,7 +1618,7 @@ class CognitiveOrganism(BaseCognitiveModule):
             scale = 1.0
         h_next = max(1, int(round(h_cycles * scale)))
         l_next = max(1, int(round(l_cycles * scale)))
-        self.homeostasis.config_scalars[10] = float(scale)
+        self.governor.config_scalars[10] = float(scale)
         skip_reasoning = bool(
             self.hpc_cfg.surprise_skip_enabled
             and (scale <= self.hpc_cfg.surprise_skip_scale)
@@ -1622,23 +1628,23 @@ class CognitiveOrganism(BaseCognitiveModule):
 
     def _temporal_activity_signal(self, p):
         if (not self.hpc_cfg.temporal_gate_enabled) or p.dim() != 3 or p.size(1) <= 1:
-            self.homeostasis.config_scalars[11] = 1.0
+            self.governor.config_scalars[11] = 1.0
             return torch.ones((p.size(0), 1, 1), dtype=torch.float32, device=p.device)
         window = min(int(self.hpc_cfg.temporal_gate_window), int(p.size(1)))
         if window <= 1:
-            self.homeostasis.config_scalars[11] = 1.0
+            self.governor.config_scalars[11] = 1.0
             return torch.ones((p.size(0), 1, 1), dtype=torch.float32, device=p.device)
         p_tail = p[:, -window:, :]
         delta = (p_tail[:, 1:, :] - p_tail[:, :-1, :]).abs().mean(dim=(1, 2), keepdim=True)
         delta = torch.nan_to_num(delta, nan=0.0, posinf=1.0, neginf=0.0)
         signal = torch.tanh(delta).to(dtype=torch.float32)
         signal = torch.nan_to_num(signal, nan=0.0, posinf=1.0, neginf=0.0)
-        self.homeostasis.config_scalars[11] = float(signal.mean().detach())
+        self.governor.config_scalars[11] = float(signal.mean().detach())
         return signal
 
     def _apply_temporal_cycle_control(self, h_cycles, l_cycles, temporal_signal, is_audit=False):
         if (not self.hpc_cfg.temporal_gate_enabled) or is_audit:
-            self.homeostasis.config_scalars[12] = 1.0
+            self.governor.config_scalars[12] = 1.0
             return h_cycles, l_cycles, False
         threshold = max(1e-6, self.hpc_cfg.temporal_gate_threshold)
         score = float(temporal_signal.mean().item())
@@ -1654,7 +1660,7 @@ class CognitiveOrganism(BaseCognitiveModule):
             scale = 1.0
         h_next = max(1, int(round(h_cycles * scale)))
         l_next = max(1, int(round(l_cycles * scale)))
-        self.homeostasis.config_scalars[12] = float(scale)
+        self.governor.config_scalars[12] = float(scale)
         skip_reasoning = bool(
             self.hpc_cfg.temporal_gate_skip_enabled
             and (scale <= self.hpc_cfg.temporal_gate_skip_scale)
@@ -1684,16 +1690,16 @@ class CognitiveOrganism(BaseCognitiveModule):
 
     def _hpc_refresh_from_states(self, H_next, H_prev=None):
         if not self._hpc_active():
-            self.homeostasis.config_scalars[7] = 0.0
-            return self.homeostasis.config_scalars[7]
+            self.governor.config_scalars[7] = 0.0
+            return self.governor.config_scalars[7]
         step = int(self.step_counter.item())
         monitor_every = max(1, self.hpc_cfg.monitor_every)
         if self.training and (step % monitor_every) != 0:
-            return self.homeostasis.config_scalars[7]
+            return self.governor.config_scalars[7]
         with torch.no_grad():
             global_error, layer_error_full, _, _ = self._hpc_error_terms(H_next.detach(), H_prev.detach() if H_prev is not None else None)
             self._hpc_update_error_stats(global_error, layer_error_full)
-        return self.homeostasis.config_scalars[7]
+        return self.governor.config_scalars[7]
 
     def _hpc_train_predictors(self, H_next, H_prev=None):
         if not (self._hpc_active() and hasattr(self, 'hpc_optimizer')):
@@ -1719,7 +1725,7 @@ class CognitiveOrganism(BaseCognitiveModule):
         dyn_threshold *= (1.0 - tps_pressure)
         if self._hpc_active():
             target_error = max(1e-6, self.hpc_cfg.target_error)
-            ema_error = float(self.homeostasis.config_scalars[6])
+            ema_error = float(self.governor.config_scalars[6])
             if not math.isfinite(ema_error):
                 ema_error = target_error
             ratio = ema_error / target_error
@@ -2190,7 +2196,7 @@ class CognitiveOrganism(BaseCognitiveModule):
         H = self._prepare_state(H, B)
             
         # --- BIOLOGICAL GATING: Blend signals for stabilization ---
-        genome_usage = self.genome.usage
+        genome_usage = self.governor.usage
         combined_scores = genome_usage.clone() if genome_usage is not None else torch.ones(L, R, device=device)
         if learning_brain is not None and hasattr(learning_brain, 'knowledge_map'):
             # Blend behavioral usage with learning contribution (Knowledge Map)
@@ -2215,7 +2221,7 @@ class CognitiveOrganism(BaseCognitiveModule):
             gate = (combined_scores >= threshold).float()[:, :, None, None]
         else:
             # Phase 1+ (Autonomous): Dynamic Metabolic + Performance Masking
-            gate = self.genome.get_metabolic_mask(
+            gate = self.governor.get_metabolic_mask(
                 metabolic_pressure=lambda_sparsity,
                 tps_pressure=tps_pressure
             )
@@ -2365,26 +2371,26 @@ class CognitiveOrganism(BaseCognitiveModule):
                 'audit': float(is_audit),
                 'thinking_duration': h_cycles_used,
                 'hpc_error': float(hpc_error.item()) if isinstance(hpc_error, torch.Tensor) else float(hpc_error),
-                'hpc_cycle_scale': float(self.homeostasis.config_scalars[8]),
-                'hpc_surprise_signal': float(self.homeostasis.config_scalars[9]),
-                'hpc_surprise_scale': float(self.homeostasis.config_scalars[10]),
-                'hpc_temporal_signal': float(self.homeostasis.config_scalars[11]),
-                'hpc_temporal_scale': float(self.homeostasis.config_scalars[12]),
-                'engagement_rate': float(self.homeostasis.config_scalars[15]),
-                'bypass_rate': 1.0 - float(self.homeostasis.config_scalars[15]),
-                'thermal_penalty': float(self.homeostasis.config_scalars[13]),
-                'cpu_freq_ghz': float(self.homeostasis.config_scalars[14]),
+                'hpc_cycle_scale': float(self.governor.config_scalars[8]),
+                'hpc_surprise_signal': float(self.governor.config_scalars[9]),
+                'hpc_surprise_scale': float(self.governor.config_scalars[10]),
+                'hpc_temporal_signal': float(self.governor.config_scalars[11]),
+                'hpc_temporal_scale': float(self.governor.config_scalars[12]),
+                'engagement_rate': float(self.governor.config_scalars[15]),
+                'bypass_rate': 1.0 - float(self.governor.config_scalars[15]),
+                'thermal_penalty': float(self.governor.config_scalars[13]),
+                'cpu_freq_ghz': float(self.governor.config_scalars[14]),
                 't': T,
                 'B': B
             })
-            self._vl_add_scalar("TransparencyGate/engagement", self._current_engagement_rate)
+            self._vl_add_scalar("TransparencyGate/engagement", float(self.governor.config_scalars[15]))
             self._vl_add_scalar("TransparencyGate/omega", self.omega)
-            self._vl_add_scalar("HPC/error_ema", self._hpc_error_ema)
-            self._vl_add_scalar("HPC/cycle_scale", self._hpc_last_cycle_scale)
-            self._vl_add_scalar("HPC/surprise_signal", self._last_surprise_signal)
-            self._vl_add_scalar("HPC/surprise_scale", self._last_surprise_cycle_scale)
-            self._vl_add_scalar("HPC/temporal_signal", self._last_temporal_signal)
-            self._vl_add_scalar("HPC/temporal_scale", self._last_temporal_cycle_scale)
+            self._vl_add_scalar("HPC/error_ema", cpp_loader.get_hpc_error_ema())
+            self._vl_add_scalar("HPC/cycle_scale", float(self.governor.config_scalars[8]))
+            self._vl_add_scalar("HPC/surprise_signal", float(self.governor.config_scalars[9]))
+            self._vl_add_scalar("HPC/surprise_scale", float(self.governor.config_scalars[10]))
+            self._vl_add_scalar("HPC/temporal_signal", float(self.governor.config_scalars[11]))
+            self._vl_add_scalar("HPC/temporal_scale", float(self.governor.config_scalars[12]))
             
         # Update preflight status after stabilization
         if not self._preflight_ready:
