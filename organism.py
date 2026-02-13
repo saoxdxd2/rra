@@ -1538,7 +1538,7 @@ class CognitiveOrganism(BaseCognitiveModule):
         dyn_threshold *= (1.0 - tps_pressure)
         if self._hpc_active():
             target_error = max(1e-6, self.hpc_cfg.target_error)
-            ema_error = float(self._hpc_error_ema.item())
+            ema_error = float(self.homeostasis.config_scalars[6])
             if not math.isfinite(ema_error):
                 ema_error = target_error
             ratio = ema_error / target_error
