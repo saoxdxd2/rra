@@ -64,15 +64,19 @@ def rms_norm(x, eps=Config.RMS_NORM_EPS):
     return _cpp_try('rms_norm', x.contiguous(), eps, tensors=(x,))
 
 
-class StrategicGatingModule(nn.Module):
+class HomeostaticModule(nn.Module):
     """
-    Unified gating module:
-    1. CertaintyHead: O(1) Engagement Predictor (Transparency Gate).
-    2. MemoryGovernor: O(1) Importance Predictor (Memory Imprinting).
+    Unified Governance & Homeostasis Module:
+    1. Strategic Gating (Engagement/Certainty & Importance).
+    2. Metabolic Governance (Usage Tracking & Reliability).
+    3. Consolidated Configuration (Scalar Buffers for C++ kernels).
     """
-    def __init__(self, input_dim, hidden_dim=128, device=None):
+    def __init__(self, L, R, input_dim, hidden_dim=128, device=None):
         super().__init__()
-        # Shared feature extractor for efficiency
+        self.L, self.R = L, R
+        self.device = device
+        
+        # --- 1. Strategic Gating (Architecture from StrategicGatingModule) ---
         self.shared = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.ReLU()
@@ -82,14 +86,67 @@ class StrategicGatingModule(nn.Module):
             nn.Linear(hidden_dim, 1),
             nn.Sigmoid()
         )                                                # Probability for imprinting
+        
+        # --- 2. Metabolic Governance (Migrated from Genome) ---
+        self.register_buffer('usage', torch.ones(L, R))
+        self.register_buffer('reliability', torch.ones(L, R))
+        
+        # --- 3. Consolidated configuration for C++ kernels ---
+        # [0: gamma, 1: imp_w, 2: surp_w, 3: metabolic_pressure, 4: tps_pressure, 5: noise, 6-15: reserved]
+        self.register_buffer('config_scalars', torch.zeros(16, dtype=torch.float32))
+        self.config_scalars[0] = 0.95 # Default gamma
+        self.config_scalars[1] = 1.0  # Default importance weight
+        self.config_scalars[2] = 1.0  # Default surprise weight
+        self.config_scalars[5] = 0.05 # Default noise
+        
         if device:
             self.to(device)
-    
+            
+    def update_metabolism(self, H, H_prev=None, bdnf_gamma=None):
+        """Update usage scores via C++ kernel survival_update_io."""
+        H_c = H.contiguous()
+        H_prev_t = H_prev.contiguous() if H_prev is not None else torch.empty(0, device=H.device, dtype=H_c.dtype)
+        
+        if bdnf_gamma is not None:
+            self.config_scalars[0] = float(bdnf_gamma)
+            
+        # survival_update_io handles the EMA update of self.usage
+        from organism import _cpp_try
+        out = _cpp_try(
+            'survival_update_io',
+            H_c,
+            self.usage,
+            [H_prev_t],
+            self.config_scalars[:3], # Points 0, 1, 2
+            tensors=(H_c, self.usage, H_prev_t, self.config_scalars)
+        )
+        # Note: In-place update might be handled by C++ or return value.
+        # Genome implementation assigned it: self.usage = out
+        if out is not None:
+            self.usage = out
+            
+    def get_metabolic_mask(self, metabolic_pressure, tps_pressure):
+        """Generate sparse activation mask via C++ kernel survival_mask_io."""
+        self.config_scalars[3] = float(metabolic_pressure)
+        self.config_scalars[4] = float(tps_pressure)
+        
+        from organism import _cpp_try
+        out = _cpp_try(
+            'survival_mask_io',
+            self.usage,
+            self.reliability,
+            self.config_scalars[3:6], # Points 3, 4, 5
+            tensors=(self.usage, self.reliability, self.config_scalars)
+        )
+        return out
+
     def forward(self, x):
+        """Strategic Gating Forward Pass."""
         features = self.shared(x)
         engagement = self.engagement_head(features)
         importance = self.importance_head(features)
         return engagement, importance
+
 
 
 
@@ -457,8 +514,9 @@ class OrganismLevel(BaseCognitiveModule):
         self.R, self.D, self.C = R, D, C
         self.cfg = cfg
         
-        # Strategic Gating Module: O(1) engagement & importance prediction
-        self.strategic_gating = StrategicGatingModule(D * C, hidden_dim=128, device=device)
+        # Homeostatic Module: O(1) engagement & importance + metabolic governance
+        self.homeostasis = HomeostaticModule(L=1, R=R, input_dim=D*C, device=device)
+        self.strategic_gating = self.homeostasis # Alias for backward compatibility
         self.omega_ref = 0.0  # Synced from parent CognitiveOrganism
         self.h_decay_rate = self.cfg.BYPASS_H_DECAY  # Light memory decay during bypass
         
@@ -638,7 +696,8 @@ class CognitiveOrganism(BaseCognitiveModule):
 
         # Non-Linear Cognitive Bridge: System 1 -> System 2 (The Uploader)
         self.bridge_s1_to_s2 = SwiGLU(self.d_s1 * C, expansion=2.0, out_dim=self.d_s2 * C)
-        self.strategic_gating = StrategicGatingModule(self.d_s1 * C, device=self.device)
+        self.homeostasis = HomeostaticModule(L=L, R=R, input_dim=self.d_s1 * C, device=self.device)
+        self.strategic_gating = self.homeostasis # Unified alias
         
         # System 2: Slow/Reasoning Path (D_S2)
         self.levels = nn.ModuleList([OrganismLevel(R, self.d_s2, C, device=device, cfg=self.cfg) for _ in range(L)])
