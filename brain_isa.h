@@ -119,4 +119,8 @@
 #define NIS_SIMD_WIDTH 16 // 512 bits
 #define NIS_ALIGNMENT  64
 
+#define NIS_SPARSITY_THRESHOLD  0.5f
+#define NIS_MAX_LOG_ENTRIES     1000
+#define NIS_EPSILON             1e-8f
+
 #endif // BRAIN_ISA_H
