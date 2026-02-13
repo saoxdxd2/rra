@@ -103,8 +103,8 @@ class LearningBrain(nn.Module):
         self._step += 1
         
         dynamic_energy_weight = Config.DYNAMIC_ENERGY_SCALE * (1.0 - confusion_ratio) * warmup_factor
-        loss_stability, loss_energy, loss_coherence = model.survival.calculate_losses(H_next, gate=gate, H_prev=H)
-        loss_myelin = model.survival.calculate_myelin_cost(model)
+        loss_stability, loss_energy, loss_coherence = model.metabolism.calculate_losses(H_next, gate=gate, H_prev=H)
+        loss_myelin = model.metabolism.calculate_myelin_cost(model)
         
         omega = getattr(model, 'omega', 0.0)
         combined_stability = loss_stability + Config.COHERENCE_WEIGHT * loss_coherence + loss_myelin

@@ -476,8 +476,8 @@ class OrganismLevel(BaseCognitiveModule):
     def forward(self, *args, **kwargs):
         raise RuntimeError("OrganismLevel.forward is bypassed; reasoning core must use forward_stack_io kernel.")
 
-class SurvivalController:
-    """Pruning controller with C++ accelerated update and mask generation."""
+class MetabolicGovernor:
+    """Unified metabolic governor: pruning, consolidation, and thermal adaptation via C++ kernels."""
     
     def __init__(self, L, R, gamma=Config.SURVIVAL_GAMMA, device=DEVICE):
         self.device = device
@@ -799,7 +799,7 @@ class CognitiveOrganism(BaseCognitiveModule):
         self._lgh_use_int8 = bool(getattr(Config, 'RAM_INT8_INFER', True))
         
         self.rope = RotaryEmbedding(self.d_s2 * C, device=device)
-        self.survival = SurvivalController(L, R, device=self.device)
+        self.metabolism = MetabolicGovernor(L, R, device=self.device)
         self.virtual_lab = VirtualLab(enabled=bool(Config.VIRTUAL_LAB_ENABLED))
         self.memory_depth = memory_depth
         # HybridEpisodicMemory decommissioned (Merged into LGH-Manifold)
@@ -1149,7 +1149,7 @@ class CognitiveOrganism(BaseCognitiveModule):
         creb = self.genome.creb
         # Assuming learning_brain is an object with lambda_stability
         # For now, let's directly influence survival.gamma as a proxy for stability/persistence
-        self.survival.gamma = 0.01 + (0.1 * (1.0 - creb)) # Lower CREB (less memory focus) -> higher gamma (faster usage decay)
+        self.metabolism.gamma = 0.01 + (0.1 * (1.0 - creb)) # Lower CREB (less memory focus) -> higher gamma (faster usage decay)
         
         # DRD2 -> Gating Threshold (Confidence)
         drd2 = self.genome.drd2
@@ -1207,7 +1207,7 @@ class CognitiveOrganism(BaseCognitiveModule):
         # Omega changes faster when BDNF is high (higher plasticity)
         self.omega_momentum = self.runtime_cfg.omega_step * bdnf_expression
         
-        print(f">>> Phenotype Updated (Gen {self.genome.generation}): CREB={creb:.2f} (Stab={self.survival.gamma:.3f}), "
+        print(f">>> Phenotype Updated (Gen {self.genome.generation}): CREB={creb:.2f} (Stab={self.metabolism.gamma:.3f}), "
               f"DRD2={drd2:.2f} (Conf={self.confidence_multiplier:.2f}), "
               f"FKBP5={fkbp5:.2f} (Sparsity={self.lambda_sparsity:.6f}, Thresh={self.metabolic_threshold:.6f})")
         print(
@@ -1329,7 +1329,7 @@ class CognitiveOrganism(BaseCognitiveModule):
         if should_update is None:
             should_update = self._should_update_survival()
         if should_update:
-            self.survival.update(H_next, H_prev=H_prev)
+            self.metabolism.update(H_next, H_prev=H_prev)
 
     def _hpc_active(self):
         return bool(self.hpc_enabled and (self.L > 1) and (self.hpc_encoder is not None) and (self.hpc_decoder is not None))
@@ -2116,7 +2116,7 @@ class CognitiveOrganism(BaseCognitiveModule):
         H = self._prepare_state(H, B)
             
         # --- BIOLOGICAL GATING: Blend signals for stabilization ---
-        combined_scores = self.survival.usage.clone()
+        combined_scores = self.metabolism.usage.clone()
         if learning_brain is not None and hasattr(learning_brain, 'knowledge_map'):
             # Blend behavioral usage with learning contribution (Knowledge Map)
             combined_scores = 0.5 * combined_scores + 0.5 * learning_brain.knowledge_map
@@ -2140,7 +2140,7 @@ class CognitiveOrganism(BaseCognitiveModule):
             gate = (combined_scores >= threshold).float()[:, :, None, None]
         else:
             # Phase 1+ (Autonomous): Dynamic Metabolic + Performance Masking
-            gate = self.survival.mask(
+            gate = self.metabolism.mask(
                 metabolic_pressure=self.lambda_sparsity,
                 tps_pressure=tps_pressure,
                 usage_override=combined_scores
@@ -2438,7 +2438,7 @@ class CognitiveOrganism(BaseCognitiveModule):
         if not bool(valid_dissonance.any().item()):
             return 0
 
-        self.survival.punish_reliability(
+        self.metabolism.punish_reliability(
             layer_indices=self._layer_indices,
             block_indices=self._block_indices,
             penalty=dissonance_weight
@@ -2565,7 +2565,7 @@ class CognitiveOrganism(BaseCognitiveModule):
         # METABOLIC TAXATION (Homeostasis)
         # Every consolidation cycle, neurons that haven't fired lose a bit of energy
         # This prevents the 100M parameters from becoming "Stochastic Parrots"
-        self.survival.usage.data *= (1.0 - self.runtime_cfg.metabolic_tax_rate)
+        self.metabolism.usage.data *= (1.0 - self.runtime_cfg.metabolic_tax_rate)
         self._apply_audit_dissonance(cache, s2_out, is_audit)
         self._demyelinate_unreliable_cache(cache)
 

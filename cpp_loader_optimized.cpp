@@ -995,197 +995,10 @@ std::vector<torch::Tensor> fused_lif_ram_lookup(
     return {spikes, v_next};
 }
 
-// -------------------------------------------------------------------------
-// KERNEL: Titans Memory Forward (nearest-memory associative recall)
-// -------------------------------------------------------------------------
-std::vector<torch::Tensor> titans_memory_forward(
-    torch::Tensor x,            // [B, D]
-    torch::Tensor memory_keys,  // [N, D]
-    torch::Tensor memory_values,// [N, D_out]
-    float temperature
-) {
-    (void)temperature;
-    check_cpu(x, "x");
-    check_cpu(memory_keys, "memory_keys");
-    check_cpu(memory_values, "memory_values");
-    check_dim(x, 2, "x");
-    check_dim(memory_keys, 2, "memory_keys");
-    check_dim(memory_values, 2, "memory_values");
-    check_dtype(x, at::kFloat, "x");
-    check_dtype(memory_keys, at::kFloat, "memory_keys");
-    check_dtype(memory_values, at::kFloat, "memory_values");
+// titans_memory_forward / titans_memory_update REMOVED (decommissioned in favor of Manifold Imprinting).
 
-    auto x_c = ensure_contig(x);
-    auto k_c = ensure_contig(memory_keys);
-    auto v_c = ensure_contig(memory_values);
 
-    const int64_t B = x_c.size(0);
-    const int64_t D = x_c.size(1);
-    const int64_t N = k_c.size(0);
-    const int64_t Dk = k_c.size(1);
-    Perf::g_titans_forward_calls.fetch_add(1ULL, std::memory_order_relaxed);
-    TORCH_CHECK(D == Dk, "x and memory_keys feature dimensions must match.");
-    TORCH_CHECK(v_c.size(0) == N, "memory_values first dimension must match memory_keys.");
-    const int64_t Dv = v_c.size(1);
 
-    auto output = torch::zeros({B, Dv}, x_c.options());
-    auto scores = torch::zeros({B}, x_c.options());
-    if (N == 0) {
-        Perf::add(0ULL, 0ULL);
-        return {output, scores};
-    }
-
-    const float* x_ptr = x_c.data_ptr<float>();
-    const float* k_ptr = k_c.data_ptr<float>();
-    const float* v_ptr = v_c.data_ptr<float>();
-    float* o_ptr = output.data_ptr<float>();
-    float* s_ptr = scores.data_ptr<float>();
-
-    std::vector<float> key_norms(static_cast<size_t>(N), 0.0f);
-    #pragma omp parallel for schedule(static)
-    for (int64_t n = 0; n < N; n++) {
-        const int64_t base = n * D;
-        double sq = 0.0;
-        for (int64_t d = 0; d < D; d++) {
-            const float kv = k_ptr[base + d];
-            sq += static_cast<double>(kv) * static_cast<double>(kv);
-        }
-        key_norms[static_cast<size_t>(n)] = static_cast<float>(std::sqrt(std::max(0.0, sq)) + 1e-8);
-    }
-
-    #pragma omp parallel for schedule(static)
-    for (int64_t b = 0; b < B; b++) {
-        const int64_t xb = b * D;
-        double x_sq = 0.0;
-        for (int64_t d = 0; d < D; d++) {
-            const float xv = x_ptr[xb + d];
-            x_sq += static_cast<double>(xv) * static_cast<double>(xv);
-        }
-        const float x_norm = static_cast<float>(std::sqrt(std::max(0.0, x_sq)) + 1e-8);
-
-        float best_sim = -std::numeric_limits<float>::infinity();
-        int64_t best_idx = -1;
-        for (int64_t n = 0; n < N; n++) {
-            const int64_t kb = n * D;
-            double dot = 0.0;
-            for (int64_t d = 0; d < D; d++) {
-                dot += static_cast<double>(x_ptr[xb + d]) * static_cast<double>(k_ptr[kb + d]);
-            }
-            const float sim = static_cast<float>(dot / (static_cast<double>(x_norm) * static_cast<double>(key_norms[static_cast<size_t>(n)])));
-            if (sim > best_sim) {
-                best_sim = sim;
-                best_idx = n;
-            }
-        }
-
-        s_ptr[b] = std::isfinite(best_sim) ? best_sim : 0.0f;
-        if (best_idx >= 0) {
-            const int64_t vb = best_idx * Dv;
-            const int64_t ob = b * Dv;
-            for (int64_t d = 0; d < Dv; d++) {
-                o_ptr[ob + d] = v_ptr[vb + d];
-            }
-        }
-    }
-
-    const long double b_ld = static_cast<long double>(B);
-    const long double d_ld = static_cast<long double>(D);
-    const long double n_ld = static_cast<long double>(N);
-    const long double dv_ld = static_cast<long double>(Dv);
-    const long double flops = n_ld * (2.0L * d_ld + 1.0L)
-        + b_ld * (2.0L * d_ld + 1.0L + n_ld * (2.0L * d_ld + 2.0L));
-    const long double bytes =
-        n_ld * d_ld * 4.0L +
-        b_ld * d_ld * 4.0L +
-        b_ld * n_ld * d_ld * 8.0L +
-        b_ld * n_ld * 4.0L +
-        b_ld * dv_ld * 8.0L +
-        b_ld * 4.0L;
-    Perf::add(Perf::sat_from_ld(flops), Perf::sat_from_ld(bytes));
-    return {output, scores};
-}
-
-// -------------------------------------------------------------------------
-// KERNEL: Titans Memory Update (append + keep latest max_memories)
-// -------------------------------------------------------------------------
-std::vector<torch::Tensor> titans_memory_update(
-    torch::Tensor memory_keys,   // [N, D] or empty
-    torch::Tensor memory_values, // [N, Dv] or empty
-    torch::Tensor new_keys,      // [B, D] or [D]
-    torch::Tensor new_values,    // [B, Dv] or [Dv]
-    int64_t max_memories
-) {
-    check_cpu(memory_keys, "memory_keys");
-    check_cpu(memory_values, "memory_values");
-    check_cpu(new_keys, "new_keys");
-    check_cpu(new_values, "new_values");
-    check_dtype(memory_keys, at::kFloat, "memory_keys");
-    check_dtype(memory_values, at::kFloat, "memory_values");
-    check_dtype(new_keys, at::kFloat, "new_keys");
-    check_dtype(new_values, at::kFloat, "new_values");
-    TORCH_CHECK(max_memories > 0, "max_memories must be > 0.");
-
-    auto k_new = ensure_contig(new_keys.dim() == 1 ? new_keys.unsqueeze(0) : new_keys);
-    auto v_new = ensure_contig(new_values.dim() == 1 ? new_values.unsqueeze(0) : new_values);
-    check_dim(k_new, 2, "new_keys");
-    check_dim(v_new, 2, "new_values");
-    TORCH_CHECK(k_new.size(0) == v_new.size(0), "new_keys and new_values batch dimension must match.");
-
-    const int64_t B = k_new.size(0);
-    const int64_t D = k_new.size(1);
-    const int64_t Dv = v_new.size(1);
-    Perf::g_titans_update_calls.fetch_add(1ULL, std::memory_order_relaxed);
-
-    auto k_norm = k_new.clone();
-    float* kn_ptr = k_norm.data_ptr<float>();
-    #pragma omp parallel for schedule(static)
-    for (int64_t b = 0; b < B; b++) {
-        const int64_t base = b * D;
-        float sum_sq = 0.0f;
-        for (int64_t d = 0; d < D; d++) {
-            const float v = kn_ptr[base + d];
-            sum_sq += v * v;
-        }
-        const float inv = 1.0f / std::sqrt(sum_sq + 1e-8f);
-        for (int64_t d = 0; d < D; d++) {
-            kn_ptr[base + d] *= inv;
-        }
-    }
-
-    at::Tensor k_old = memory_keys;
-    at::Tensor v_old = memory_values;
-    if (memory_keys.numel() == 0) {
-        k_old = torch::empty({0, D}, k_norm.options());
-    } else {
-        check_dim(memory_keys, 2, "memory_keys");
-        TORCH_CHECK(memory_keys.size(1) == D, "memory_keys feature dimension must match new_keys.");
-        k_old = ensure_contig(memory_keys);
-    }
-    if (memory_values.numel() == 0) {
-        v_old = torch::empty({0, Dv}, v_new.options());
-    } else {
-        check_dim(memory_values, 2, "memory_values");
-        TORCH_CHECK(memory_values.size(1) == Dv, "memory_values feature dimension must match new_values.");
-        TORCH_CHECK(memory_values.size(0) == k_old.size(0), "memory_values row count must match memory_keys.");
-        v_old = ensure_contig(memory_values);
-    }
-
-    auto k_cat = torch::cat({k_old, k_norm}, 0);
-    auto v_cat = torch::cat({v_old, v_new}, 0);
-    const int64_t total = k_cat.size(0);
-    if (total > max_memories) {
-        const int64_t start = total - max_memories;
-        k_cat = k_cat.narrow(0, start, max_memories).contiguous();
-        v_cat = v_cat.narrow(0, start, max_memories).contiguous();
-    }
-    const long double b_ld = static_cast<long double>(B);
-    const long double d_ld = static_cast<long double>(D);
-    Perf::add(
-        Perf::sat_from_ld(b_ld * (3.0L * d_ld + 1.0L)),
-        Perf::sat_from_ld(b_ld * (8.0L * d_ld))
-    );
-    return {k_cat, v_cat};
-}
 
 // -------------------------------------------------------------------------
 // KERNEL: Neural Cache Fast Lookup
@@ -2554,6 +2367,241 @@ inline float lgh_trace_pulse_update(float trace_value, float trace_gain, float a
 }
 } // namespace
 
+// -------------------------------------------------------------------------
+// KERNEL: Pulse-Gated SIMD Forward (Phase 2 & 3 Architecture Overhaul)
+// -------------------------------------------------------------------------
+std::vector<at::Tensor> pulse_gated_forward(
+    at::Tensor x_input,      // [B, T, M]
+    at::Tensor H_state,      // [B, L, R, D, C]
+    at::Tensor mask,          // [L, R] survival mask
+    at::Tensor mdna_mask,     // [L, M] or [L, R] active-neuron mask
+    at::Tensor curve_indices, // [S] Morton Path indices
+    at::Tensor manifold,      // [N, M] One Manifold weights
+    at::Tensor workspace,     // [workspace_size] pre-allocated scratchpad
+    int64_t time_phase,
+    int64_t h_cycles,
+    int64_t l_cycles,
+    double halt_threshold,
+    int64_t prefetch_distance,
+    double thermal_penalty,
+    double temporal_fold_threshold,
+    int64_t temporal_bins
+) {
+    check_cpu(x_input, "x_input");
+    check_cpu(H_state, "H_state");
+    check_cpu(mask, "mask");
+    check_cpu(mdna_mask, "mdna_mask");
+    check_cpu(curve_indices, "curve_indices");
+    check_cpu(manifold, "manifold");
+    check_cpu(workspace, "workspace");
+
+    auto p_c = ensure_contig(x_input);
+    auto h_c = ensure_contig(H_state);
+    auto g_c = ensure_contig(mask);
+    auto md_c = ensure_contig(mdna_mask);
+    auto idx_c = ensure_contig(curve_indices);
+    auto m_c = ensure_contig(manifold);
+    auto ws_c = ensure_contig(workspace);
+
+    const int64_t B = p_c.size(0);
+    const int64_t T = p_c.size(1);
+    const int64_t M = p_c.size(2);
+    const int64_t L = h_c.size(1);
+    const int64_t R = h_c.size(2);
+    const int64_t N_atlas = m_c.size(0);
+    const int64_t N3 = N_atlas / temporal_bins;
+    const int64_t S = idx_c.numel();
+
+    // Zero-Copy Workspace Partitioning (Phase 3)
+    // Zone A: H_next [B, L, R, M]
+    // Zone B: out [B, T, R, M]
+    // Zone C: halt_probs [B, T, 1]
+    const int64_t size_A = B * L * R * M;
+    const int64_t size_B = B * T * R * M;
+    const int64_t size_C = B * T;
+    TORCH_CHECK(ws_c.numel() >= (size_A + size_B + size_C), "Workspace too small for configured batch/sequence.");
+
+    float* ws_ptr = ws_c.data_ptr<float>();
+    float* h_next_ptr = ws_ptr;
+    float* out_ptr = ws_ptr + size_A;
+    float* halt_ptr = ws_ptr + size_A + size_B;
+
+    // Map workspace to return tensors (no copy)
+    auto h_next = torch::from_blob(h_next_ptr, h_c.sizes(), h_c.options());
+    auto out = torch::from_blob(out_ptr, {B, T, R, M}, p_c.options());
+    auto halt_probs = torch::from_blob(halt_ptr, {B, T, 1}, p_c.options());
+
+    // Initialize H_next with H_state (Zero-copy initial state)
+    std::memcpy(h_next_ptr, h_c.data_ptr<float>(), static_cast<size_t>(size_A) * sizeof(float));
+    std::memset(out_ptr, 0, static_cast<size_t>(size_B) * sizeof(float));
+    std::memset(halt_ptr, 0, static_cast<size_t>(size_C) * sizeof(float));
+
+    // Internal Pointers
+    const float* x_ptr = p_c.data_ptr<float>();
+    const float* g_ptr = g_c.data_ptr<float>();
+    const float* md_ptr = md_c.data_ptr<float>();
+    const int64_t* idx_ptr = idx_c.data_ptr<int64_t>();
+    const float* man_ptr = m_c.data_ptr<float>();
+
+    const float thermal_scale = 1.0f - 0.5f * static_cast<float>(std::max(0.0, std::min(0.95, thermal_penalty)));
+    const float cycle_scale = static_cast<float>(std::max<int64_t>(1, h_cycles) * std::max<int64_t>(1, l_cycles));
+    const float eps = 1e-8f;
+    const int64_t atlas_bins = std::max<int64_t>(1, N_atlas / N3);
+    const int64_t dt = lgh_wrap_row(time_phase, temporal_bins);
+
+    Perf::g_lgh_calls.fetch_add(1ULL, std::memory_order_relaxed);
+    const uint64_t tsc_start = __rdtsc();
+
+    // 1. BUILDS PROTOTYPE AND APPLIES PULSE (Consolidated AVX-512 Loop)
+    // For simplicity in this unified kernel, we build the prototype thread-locally or once per T.
+    // However, to strictly follow the "Hardware Gate" speed, we use ZMM registers for weights.
+    
+    std::vector<uint64_t> mdna_words(static_cast<size_t>(R), 0ULL);
+    for (int64_t r = 0; r < R; r++) {
+        mdna_words[static_cast<size_t>(r)] = lgh_region_mdna_word(md_ptr, L, R, r);
+    }
+
+    #pragma omp parallel
+    {
+        std::vector<float> proto_local(static_cast<size_t>(M), 0.0f);
+        float* proto_ptr = proto_local.data();
+
+        #pragma omp for schedule(dynamic)
+        for (int64_t b = 0; b < B; b++) {
+            for (int64_t t = 0; t < T; t++) {
+                std::fill(proto_local.begin(), proto_local.end(), 0.0f);
+                float contrib_count = 0.0f;
+
+                // --- PROTOTYPE BUILDING (Morton sequential stream) ---
+                for (int64_t s = 0; s < S; s++) {
+                    const int64_t row_base = lgh_clamp_row(idx_ptr[s], N3);
+                    const int64_t row3 = lgh_temporal_fold_row(row_base, dt, N3, temporal_bins, Core::g_hpc_fold_alpha);
+                    const int64_t row = row3 * atlas_bins + (dt % atlas_bins);
+                    const float* weight_row = man_ptr + row * M;
+
+                    // Morton Prefetch N+prefetch_distance
+                    if (s + prefetch_distance < S) {
+                        const int64_t next_base = lgh_clamp_row(idx_ptr[s + prefetch_distance], N3);
+                        const int64_t next_row3 = lgh_temporal_fold_row(next_base, dt, N3, temporal_bins, Core::g_hpc_fold_alpha);
+                        const int64_t next_row = next_row3 * atlas_bins + (dt % atlas_bins);
+                        _mm_prefetch(reinterpret_cast<const char*>(man_ptr + next_row * M), _MM_HINT_T0);
+                    }
+
+                    // AVX-512 Accumulation
+#ifdef __AVX512F
+                    int64_t m = 0;
+                    for (; m + 16 <= M; m += 16) {
+                        __m512 w_v = _mm512_loadu_ps(weight_row + m);
+                        __m512 p_v = _mm512_loadu_ps(proto_ptr + m);
+                        _mm512_storeu_ps(proto_ptr + m, _mm512_add_ps(p_v, w_v));
+                    }
+                    for (; m < M; m++) proto_ptr[m] += weight_row[m];
+#else
+                    for (int64_t m = 0; m < M; m++) proto_ptr[m] += weight_row[m];
+#endif
+                    contrib_count += 1.0f;
+                }
+
+                const float inv_s = 1.0f / std::max(1e-6f, contrib_count);
+#ifdef __AVX512F
+                int64_t mq = 0;
+                __m512 inv_v = _mm512_set1_ps(inv_s);
+                for (; mq + 16 <= M; mq += 16) {
+                    __m512 v = _mm512_loadu_ps(proto_ptr + mq);
+                    _mm512_storeu_ps(proto_ptr + mq, _mm512_mul_ps(v, inv_v));
+                }
+                for (; mq < M; mq++) proto_ptr[mq] *= inv_s;
+#else
+                for (int64_t mq = 0; mq < M; mq++) proto_ptr[mq] *= inv_s;
+#endif
+
+                // --- PULSE GATED EVALUATION ---
+                float halt_acc = 0.0f;
+                for (int64_t r = 0; r < R; r++) {
+                    const float scale = lgh_region_scale(g_ptr, md_ptr, L, R, r, thermal_scale) * cycle_scale;
+                    const int64_t out_base = ((b * T + t) * R + r) * M;
+                    const uint64_t mdna_word = mdna_words[static_cast<size_t>(r)];
+                    const int64_t x_base = (b * T + t) * M;
+
+#ifdef __AVX512F
+                    const __m512 scale_vec = _mm512_set1_ps(scale);
+                    int64_t m = 0;
+                    int64_t chunk = 0;
+                    for (; m + 16 <= M; m += 16, chunk++) {
+                        __mmask16 k_mdna = lgh_mdna_mask16(mdna_word, chunk);
+                        __m512 x_v = _mm512_loadu_ps(x_ptr + x_base + m);
+                        __m512 p_v = _mm512_loadu_ps(proto_ptr + m);
+                        __m512 merged = _mm512_add_ps(x_v, p_v);
+                        // Heart of the pulse: _mm512_maskz_mul_ps
+                        __m512 gated = _mm512_maskz_mul_ps(k_mdna, merged, scale_vec);
+                        _mm512_storeu_ps(out_ptr + out_base + m, gated);
+                        __m512 abs_v = _mm512_andnot_ps(_mm512_set1_ps(-0.0f), gated);
+                        halt_acc += _mm512_reduce_add_ps(abs_v);
+                    }
+                    for (; m < M; m++) {
+                        const float merged = x_ptr[x_base + m] + proto_ptr[m];
+                        const int bit = static_cast<int>((mdna_word >> (m & 63)) & 1ULL);
+                        const float v = (bit != 0) ? (merged * scale) : 0.0f;
+                        out_ptr[out_base + m] = v;
+                        halt_acc += std::abs(v);
+                    }
+#else
+                    for (int64_t m = 0; m < M; m++) {
+                        const float merged = x_ptr[x_base + m] + proto_ptr[m];
+                        const int bit = static_cast<int>((mdna_word >> (m & 63)) & 1ULL);
+                        const float v = (bit != 0) ? (merged * scale) : 0.0f;
+                        out_ptr[out_base + m] = v;
+                        halt_acc += std::abs(v);
+                    }
+#endif
+                }
+                
+                // Halting proxy (average energy)
+                const float denom = static_cast<float>(std::max<int64_t>(1, R * M));
+                const float raw_halt = (halt_acc / denom) / ((halt_acc / denom) + static_cast<float>(halt_threshold) + 1e-6f);
+                halt_ptr[b * T + t] = std::max(0.0f, std::min(1.0f, raw_halt * (1.0f - 0.35f * static_cast<float>(thermal_penalty))));
+            }
+        }
+    }
+
+    // 2. STATE UPDATE (Last step injection into H_next)
+    for (int64_t b = 0; b < B; b++) {
+        for (int64_t r = 0; r < R; r++) {
+            const int64_t src_base = ((b * T + (T - 1)) * R + r) * M;
+            for (int64_t l = 0; l < L; l++) {
+                const float gate_lr = std::max(0.0f, std::min(1.0f, g_ptr[l * R + r]));
+                const float mdna_lr = std::max(0.0f, std::min(1.0f, md_ptr[l * R + r]));
+                const float mix = gate_lr * mdna_lr * thermal_scale;
+                const float decay = 0.90f + 0.08f * (1.0f - mix);
+                const int64_t h_base = (((b * L + l) * R + r) * M);
+                
+                float* h_row = h_next_ptr + h_base;
+                const float* s_row = out_ptr + src_base;
+
+#ifdef __AVX512F
+                const __m512 decay_v = _mm512_set1_ps(decay);
+                const __m512 mix_v = _mm512_set1_ps(mix);
+                int64_t m = 0;
+                for (; m + 16 <= M; m += 16) {
+                    __m512 old_v = _mm512_loadu_ps(h_row + m);
+                    __m512 src_v = _mm512_loadu_ps(s_row + m);
+                    __m512 updated = _mm512_add_ps(_mm512_mul_ps(old_v, decay_v), _mm512_mul_ps(src_v, mix_v));
+                    _mm512_storeu_ps(h_row + m, updated);
+                }
+                for (; m < M; m++) h_row[m] = (decay * h_row[m]) + (mix * s_row[m]);
+#else
+                for (int64_t m = 0; m < M; m++) h_row[m] = (decay * h_row[m]) + (mix * s_row[m]);
+#endif
+            }
+        }
+    }
+
+    const uint64_t tsc_end = __rdtsc();
+    Perf::g_lgh_tsc_cycles.fetch_add((tsc_end >= tsc_start) ? (tsc_end - tsc_start) : 0ULL, std::memory_order_relaxed);
+    
+    return {out, h_next, halt_probs};
+}
+
 std::vector<at::Tensor> geometric_manifold_forward_avx512(
     at::Tensor p_brain,          // [B, T, M]
     at::Tensor H_state,          // [B, L, R, D, C]
@@ -3276,8 +3324,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("dcls_ram_lookup_int8", &dcls_ram_lookup_int8);
     m.def("fused_lif_ram_lookup", &fused_lif_ram_lookup);
     m.def("dcls_backward", &dcls_backward);
-    m.def("titans_memory_forward", &titans_memory_forward);
-    m.def("titans_memory_update", &titans_memory_update);
+    // titans_memory_forward / titans_memory_update REMOVED (Manifold Imprinting)
     m.def("neural_cache_lookup_fast", &neural_cache_lookup_fast);
     m.def("forward_stack_io", &forward_stack_io);
     m.def("mes_super_step_io", &mes_super_step_io);
@@ -3291,6 +3338,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("get_perf_counters", &get_perf_counters);
     m.def("ademamix_update", &ademamix_update);
     m.def("batched_ademamix_update", &batched_ademamix_update);
+    m.def("pulse_gated_forward", &pulse_gated_forward);
     m.def("geometric_manifold_forward_avx512", &geometric_manifold_forward_avx512);
     m.def("geometric_manifold_forward_avx512_int8", &geometric_manifold_forward_avx512_int8);
     m.def("fused_cognitive_cycle", &_fused_cognitive_cycle_impl);

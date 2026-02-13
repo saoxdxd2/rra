@@ -1128,8 +1128,8 @@ class RRATrainer:
         self._record_gate_sparsity(gate)
 
         
-        # Stability losses from SurvivalController
-        l_stab, l_eng, l_coh = self.model.survival.calculate_losses(H_next, gate=gate, H_prev=H)
+        # Stability losses from MetabolicGovernor
+        l_stab, l_eng, l_coh = self.model.metabolism.calculate_losses(H_next, gate=gate, H_prev=H)
         l_stab = self._finite(l_stab, nan=0.0, posinf=1e4, neginf=0.0)
         l_eng = self._finite(l_eng, nan=0.0, posinf=1e4, neginf=0.0)
         
@@ -1210,11 +1210,11 @@ class RRATrainer:
             with torch.no_grad():
                 loss_task = self.learning_brain.calculate_task_loss(out, yb)
                 loss_task = self._finite(loss_task, nan=10.0, posinf=10.0, neginf=10.0)
-                l_stab, l_eng, l_coh = self.model.survival.calculate_losses(H_next, gate=gate, H_prev=H)
+                l_stab, l_eng, l_coh = self.model.metabolism.calculate_losses(H_next, gate=gate, H_prev=H)
                 l_stab = self._finite(l_stab, nan=0.0, posinf=1e4, neginf=0.0)
                 l_eng = self._finite(l_eng, nan=0.0, posinf=1e4, neginf=0.0)
                 l_coh = self._finite(l_coh, nan=0.0, posinf=1e4, neginf=0.0)
-                l_myelin = self.model.survival.calculate_myelin_cost(self.model)
+                l_myelin = self.model.metabolism.calculate_myelin_cost(self.model)
                 if not isinstance(l_myelin, torch.Tensor):
                     l_myelin = torch.tensor(float(l_myelin), device=out.device, dtype=out.dtype)
                 l_myelin = self._finite(l_myelin, nan=0.0, posinf=1e4, neginf=0.0)
