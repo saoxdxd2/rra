@@ -1199,7 +1199,7 @@ void batched_ademamix_update(
 
     long double total_elems = 0.0L;
     #pragma omp parallel for reduction(+:total_elems) schedule(dynamic)
-    for (size_t i = 0; i < n_params; i++) {
+    for (int64_t i = 0; i < (int64_t)n_params; i++) {
         auto& p = params[i]; auto& g = grads[i];
         auto& mf = m_fast_list[i]; auto& ms = m_slow_list[i]; auto& v = v_list[i];
         
@@ -2183,7 +2183,7 @@ std::vector<at::Tensor> forward_stack(
 
     // Zero-Copy Workspace Pointer (Simplified)
     // In a full implementation, we'd use the Morton curve to jump.
-    #pragma omp parallel for collapse(2)
+    #pragma omp parallel for
     for (int64_t b = 0; b < B; b++) {
         for (int64_t t = 0; t < T; t++) {
             float* x_bt = x_ptr + (b * T + t) * D * C;
@@ -3488,4 +3488,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("make_morton_order", &make_morton_order);
 
     m.attr("STRICT_CPU_ONLY") = (bool)NIS::STRICT_CPU_ONLY;
+    m.attr("DEVICE") = NIS::DEVICE;
+    m.attr("VIRTUAL_LAB_ENABLED") = (bool)NIS::VIRTUAL_LAB_ENABLED;
+    m.attr("PREFLIGHT_ENABLED") = (bool)NIS::PREFLIGHT_ENABLED;
+    m.attr("NEURAL_CACHE_ENABLED") = (bool)NIS::NEURAL_CACHE_ENABLED;
+    m.attr("RAM_INT8_INFER") = (bool)NIS::RAM_INT8_INFER;
+    m.attr("USE_FORWARD_STACK") = (bool)NIS::USE_FORWARD_STACK;
+    m.attr("USE_FUSED_CYCLE") = (bool)NIS::USE_FUSED_CYCLE;
+    m.attr("DISSONANCE_CONFIDENCE_THRESHOLD") = NIS::DISSONANCE_CONFIDENCE_THRESHOLD;
 }

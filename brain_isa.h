@@ -153,6 +153,16 @@ namespace NIS {
     static constexpr float WARM_UP_STEPS           = 2000.0f;
     static constexpr float SCALE_CONSTANT          = 0.1f;
     static constexpr bool STRICT_CPU_ONLY         = false;
+    static constexpr const char* DEVICE           = "cpu"; // Authority string
+    
+    static constexpr bool VIRTUAL_LAB_ENABLED     = true;
+    static constexpr bool PREFLIGHT_ENABLED       = true;
+    static constexpr bool NEURAL_CACHE_ENABLED    = false;
+    static constexpr bool RAM_INT8_INFER          = true;
+    static constexpr bool USE_FORWARD_STACK       = true;
+    static constexpr bool USE_FUSED_CYCLE         = true;
+
+    static constexpr float DISSONANCE_CONFIDENCE_THRESHOLD = 0.5f;
 
     // Hardware Morton Jump (PDEP)
     inline uint64_t morton_jump_4d(uint32_t x, uint32_t y, uint32_t z, uint32_t t) {
