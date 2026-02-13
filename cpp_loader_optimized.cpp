@@ -2401,12 +2401,76 @@ std::vector<at::Tensor> forward_stack(
 // -------------------------------------------------------------------------
 // KERNEL: Liquid Geometric Hypernetwork (LGH) AVX512 Path
 // -------------------------------------------------------------------------
+
+namespace {
+inline int64_t lgh_clamp_row(int64_t row, int64_t n_rows) {
+    if (n_rows <= 0) {
+        return 0;
+    }
+    if (row < 0) {
+        return 0;
+    }
+    if (row >= n_rows) {
+        return n_rows - 1;
+    }
+    return row;
+}
+
+inline int64_t lgh_map_curve_row(int64_t curve_idx_original, const int64_t* inverse_order, int64_t n_rows) {
+    const int64_t original = lgh_clamp_row(curve_idx_original, n_rows);
+    return lgh_clamp_row(inverse_order[original], n_rows);
+}
+
+inline uint64_t lgh_region_mdna_word(const float* mdna_ptr, int64_t L, int64_t R, int64_t r) {
+    const int64_t max_bits = std::min<int64_t>(L, 64);
+    uint64_t word = 0ULL;
+    for (int64_t l = 0; l < max_bits; l++) {
+        if (mdna_ptr[l * R + r] >= 0.5f) {
+            word |= (uint64_t(1) << l);
+        }
+    }
+    return word;
+}
+
+inline float lgh_region_scale(
+    const float* gate_ptr,
+    const float* mdna_ptr,
+    int64_t L,
+    int64_t R,
+    int64_t r,
+    float thermal_scale
+) {
+    float sum = 0.0f;
+    for (int64_t l = 0; l < L; l++) {
+        const float gate_lr = std::max(0.0f, std::min(1.0f, gate_ptr[l * R + r]));
+        const float mdna_lr = std::max(0.0f, std::min(1.0f, mdna_ptr[l * R + r]));
+        sum += gate_lr * mdna_lr;
+    }
+    return thermal_scale * (sum / static_cast<float>(std::max<int64_t>(1, L)));
+}
+
+#ifdef __AVX512F
+inline __mmask16 lgh_mdna_mask16(uint64_t mdna_word, int64_t chunk_index) {
+    const int shift = static_cast<int>((chunk_index * 16) & 63);
+    const uint64_t rotated = (shift == 0)
+        ? mdna_word
+        : ((mdna_word >> shift) | (mdna_word << (64 - shift)));
+    return static_cast<__mmask16>(rotated & 0xFFFFULL);
+}
+
+inline __m512 lgh_pulse_eval_avx512(__m512 merged, __m512 scale_v, __mmask16 k_mdna) {
+    return _mm512_maskz_mul_ps(k_mdna, merged, scale_v);
+}
+#endif
+} // namespace
+
 std::vector<at::Tensor> geometric_manifold_forward_avx512(
     at::Tensor p_brain,          // [B, T, M]
     at::Tensor H_state,          // [B, L, R, D, C]
     at::Tensor gate,             // [L, R]
     at::Tensor manifold_morton,  // [N, M]
     at::Tensor curve_indices,    // [S]
+    at::Tensor morton_inverse_order, // [N] maps original topology idx -> Morton row
     at::Tensor mdna_mask,        // [L, R]
     int64_t h_cycles,
     int64_t l_cycles,
@@ -2419,18 +2483,21 @@ std::vector<at::Tensor> geometric_manifold_forward_avx512(
     check_cpu(gate, "gate");
     check_cpu(manifold_morton, "manifold_morton");
     check_cpu(curve_indices, "curve_indices");
+    check_cpu(morton_inverse_order, "morton_inverse_order");
     check_cpu(mdna_mask, "mdna_mask");
     check_dim(p_brain, 3, "p_brain");
     check_dim(H_state, 5, "H_state");
     check_dim(gate, 2, "gate");
     check_dim(manifold_morton, 2, "manifold_morton");
     check_dim(curve_indices, 1, "curve_indices");
+    check_dim(morton_inverse_order, 1, "morton_inverse_order");
     check_dim(mdna_mask, 2, "mdna_mask");
     check_dtype(p_brain, at::kFloat, "p_brain");
     check_dtype(H_state, at::kFloat, "H_state");
     check_dtype(gate, at::kFloat, "gate");
     check_dtype(manifold_morton, at::kFloat, "manifold_morton");
     check_dtype(curve_indices, at::kLong, "curve_indices");
+    check_dtype(morton_inverse_order, at::kLong, "morton_inverse_order");
     check_dtype(mdna_mask, at::kFloat, "mdna_mask");
 
     auto p_c = ensure_contig(p_brain);
@@ -2438,6 +2505,7 @@ std::vector<at::Tensor> geometric_manifold_forward_avx512(
     auto g_c = ensure_contig(gate);
     auto m_c = ensure_contig(manifold_morton);
     auto idx_c = ensure_contig(curve_indices);
+    auto inv_c = ensure_contig(morton_inverse_order);
     auto mdna_c = ensure_contig(mdna_mask);
 
     const int64_t B = p_c.size(0);
@@ -2450,6 +2518,7 @@ std::vector<at::Tensor> geometric_manifold_forward_avx512(
     const int64_t N = m_c.size(0);
     TORCH_CHECK(M == D * C, "p_brain feature dim must match H_state D*C.");
     TORCH_CHECK(m_c.size(1) == M, "manifold_morton feature dim must match p_brain feature dim.");
+    TORCH_CHECK(inv_c.size(0) == N, "morton_inverse_order must have length N.");
     TORCH_CHECK(g_c.size(0) == L && g_c.size(1) == R, "gate must match [L, R].");
     TORCH_CHECK(mdna_c.size(0) == L && mdna_c.size(1) == R, "mdna_mask must match [L, R].");
 
@@ -2468,6 +2537,7 @@ std::vector<at::Tensor> geometric_manifold_forward_avx512(
     const float* g_ptr = g_c.data_ptr<float>();
     const float* m_ptr = m_c.data_ptr<float>();
     const int64_t* idx_ptr = idx_c.data_ptr<int64_t>();
+    const int64_t* inv_ptr = inv_c.data_ptr<int64_t>();
     const float* mdna_ptr = mdna_c.data_ptr<float>();
 
     const int64_t S = idx_c.numel();
@@ -2475,20 +2545,17 @@ std::vector<at::Tensor> geometric_manifold_forward_avx512(
     const float thermal = static_cast<float>(std::max(0.0, std::min(0.95, thermal_penalty)));
     const float thermal_scale = 1.0f - 0.5f * thermal;
     const float cycle_scale = static_cast<float>(std::max<int64_t>(1, h_cycles) * std::max<int64_t>(1, l_cycles));
+    const float eps = 1e-8f;
 
     Perf::g_lgh_calls.fetch_add(1ULL, std::memory_order_relaxed);
 
     // Curve prototype in Morton space with prefetching.
     if (S > 0) {
         for (int64_t s = 0; s < S; s++) {
-            int64_t row = idx_ptr[s];
-            if (row < 0) row = 0;
-            if (row >= N) row = N - 1;
+            const int64_t row = lgh_map_curve_row(idx_ptr[s], inv_ptr, N);
             const float* row_ptr = m_ptr + row * M;
             if (s + prefetch_d < S) {
-                int64_t next_row = idx_ptr[s + prefetch_d];
-                if (next_row < 0) next_row = 0;
-                if (next_row >= N) next_row = N - 1;
+                const int64_t next_row = lgh_map_curve_row(idx_ptr[s + prefetch_d], inv_ptr, N);
                 const float* next_ptr = m_ptr + next_row * M;
                 _mm_prefetch(reinterpret_cast<const char*>(next_ptr), _MM_HINT_T0);
             }
@@ -2527,14 +2594,10 @@ std::vector<at::Tensor> geometric_manifold_forward_avx512(
     }
 
     // Region-level scale from averaged mDNA*gate.
+    std::vector<uint64_t> mdna_words(static_cast<size_t>(R), 0ULL);
     for (int64_t r = 0; r < R; r++) {
-        float sum = 0.0f;
-        for (int64_t l = 0; l < L; l++) {
-            const float gate_lr = std::max(0.0f, std::min(1.0f, g_ptr[l * R + r]));
-            const float mdna_lr = std::max(0.0f, std::min(1.0f, mdna_ptr[l * R + r]));
-            sum += gate_lr * mdna_lr;
-        }
-        region_scale_ptr[r] = thermal_scale * (sum / static_cast<float>(std::max<int64_t>(1, L)));
+        mdna_words[static_cast<size_t>(r)] = lgh_region_mdna_word(mdna_ptr, L, R, r);
+        region_scale_ptr[r] = lgh_region_scale(g_ptr, mdna_ptr, L, R, r, thermal_scale);
     }
 
     std::vector<float> halt_acc(static_cast<size_t>(B * T), 0.0f);
@@ -2546,29 +2609,36 @@ std::vector<at::Tensor> geometric_manifold_forward_avx512(
             for (int64_t r = 0; r < R; r++) {
                 const float scale = region_scale_ptr[r] * cycle_scale;
                 const int64_t out_base = ((b * T + t) * R + r) * M;
+                const uint64_t mdna_word = mdna_words[static_cast<size_t>(r)];
 #ifdef __AVX512F
                 const __m512 scale_v = _mm512_set1_ps(scale);
-                const __mmask16 k_mdna = (scale > 1e-8f) ? static_cast<__mmask16>(0xFFFF) : static_cast<__mmask16>(0x0000);
                 int64_t m = 0;
-                for (; m + 16 <= M; m += 16) {
+                int64_t chunk = 0;
+                for (; m + 16 <= M; m += 16, chunk++) {
+                    __mmask16 k_mdna = lgh_mdna_mask16(mdna_word, chunk);
+                    if (!(scale > eps)) {
+                        k_mdna = static_cast<__mmask16>(0x0000);
+                    }
                     __m512 p_v = _mm512_loadu_ps(p_ptr + p_base + m);
                     __m512 proto_v = _mm512_loadu_ps(proto_ptr + m);
                     __m512 merged = _mm512_add_ps(p_v, proto_v);
-                    __m512 gated = _mm512_maskz_mul_ps(k_mdna, merged, scale_v);
+                    __m512 gated = lgh_pulse_eval_avx512(merged, scale_v, k_mdna);
                     _mm512_storeu_ps(out_ptr + out_base + m, gated);
                     __m512 abs_v = _mm512_andnot_ps(_mm512_set1_ps(-0.0f), gated);
                     halt_acc[static_cast<size_t>(b * T + t)] += _mm512_reduce_add_ps(abs_v);
                 }
                 for (; m < M; m++) {
                     const float merged = p_ptr[p_base + m] + proto_ptr[m];
-                    const float v = (scale > 1e-8f) ? (merged * scale) : 0.0f;
+                    const int bit = static_cast<int>((mdna_word >> (m & 63)) & 1ULL);
+                    const float v = ((scale > eps) && (bit != 0)) ? (merged * scale) : 0.0f;
                     out_ptr[out_base + m] = v;
                     halt_acc[static_cast<size_t>(b * T + t)] += std::abs(v);
                 }
 #else
                 for (int64_t m = 0; m < M; m++) {
                     const float merged = p_ptr[p_base + m] + proto_ptr[m];
-                    const float v = merged * scale;
+                    const int bit = static_cast<int>((mdna_word >> (m & 63)) & 1ULL);
+                    const float v = ((scale > eps) && (bit != 0)) ? (merged * scale) : 0.0f;
                     out_ptr[out_base + m] = v;
                     halt_acc[static_cast<size_t>(b * T + t)] += std::abs(v);
                 }
@@ -2587,28 +2657,34 @@ std::vector<at::Tensor> geometric_manifold_forward_avx512(
                 const float mix = std::max(0.0f, std::min(1.0f, gate_lr * mdna_lr * thermal_scale));
                 const float decay = 0.90f + 0.08f * (1.0f - mix);
                 const int64_t h_base = (((b * L + l) * R + r) * M);
+                const uint64_t mdna_word = mdna_words[static_cast<size_t>(r)];
+                const int mdna_active = (l < 64) ? static_cast<int>((mdna_word >> l) & 1ULL) : static_cast<int>(mix > eps);
 #ifdef __AVX512F
                 const __m512 decay_v = _mm512_set1_ps(decay);
                 const __m512 mix_v = _mm512_set1_ps(mix);
-                const __mmask16 k_mdna = (mix > 1e-8f) ? static_cast<__mmask16>(0xFFFF) : static_cast<__mmask16>(0x0000);
+                const __mmask16 k_mdna = ((mix > eps) && (mdna_active != 0))
+                    ? static_cast<__mmask16>(0xFFFF)
+                    : static_cast<__mmask16>(0x0000);
                 int64_t m = 0;
                 for (; m + 16 <= M; m += 16) {
                     __m512 old_v = _mm512_loadu_ps(h_ptr + h_base + m);
                     __m512 src_v = _mm512_loadu_ps(out_ptr + src_base + m);
                     __m512 decayed = _mm512_mul_ps(old_v, decay_v);
-                    __m512 injected = _mm512_maskz_mul_ps(k_mdna, src_v, mix_v);
+                    __m512 injected = lgh_pulse_eval_avx512(src_v, mix_v, k_mdna);
                     _mm512_storeu_ps(h_ptr + h_base + m, _mm512_add_ps(decayed, injected));
                 }
                 for (; m < M; m++) {
                     const float old_v = h_ptr[h_base + m];
                     const float src_v = out_ptr[src_base + m];
-                    h_ptr[h_base + m] = (decay * old_v) + (mix * src_v);
+                    const int bit = mdna_active != 0;
+                    h_ptr[h_base + m] = (decay * old_v) + ((bit != 0) ? (mix * src_v) : 0.0f);
                 }
 #else
                 for (int64_t m = 0; m < M; m++) {
                     const float old_v = h_ptr[h_base + m];
                     const float src_v = out_ptr[src_base + m];
-                    h_ptr[h_base + m] = (decay * old_v) + (mix * src_v);
+                    const int bit = mdna_active != 0;
+                    h_ptr[h_base + m] = (decay * old_v) + ((bit != 0) ? (mix * src_v) : 0.0f);
                 }
 #endif
             }
@@ -2631,6 +2707,247 @@ std::vector<at::Tensor> geometric_manifold_forward_avx512(
     const long double l_ld = static_cast<long double>(L);
     const long double flops = bt_ld * r_ld * m_ld * 4.0L + bt_ld * l_ld * r_ld * m_ld * 3.0L;
     const long double bytes = bt_ld * r_ld * m_ld * 16.0L + bt_ld * l_ld * r_ld * m_ld * 8.0L;
+    Perf::add(Perf::sat_from_ld(flops), Perf::sat_from_ld(bytes));
+
+    auto out_5d = out.view({B, T, R, D, C});
+    return {out_5d, h_next, halt_probs};
+}
+
+std::vector<at::Tensor> geometric_manifold_forward_avx512_int8(
+    at::Tensor p_brain,          // [B, T, M]
+    at::Tensor H_state,          // [B, L, R, D, C]
+    at::Tensor gate,             // [L, R]
+    at::Tensor manifold_morton_q, // [N, M] int8
+    at::Tensor manifold_scale,   // [N] float32
+    at::Tensor curve_indices,    // [S] original topology indices
+    at::Tensor morton_inverse_order, // [N]
+    at::Tensor mdna_mask,        // [L, R]
+    int64_t h_cycles,
+    int64_t l_cycles,
+    double halt_threshold,
+    int64_t prefetch_distance,
+    double thermal_penalty
+) {
+    check_cpu(p_brain, "p_brain");
+    check_cpu(H_state, "H_state");
+    check_cpu(gate, "gate");
+    check_cpu(manifold_morton_q, "manifold_morton_q");
+    check_cpu(manifold_scale, "manifold_scale");
+    check_cpu(curve_indices, "curve_indices");
+    check_cpu(morton_inverse_order, "morton_inverse_order");
+    check_cpu(mdna_mask, "mdna_mask");
+    check_dim(p_brain, 3, "p_brain");
+    check_dim(H_state, 5, "H_state");
+    check_dim(gate, 2, "gate");
+    check_dim(manifold_morton_q, 2, "manifold_morton_q");
+    check_dim(manifold_scale, 1, "manifold_scale");
+    check_dim(curve_indices, 1, "curve_indices");
+    check_dim(morton_inverse_order, 1, "morton_inverse_order");
+    check_dim(mdna_mask, 2, "mdna_mask");
+    check_dtype(p_brain, at::kFloat, "p_brain");
+    check_dtype(H_state, at::kFloat, "H_state");
+    check_dtype(gate, at::kFloat, "gate");
+    check_dtype(manifold_morton_q, at::kChar, "manifold_morton_q");
+    check_dtype(manifold_scale, at::kFloat, "manifold_scale");
+    check_dtype(curve_indices, at::kLong, "curve_indices");
+    check_dtype(morton_inverse_order, at::kLong, "morton_inverse_order");
+    check_dtype(mdna_mask, at::kFloat, "mdna_mask");
+
+    auto p_c = ensure_contig(p_brain);
+    auto h_c = ensure_contig(H_state);
+    auto g_c = ensure_contig(gate);
+    auto q_c = ensure_contig(manifold_morton_q);
+    auto sc_c = ensure_contig(manifold_scale);
+    auto idx_c = ensure_contig(curve_indices);
+    auto inv_c = ensure_contig(morton_inverse_order);
+    auto mdna_c = ensure_contig(mdna_mask);
+
+    const int64_t B = p_c.size(0);
+    const int64_t T = p_c.size(1);
+    const int64_t M = p_c.size(2);
+    const int64_t L = h_c.size(1);
+    const int64_t R = h_c.size(2);
+    const int64_t D = h_c.size(3);
+    const int64_t C = h_c.size(4);
+    const int64_t N = q_c.size(0);
+    TORCH_CHECK(M == D * C, "p_brain feature dim must match H_state D*C.");
+    TORCH_CHECK(q_c.size(1) == M, "manifold_morton_q feature dim must match p_brain feature dim.");
+    TORCH_CHECK(sc_c.size(0) == N, "manifold_scale must have shape [N].");
+    TORCH_CHECK(inv_c.size(0) == N, "morton_inverse_order must have length N.");
+    TORCH_CHECK(g_c.size(0) == L && g_c.size(1) == R, "gate must match [L, R].");
+    TORCH_CHECK(mdna_c.size(0) == L && mdna_c.size(1) == R, "mdna_mask must match [L, R].");
+
+    auto out = torch::zeros({B, T, R, M}, p_c.options());
+    auto h_next = h_c.clone();
+    auto halt_probs = torch::zeros({B, T, 1}, p_c.options());
+    auto proto = torch::zeros({M}, p_c.options());
+    auto region_scale_t = torch::zeros({R}, p_c.options());
+
+    float* out_ptr = out.data_ptr<float>();
+    float* h_ptr = h_next.data_ptr<float>();
+    float* halt_ptr = halt_probs.data_ptr<float>();
+    float* proto_ptr = proto.data_ptr<float>();
+    float* region_scale_ptr = region_scale_t.data_ptr<float>();
+    const float* p_ptr = p_c.data_ptr<float>();
+    const float* g_ptr = g_c.data_ptr<float>();
+    const int8_t* q_ptr = q_c.data_ptr<int8_t>();
+    const float* sc_ptr = sc_c.data_ptr<float>();
+    const int64_t* idx_ptr = idx_c.data_ptr<int64_t>();
+    const int64_t* inv_ptr = inv_c.data_ptr<int64_t>();
+    const float* mdna_ptr = mdna_c.data_ptr<float>();
+
+    const int64_t S = idx_c.numel();
+    const int64_t prefetch_d = std::max<int64_t>(1, prefetch_distance);
+    const float thermal = static_cast<float>(std::max(0.0, std::min(0.95, thermal_penalty)));
+    const float thermal_scale = 1.0f - 0.5f * thermal;
+    const float cycle_scale = static_cast<float>(std::max<int64_t>(1, h_cycles) * std::max<int64_t>(1, l_cycles));
+    const float eps = 1e-8f;
+
+    Perf::g_lgh_calls.fetch_add(1ULL, std::memory_order_relaxed);
+
+    // Build float prototype from Morton-ordered int8 manifold.
+    if (S > 0) {
+        for (int64_t s = 0; s < S; s++) {
+            const int64_t row = lgh_map_curve_row(idx_ptr[s], inv_ptr, N);
+            const int8_t* row_ptr = q_ptr + row * M;
+            const float row_scale = sc_ptr[row];
+            if (s + prefetch_d < S) {
+                const int64_t next_row = lgh_map_curve_row(idx_ptr[s + prefetch_d], inv_ptr, N);
+                const int8_t* next_ptr = q_ptr + next_row * M;
+                _mm_prefetch(reinterpret_cast<const char*>(next_ptr), _MM_HINT_T0);
+            }
+            for (int64_t m = 0; m < M; m++) {
+                proto_ptr[m] += static_cast<float>(row_ptr[m]) * row_scale;
+            }
+        }
+        const float inv_s = 1.0f / static_cast<float>(S);
+#ifdef __AVX512F
+        int64_t m = 0;
+        const __m512 inv = _mm512_set1_ps(inv_s);
+        for (; m + 16 <= M; m += 16) {
+            __m512 v = _mm512_loadu_ps(proto_ptr + m);
+            _mm512_storeu_ps(proto_ptr + m, _mm512_mul_ps(v, inv));
+        }
+        for (; m < M; m++) {
+            proto_ptr[m] *= inv_s;
+        }
+#else
+        for (int64_t m = 0; m < M; m++) {
+            proto_ptr[m] *= inv_s;
+        }
+#endif
+    }
+
+    std::vector<uint64_t> mdna_words(static_cast<size_t>(R), 0ULL);
+    for (int64_t r = 0; r < R; r++) {
+        mdna_words[static_cast<size_t>(r)] = lgh_region_mdna_word(mdna_ptr, L, R, r);
+        region_scale_ptr[r] = lgh_region_scale(g_ptr, mdna_ptr, L, R, r, thermal_scale);
+    }
+
+    std::vector<float> halt_acc(static_cast<size_t>(B * T), 0.0f);
+
+    for (int64_t b = 0; b < B; b++) {
+        for (int64_t t = 0; t < T; t++) {
+            const int64_t p_base = (b * T + t) * M;
+            for (int64_t r = 0; r < R; r++) {
+                const float scale = region_scale_ptr[r] * cycle_scale;
+                const int64_t out_base = ((b * T + t) * R + r) * M;
+                const uint64_t mdna_word = mdna_words[static_cast<size_t>(r)];
+#ifdef __AVX512F
+                const __m512 scale_v = _mm512_set1_ps(scale);
+                int64_t m = 0;
+                int64_t chunk = 0;
+                for (; m + 16 <= M; m += 16, chunk++) {
+                    __mmask16 k_mdna = lgh_mdna_mask16(mdna_word, chunk);
+                    if (!(scale > eps)) {
+                        k_mdna = static_cast<__mmask16>(0x0000);
+                    }
+                    __m512 p_v = _mm512_loadu_ps(p_ptr + p_base + m);
+                    __m512 proto_v = _mm512_loadu_ps(proto_ptr + m);
+                    __m512 merged = _mm512_add_ps(p_v, proto_v);
+                    __m512 gated = lgh_pulse_eval_avx512(merged, scale_v, k_mdna);
+                    _mm512_storeu_ps(out_ptr + out_base + m, gated);
+                    __m512 abs_v = _mm512_andnot_ps(_mm512_set1_ps(-0.0f), gated);
+                    halt_acc[static_cast<size_t>(b * T + t)] += _mm512_reduce_add_ps(abs_v);
+                }
+                for (; m < M; m++) {
+                    const float merged = p_ptr[p_base + m] + proto_ptr[m];
+                    const int bit = static_cast<int>((mdna_word >> (m & 63)) & 1ULL);
+                    const float v = ((scale > eps) && (bit != 0)) ? (merged * scale) : 0.0f;
+                    out_ptr[out_base + m] = v;
+                    halt_acc[static_cast<size_t>(b * T + t)] += std::abs(v);
+                }
+#else
+                for (int64_t m = 0; m < M; m++) {
+                    const float merged = p_ptr[p_base + m] + proto_ptr[m];
+                    const int bit = static_cast<int>((mdna_word >> (m & 63)) & 1ULL);
+                    const float v = ((scale > eps) && (bit != 0)) ? (merged * scale) : 0.0f;
+                    out_ptr[out_base + m] = v;
+                    halt_acc[static_cast<size_t>(b * T + t)] += std::abs(v);
+                }
+#endif
+            }
+        }
+    }
+
+    for (int64_t b = 0; b < B; b++) {
+        for (int64_t r = 0; r < R; r++) {
+            const int64_t src_base = ((b * T + (T - 1)) * R + r) * M;
+            for (int64_t l = 0; l < L; l++) {
+                const float gate_lr = std::max(0.0f, std::min(1.0f, g_ptr[l * R + r]));
+                const float mdna_lr = std::max(0.0f, std::min(1.0f, mdna_ptr[l * R + r]));
+                const float mix = std::max(0.0f, std::min(1.0f, gate_lr * mdna_lr * thermal_scale));
+                const float decay = 0.90f + 0.08f * (1.0f - mix);
+                const int64_t h_base = (((b * L + l) * R + r) * M);
+                const uint64_t mdna_word = mdna_words[static_cast<size_t>(r)];
+                const int mdna_active = (l < 64) ? static_cast<int>((mdna_word >> l) & 1ULL) : static_cast<int>(mix > eps);
+#ifdef __AVX512F
+                const __m512 decay_v = _mm512_set1_ps(decay);
+                const __m512 mix_v = _mm512_set1_ps(mix);
+                const __mmask16 k_mdna = ((mix > eps) && (mdna_active != 0))
+                    ? static_cast<__mmask16>(0xFFFF)
+                    : static_cast<__mmask16>(0x0000);
+                int64_t m = 0;
+                for (; m + 16 <= M; m += 16) {
+                    __m512 old_v = _mm512_loadu_ps(h_ptr + h_base + m);
+                    __m512 src_v = _mm512_loadu_ps(out_ptr + src_base + m);
+                    __m512 decayed = _mm512_mul_ps(old_v, decay_v);
+                    __m512 injected = lgh_pulse_eval_avx512(src_v, mix_v, k_mdna);
+                    _mm512_storeu_ps(h_ptr + h_base + m, _mm512_add_ps(decayed, injected));
+                }
+                for (; m < M; m++) {
+                    const float old_v = h_ptr[h_base + m];
+                    const float src_v = out_ptr[src_base + m];
+                    const int bit = mdna_active != 0;
+                    h_ptr[h_base + m] = (decay * old_v) + ((bit != 0) ? (mix * src_v) : 0.0f);
+                }
+#else
+                for (int64_t m = 0; m < M; m++) {
+                    const float old_v = h_ptr[h_base + m];
+                    const float src_v = out_ptr[src_base + m];
+                    const int bit = mdna_active != 0;
+                    h_ptr[h_base + m] = (decay * old_v) + ((bit != 0) ? (mix * src_v) : 0.0f);
+                }
+#endif
+            }
+        }
+    }
+
+    const float denom = static_cast<float>(std::max<int64_t>(1, R * M));
+    const float halt_denom = static_cast<float>(std::max(1e-6, halt_threshold));
+    for (int64_t bt = 0; bt < B * T; bt++) {
+        const float mean_abs = halt_acc[static_cast<size_t>(bt)] / denom;
+        const float raw = mean_abs / (mean_abs + halt_denom + 1e-6f);
+        const float cool = std::max(0.0f, std::min(1.0f, raw * (1.0f - 0.35f * thermal)));
+        halt_ptr[bt] = cool;
+    }
+
+    const long double bt_ld = static_cast<long double>(B) * static_cast<long double>(T);
+    const long double r_ld = static_cast<long double>(R);
+    const long double m_ld = static_cast<long double>(M);
+    const long double l_ld = static_cast<long double>(L);
+    const long double flops = bt_ld * r_ld * m_ld * 4.0L + bt_ld * l_ld * r_ld * m_ld * 3.0L;
+    const long double bytes = bt_ld * r_ld * m_ld * 13.0L + bt_ld * l_ld * r_ld * m_ld * 8.0L;
     Perf::add(Perf::sat_from_ld(flops), Perf::sat_from_ld(bytes));
 
     auto out_5d = out.view({B, T, R, D, C});
@@ -2699,5 +3016,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("ademamix_update", &ademamix_update);
     m.def("batched_ademamix_update", &batched_ademamix_update);
     m.def("geometric_manifold_forward_avx512", &geometric_manifold_forward_avx512);
+    m.def("geometric_manifold_forward_avx512_int8", &geometric_manifold_forward_avx512_int8);
     m.def("fused_cognitive_cycle", &_fused_cognitive_cycle_impl);
 }
