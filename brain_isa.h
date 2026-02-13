@@ -119,8 +119,33 @@
 #define NIS_SIMD_WIDTH 16 // 512 bits
 #define NIS_ALIGNMENT  64
 
-#define NIS_SPARSITY_THRESHOLD  0.5f
-#define NIS_MAX_LOG_ENTRIES     1000
-#define NIS_EPSILON             1e-8f
+/**
+ * Metadata & Runtime Strategy (Bio-BIOS)
+ */
+#define NIS_TRAIN_SAMPLES_PER_EPOCH 40000
+#define NIS_VAL_SAMPLES_PER_EPOCH   4000
+#define NIS_DREAM_REPLAY_BATCHES    2
+#define NIS_MES_ENABLED             1
+#define NIS_COHERENCE_WEIGHT        0.01f
+#define NIS_AGC_CLIP_FACTOR         0.1f
+
+#define NIS_CPP_OMP_THREADS         8
+#define NIS_TORCH_NUM_THREADS       2
+#define NIS_TORCH_INTEROP_THREADS   1
+
+#define NIS_TRAIN_LOSS_EMA_DECAY    0.98f
+#define NIS_SPARSITY_LOG_EVERY      50
+#define NIS_KNOWLEDGE_GAMMA         0.01f
+#define NIS_IMPORTANCE_EVERY        200
+#define NIS_IMPORTANCE_RATIO        0.3f
+#define NIS_GATE_UPDATE_EVERY       50
+#define NIS_RAM_PRUNE_FRACTION      0.2f
+#define NIS_RAM_CRITICAL_THRESHOLD  0.95f
+#define NIS_SLEEP_INTERVAL_STEPS    1000
+
+#define NIS_SPARSITY_THRESHOLD      0.5f
+#define NIS_MAX_LOG_ENTRIES         1000
+#define NIS_EPSILON                 1e-8f
+#define NIS_WARM_UP_STEPS           2000.0f
 
 #endif // BRAIN_ISA_H
