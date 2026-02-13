@@ -9,7 +9,7 @@ import random
 import yaml
 import os
 from genome import Genome
-from morton import MortonBuffer
+# from morton import MortonBuffer  <-- Removed
 import math
 from types import SimpleNamespace
 from optimizers import AdEMAMix
@@ -56,31 +56,12 @@ def _cpp_try(op_name, *args, tensors=None):
 Config = cpp_loader
 
 # Critical Python-side Runtime Extensions
-if not hasattr(Config, 'DEVICE'):
-    # Restore Device Detection logic
-    _YAML_PATH = 'conf/config.yaml'
-    _RUNTIME_DATA = {}
-    if os.path.exists(_YAML_PATH):
-        with open(_YAML_PATH, 'r') as f:
-            _RUNTIME_DATA = yaml.safe_load(f).get('runtime', {})
-    
-    _STRICT_CPU = _RUNTIME_DATA.get('strict_cpu_only', True)
-    _DEV_REQ = str(_RUNTIME_DATA.get('device', 'auto')).lower()
-    
-    if _STRICT_CPU:
-        Config.DEVICE = torch.device('cpu')
-    else:
-        if _DEV_REQ in ('cpu', 'cuda'):
-            Config.DEVICE = torch.device('cpu') if (_DEV_REQ == 'cuda' and not torch.cuda.is_available()) else torch.device(_DEV_REQ)
-        else:
-            Config.DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-# Authority synced from BIOS (brain_isa.h)
+# Authority synced from BIOS (brain_isa.h) via Accelerator
 L = Config.L
 R = Config.R
 D = Config.WORKING_DIM
 C = Config.C
-DEVICE = Config.DEVICE
+DEVICE = getattr(Config, 'DEVICE', torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
 
 # ---------------------------
 # Modern Layers (Recurrent Cognitive Architecture)
@@ -465,13 +446,10 @@ class VNNILinear(nn.Module):
                 new_shape = list(original_shape[:-1]) + [-1]
                 y = y.reshape(new_shape)
             return y
-        
-        # Reset quantization flag if we return to training
         if self.training:
-            self._is_quantized = False
+            return F.linear(x, self.weight, self.bias)
         
-        # Fallback to standard Torch path (MKL/OneDNN)
-        return F.linear(x, self.weight, self.bias)
+        raise RuntimeError("VNNILinear: C++ kernels (quantized_matmul) not ready in inference mode.")
 
 class RAMTupleLayer(nn.Module):
     def __init__(self, M, K, D_in, device=DEVICE):
@@ -612,7 +590,7 @@ class CognitiveOrganism(BaseCognitiveModule):
             curve_wrap=bool(Config.LGH_CURVE_WRAP),
             mask_min_keep=float(Config.LGH_MASK_MIN_KEEP),
             mask_max_keep=float(Config.LGH_MASK_MAX_KEEP),
-            morton_depth=max(1, int(Config.LGH_MORTON_DEPTH)),
+            morton_depth=max(1, int(getattr(Config, 'MEMORY_DEPTH', 5))),
             prefetch_distance=max(1, int(Config.LGH_PREFETCH_DISTANCE)),
             align_multiple=max(1, int(getattr(Config, 'LGH_ALIGN_MULTIPLE', 64))),
             temporal_bins=max(1, int(getattr(Config, 'LGH_TEMPORAL_BINS', 16))),
@@ -975,28 +953,28 @@ class CognitiveOrganism(BaseCognitiveModule):
         return self.importance_threshold_ema
 
     def _init_manifold(self):
-        self._lgh_shape3d = (self.L, self.R, self.lgh_cfg.morton_depth)
-        self._lgh_morton = MortonBuffer(
-            self._lgh_shape3d,
-            device=self.device,
-            align_multiple=self.lgh_cfg.align_multiple,
-            temporal_bins=self.lgh_cfg.temporal_bins
-        )
-        self._lgh_morton.set_temporal_bins(self.lgh_cfg.temporal_bins)
+        # Firmware-Driven Morton Curve Generation
         if self.cfg_lgh_enabled:
-            n3 = int(self._lgh_morton.size)
+            # Generate Base Morton Order from C++ Firmware (replaces MortonBuffer)
+            full_order = cpp_loader.make_morton_order(
+                self.L, 
+                self.R, 
+                self.lgh_cfg.morton_depth, 
+                self.lgh_cfg.align_multiple
+            )
+            self._lgh_order = full_order.to(self.device)
+            
+            # Total size including padding
+            n3 = int(self._lgh_order.numel())
             n = int(n3 * self.lgh_cfg.temporal_bins)
             m = int(self.d_s2 * self.C)
             self.lgh_manifold_morton = nn.Parameter(torch.randn(n, m, device=self.device) * 0.01)
-            curve_len = min(self.lgh_cfg.curve_length, int(self._lgh_morton.size_original))
-            curve_orig = self._lgh_morton.curve_segment_original(
-                0,
-                curve_len,
-                wrap=self.lgh_cfg.curve_wrap,
-                delta_t=0,
-                temporal_bins=self.lgh_cfg.temporal_bins,
-                fold_alpha=self.lgh_cfg.temporal_fold_alpha
-            )
+            
+            # Slice initial curve segment (delta_t=0)
+            # curve_segment_original(0, len) logic: take first 'len' indices
+            curve_len = min(self.lgh_cfg.curve_length, n3)
+            curve_orig = self._lgh_order[:curve_len]
+            
             self.register_buffer('_lgh_curve_indices', curve_orig.to(dtype=torch.long))
             self.register_buffer('_lgh_prefetch_curve_indices', curve_orig.to(dtype=torch.long))
             self.register_buffer('_lgh_mdna_mask', torch.ones(self.L, self.R, dtype=torch.float32, device=self.device))

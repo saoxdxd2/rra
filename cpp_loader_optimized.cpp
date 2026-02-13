@@ -26,13 +26,6 @@ namespace Config {
     constexpr float MAX_RELu = 10.0f; // Clip value
 }
 
-/**
- * NIS Firmware constants are now the authoritative config.
- * init_nis_config is deprecated as we shift to Total Neural Unification via brain_isa.h.
- */
-void init_nis_config(py::dict yaml_cfg) {
-    // Deprecated: Hardware constants are now fixed in brain_isa.h
-}
 namespace py = pybind11;
 
 // =========================================================================
@@ -3440,7 +3433,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("set_perf_counters_enabled", &set_perf_counters_enabled);
     m.def("reset_perf_counters", &reset_perf_counters);
     m.def("get_perf_counters", &get_perf_counters);
-    m.def("init_nis_config", &init_nis_config);
 
     // NIS_Config bindings removed - fully migrated to brain_isa.h firmware exports below.
     m.def("ademamix_update", &ademamix_update);
