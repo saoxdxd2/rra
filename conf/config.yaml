@@ -91,6 +91,7 @@ runtime:
   lgh_thermal_freq_min_ghz: 3.0 # Penalize genomes that trigger downclock below this target.
   lgh_thermal_ema_decay: 0.95 # EMA smoothing for thermal pressure signal.
   lgh_thermal_penalty_weight: 0.25 # Weight of thermal penalty in evolution fitness.
+  lgh_thermal_sample_every_s: 2.0 # Thermal watchdog sampling cadence.
   strict_cpu_only: true # This codebase uses CPU C++ kernels as the production path.
   virtual_lab_enabled: false # Disable heavy benchmark/event logging by default for training runs.
   preflight_enabled: true # Run a startup smoke-check before long training.

@@ -175,9 +175,11 @@ class EvolutionPolicy:
         val_loss = metrics.get('val_loss', 1.0)
         cost_step = metrics.get('cost_step', 0.0)
         thermal_penalty = metrics.get('thermal_penalty', 0.0)
+        thermal_status = metrics.get('thermal_status', {}) if isinstance(metrics.get('thermal_status', {}), dict) else {}
+        throttled = bool(thermal_status.get('throttled', False))
         
         if val_loss > 1.5: return "TASK_FAILURE"
-        if thermal_penalty > 0.25: return "THERMAL_FAILURE"
+        if throttled or thermal_penalty > 0.25: return "THERMAL_FAILURE"
         # Enterprise tuning: Lower threshold for energy failure to force efficiency early?
         if cost_step > 0.5: return "ENERGY_FAILURE" 
         return "STAGNATION"
@@ -190,7 +192,8 @@ class EvolutionPolicy:
         if stress_dir == "TASK_FAILURE":
             return 'bdnf', 1.0
         elif stress_dir == "THERMAL_FAILURE":
-            return 'metabolic_efficiency', 1.0
+            # Favor cooler sparse masks under heat stress.
+            return 'mask_sparsity_bias', 1.0
         elif stress_dir == "ENERGY_FAILURE":
             return 'fkbp5', 1.0
         else:
@@ -258,6 +261,20 @@ class Genome: # Renamed from GenomeEngine to maintain compat with organism.py
             return self.get_expression(self.state.GENE_ROLES[role])
         return 0.5
 
+    def next_curve_anchor(self, total_nodes: int, hint: int = 0) -> int:
+        total = max(1, int(total_nodes))
+        base = int(round(self.curve_trajectory * max(0, total - 1)))
+        stride = max(1, int(round(1.0 + 7.0 * max(0.0, min(1.5, self.metabolic_efficiency)))))
+        return int((base + (self.state.generation * stride) + int(hint)) % total)
+
+    def build_curve_chain(self, total_nodes: int, length: int, hint: int = 0) -> List[int]:
+        total = max(1, int(total_nodes))
+        length = max(1, min(int(length), total))
+        start = self.next_curve_anchor(total, hint=hint)
+        trajectory = max(0.0, min(1.0, self.curve_trajectory))
+        step = max(1, int(round(1 + trajectory * 5)))
+        return [int((start + i * step) % total) for i in range(length)]
+
     # --- Execution Logic ---
     
     def _execute_mutation(self, stress_dir: str):
@@ -317,7 +334,14 @@ class Genome: # Renamed from GenomeEngine to maintain compat with organism.py
         
         val_loss = performance_metrics.get('val_loss', 100.0)
         thermal_penalty = max(0.0, float(performance_metrics.get('thermal_penalty', 0.0)))
-        effective_loss = val_loss + self.policy.config.thermal_penalty_weight * thermal_penalty
+        thermal_status = performance_metrics.get('thermal_status', {})
+        if not isinstance(thermal_status, dict):
+            thermal_status = {}
+        throttled = bool(thermal_status.get('throttled', False))
+        freq_ghz = float(thermal_status.get('freq_ghz', 0.0))
+        dense_penalty = max(0.0, 1.0 - float(self.mask_sparsity_bias))
+        thermal_weight = self.policy.config.thermal_penalty_weight * (2.0 if throttled else 1.0)
+        effective_loss = val_loss + thermal_weight * (thermal_penalty + dense_penalty)
         
         # 1. Improvement Branch
         if effective_loss < self.state.best_loss:
@@ -331,8 +355,23 @@ class Genome: # Renamed from GenomeEngine to maintain compat with organism.py
                 torch.save(model.state_dict(), self.best_checkpoint_path)
             
             self.patience_counter = 0
-            self.logger.emit("improvement", {"loss": val_loss, "effective_loss": effective_loss, "thermal_penalty": thermal_penalty, "health": self.state.health})
-            print(f">>> GENOME: Improvement! Gen {self.state.generation} | Loss: {val_loss:.4f} | Effective: {effective_loss:.4f} | Thermal: {thermal_penalty:.4f}")
+            self.logger.emit(
+                "improvement",
+                {
+                    "loss": val_loss,
+                    "effective_loss": effective_loss,
+                    "thermal_penalty": thermal_penalty,
+                    "dense_penalty": dense_penalty,
+                    "throttled": throttled,
+                    "freq_ghz": freq_ghz,
+                    "health": self.state.health
+                }
+            )
+            print(
+                f">>> GENOME: Improvement! Gen {self.state.generation} | Loss: {val_loss:.4f} "
+                f"| Effective: {effective_loss:.4f} | Thermal: {thermal_penalty:.4f} "
+                f"| DensePenalty: {dense_penalty:.4f} | Throttled={throttled}"
+            )
             return True
             
         # 2. Stagnation Branch

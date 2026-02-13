@@ -772,6 +772,12 @@ class CognitiveOrganism(BaseCognitiveModule):
         
         # System 2 Readout (Bit-Level)
         self.readout = VNNILinear(R * self.d_s2 * C, 8).to(self.device)
+        self.curve_index_head = nn.Linear(self.d_s1 * C, 1).to(self.device)
+        self.hyper_control_head = nn.Sequential(
+            nn.Linear(self.d_s1 * C, 128),
+            nn.GELU(),
+            nn.Linear(128, self.L * self.R)
+        ).to(self.device)
         
         # --- COGNITIVE RESONANCE: Surprise Head (World Model) ---
         # Predicts sensory latent (d_s1 * C) from internal state (d_s2 * C)
@@ -819,24 +825,15 @@ class CognitiveOrganism(BaseCognitiveModule):
             self.max_batch_size, L, R, self.d_s2, C, 
             device=device
         ).contiguous()
-        self._lgh_shape3d = (self.L, self.R, self.lgh_cfg.morton_depth)
-        self._lgh_morton = MortonBuffer(self._lgh_shape3d, device=self.device)
-        if self.cfg_lgh_enabled:
-            self.lgh_manifold = nn.Parameter(
-                torch.randn(self.L, self.R, self.lgh_cfg.morton_depth, self.d_s2 * self.C, device=self.device) * 0.01
-            )
-            curve_len = min(self.lgh_cfg.curve_length, self._lgh_morton.size)
-            self.register_buffer(
-                '_lgh_curve_indices',
-                self._lgh_morton.curve_segment(0, curve_len, wrap=self.lgh_cfg.curve_wrap).to(dtype=torch.long),
-            )
-            self.register_buffer('_lgh_mdna_mask', torch.ones(self.L, self.R, dtype=torch.float32, device=self.device))
-        else:
-            self.lgh_manifold = None
-            self.register_buffer('_lgh_curve_indices', torch.empty(0, dtype=torch.long, device=self.device))
-            self.register_buffer('_lgh_mdna_mask', torch.empty(0, dtype=torch.float32, device=self.device))
+        self._init_manifold()
         self.register_buffer('_lgh_thermal_penalty_ema', torch.tensor(0.0, dtype=torch.float32, device=self.device))
         self.register_buffer('_lgh_last_freq_ghz', torch.tensor(0.0, dtype=torch.float32, device=self.device))
+        self.register_buffer('_lgh_mdna_modulation', torch.ones(self.L, self.R, dtype=torch.float32, device=self.device))
+        self.register_buffer('_lgh_last_curve_anchor', torch.tensor(0, dtype=torch.long, device=self.device))
+        self._lgh_q_step = -1
+        self._lgh_q_cache = None
+        self._lgh_q_scale = None
+        self._lgh_use_int8 = bool(getattr(Config, 'RAM_INT8_INFER', True))
         
         self.rope = RotaryEmbedding(self.d_s2 * C, device=device)
         self.survival = SurvivalController(L, R, device=self.device)
@@ -982,6 +979,8 @@ class CognitiveOrganism(BaseCognitiveModule):
                 print(">>> LGH core enabled: geometric_manifold_forward_avx512 is available.")
             else:
                 print(">>> LGH requested, but kernel is missing in current extension build; falling back to forward_stack_io.")
+            if self._lgh_use_int8:
+                print(">>> LGH int8 manifold mode enabled (RAM_INT8_INFER=true).")
         if not self.exec_cfg.use_forward_stack:
             raise RuntimeError("USE_FORWARD_STACK must be enabled; no Python reasoning fallback path exists.")
         print(
@@ -991,6 +990,26 @@ class CognitiveOrganism(BaseCognitiveModule):
             f"cold_dense={self.episodic_memory.cold.dense_mode}, "
             f"fallback={self.episodic_cfg.hybrid_fallback_threshold:.2f}"
         )
+
+    def _init_manifold(self):
+        self._lgh_shape3d = (self.L, self.R, self.lgh_cfg.morton_depth)
+        self._lgh_morton = MortonBuffer(self._lgh_shape3d, device=self.device)
+        if self.cfg_lgh_enabled:
+            n = int(self._lgh_morton.size)
+            m = int(self.d_s2 * self.C)
+            self.lgh_manifold_morton = nn.Parameter(torch.randn(n, m, device=self.device) * 0.01)
+            curve_len = min(self.lgh_cfg.curve_length, n)
+            curve_orig = self._lgh_morton.curve_segment_original(0, curve_len, wrap=self.lgh_cfg.curve_wrap)
+            self.register_buffer('_lgh_curve_indices', curve_orig.to(dtype=torch.long))
+            self.register_buffer('_lgh_mdna_mask', torch.ones(self.L, self.R, dtype=torch.float32, device=self.device))
+            self.register_buffer('_lgh_morton_order', self._lgh_morton.order.clone().to(dtype=torch.long))
+            self.register_buffer('_lgh_inverse_order', self._lgh_morton.inverse_order.clone().to(dtype=torch.long))
+        else:
+            self.lgh_manifold_morton = None
+            self.register_buffer('_lgh_curve_indices', torch.empty(0, dtype=torch.long, device=self.device))
+            self.register_buffer('_lgh_mdna_mask', torch.empty(0, dtype=torch.float32, device=self.device))
+            self.register_buffer('_lgh_morton_order', torch.empty(0, dtype=torch.long, device=self.device))
+            self.register_buffer('_lgh_inverse_order', torch.empty(0, dtype=torch.long, device=self.device))
     
     def _sync_stacked_params(self):
         """
@@ -1665,29 +1684,76 @@ class CognitiveOrganism(BaseCognitiveModule):
         return True, z_L, H_next_fused, halt_probs_cycle
 
     def _lgh_morton_manifold(self):
-        if (not self.cfg_lgh_enabled) or (self.lgh_manifold is None):
+        if (not self.cfg_lgh_enabled) or (self.lgh_manifold_morton is None):
             return None
-        rows = self.lgh_manifold.reshape(self._lgh_morton.size, self.d_s2 * self.C)
-        return self._lgh_morton.reorder_rows(rows).contiguous()
+        return self.lgh_manifold_morton.contiguous()
 
-    def _refresh_lgh_curve_from_genome(self):
+    def _quantize_lgh_manifold(self):
+        manifold = self._lgh_morton_manifold()
+        if manifold is None or manifold.numel() == 0:
+            return None, None
+        step = int(self.step_counter.item())
+        if self._lgh_q_cache is not None and self._lgh_q_scale is not None and self._lgh_q_step == step:
+            return self._lgh_q_cache, self._lgh_q_scale
+        with torch.no_grad():
+            absmax = manifold.abs().amax(dim=1).clamp_min(1e-8)
+            scale = absmax / 127.0
+            q = torch.clamp(torch.round(manifold / scale.unsqueeze(-1)), -127, 127).to(torch.int8).contiguous()
+        self._lgh_q_step = step
+        self._lgh_q_cache = q
+        self._lgh_q_scale = scale.contiguous()
+        return self._lgh_q_cache, self._lgh_q_scale
+
+    def _predict_curve_chain(self, p_s1):
         if (not self.cfg_lgh_enabled) or self._lgh_curve_indices.numel() == 0:
+            return None
+        if p_s1.dim() != 3:
+            return None
+        with torch.no_grad():
+            s1_anchor = p_s1[:, -1, :].float()
+            pred = torch.sigmoid(self.curve_index_head(s1_anchor)).mean()
+            pred_start = int(round(float(pred.item()) * max(0, self._lgh_morton.size - 1)))
+            self._lgh_last_curve_anchor.fill_(pred_start)
+            if hasattr(self.genome, 'build_curve_chain'):
+                chain = self.genome.build_curve_chain(
+                    total_nodes=self._lgh_morton.size,
+                    length=int(self._lgh_curve_indices.numel()),
+                    hint=pred_start
+                )
+                # Convert Morton positions to original topology ids for kernel mapping via inverse_order.
+                chain_morton = torch.as_tensor(chain, dtype=torch.long, device=self.device)
+                chain_orig = self._lgh_morton.morton_to_original(chain_morton)
+                return chain_orig
+        return None
+
+    def _refresh_lgh_curve_from_genome(self, predicted_curve=None):
+        if (not self.cfg_lgh_enabled) or self._lgh_curve_indices.numel() == 0:
+            return
+        if isinstance(predicted_curve, torch.Tensor) and predicted_curve.numel() == self._lgh_curve_indices.numel():
+            self._lgh_curve_indices.copy_(predicted_curve.to(self._lgh_curve_indices.device, dtype=torch.long))
             return
         curve_gene = float(getattr(self, 'curve_trajectory_gene', 0.5))
         curve_gene = max(0.0, min(1.0, curve_gene))
-        start = int(round(curve_gene * max(0, self._lgh_morton.size - 1)))
-        new_curve = self._lgh_morton.curve_segment(
+        if hasattr(self.genome, 'next_curve_anchor'):
+            start = int(self.genome.next_curve_anchor(self._lgh_morton.size))
+        else:
+            start = int(round(curve_gene * max(0, self._lgh_morton.size - 1)))
+        new_curve = self._lgh_morton.curve_segment_original(
             start,
             int(self._lgh_curve_indices.numel()),
             wrap=self.lgh_cfg.curve_wrap
         )
         self._lgh_curve_indices.copy_(new_curve.to(self._lgh_curve_indices.device, dtype=torch.long))
 
-    def _refresh_lgh_mdna_mask(self, gate):
+    def _refresh_lgh_mdna_mask(self, gate, modulation=None):
         if (not self.cfg_lgh_enabled) or self._lgh_mdna_mask.numel() == 0:
             return
         gate_2d = gate.reshape(self.L, self.R) if gate.dim() > 2 else gate
         gate_2d = torch.nan_to_num(gate_2d.float(), nan=0.0, posinf=1.0, neginf=0.0)
+        if isinstance(modulation, torch.Tensor) and modulation.shape == gate_2d.shape:
+            mod = torch.nan_to_num(modulation.float(), nan=1.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+            self._lgh_mdna_modulation.copy_(mod)
+            gate_2d = gate_2d * (0.5 + 0.5 * mod)
         min_keep = max(0.01, min(1.0, self.lgh_cfg.mask_min_keep))
         max_keep = max(min_keep, min(1.0, self.lgh_cfg.mask_max_keep))
         sparsity_bias = float(getattr(self, 'mask_sparsity_bias', 0.5))
@@ -1717,10 +1783,10 @@ class CognitiveOrganism(BaseCognitiveModule):
     def get_thermal_penalty(self):
         return float(self._update_thermal_penalty())
 
-    def _run_lgh_cycle(self, p_brain, H, gate, B, T, h_cycles, l_cycles, dyn_threshold):
+    def _run_lgh_cycle(self, p_brain, H, gate, B, T, h_cycles, l_cycles, dyn_threshold, p_s1=None):
         if not (self.cfg_lgh_enabled and self.lgh_cfg.replace_forward_stack):
             return False, None, None, None
-        if self.lgh_manifold is None or self._lgh_curve_indices.numel() == 0:
+        if self.lgh_manifold_morton is None or self._lgh_curve_indices.numel() == 0:
             return False, None, None, None
 
         manifold_morton = self._lgh_morton_manifold()
@@ -1728,30 +1794,62 @@ class CognitiveOrganism(BaseCognitiveModule):
             return False, None, None, None
         gate_cpp = gate.reshape(self.L, self.R) if gate.dim() > 2 else gate
         gate_cpp = gate_cpp.float().contiguous()
-        self._refresh_lgh_mdna_mask(gate_cpp)
+        p_curve = p_s1 if isinstance(p_s1, torch.Tensor) else p_brain[:, :, :self.d_s1 * self.C]
+        pred_curve = self._predict_curve_chain(p_curve)
+        self._refresh_lgh_curve_from_genome(predicted_curve=pred_curve)
+        s1_anchor = p_curve[:, -1, :].detach()
+        hyper_mod = torch.sigmoid(self.hyper_control_head(s1_anchor)).mean(dim=0).view(self.L, self.R)
+        self._refresh_lgh_mdna_mask(gate_cpp, modulation=hyper_mod)
         thermal_penalty = self.get_thermal_penalty()
+        curve_idx = self._lgh_curve_indices.contiguous()
+        inv_order = self._lgh_inverse_order.contiguous()
 
-        if not _cpp_has(
-            'geometric_manifold_forward_avx512',
-            p_brain, H, gate_cpp, manifold_morton, self._lgh_curve_indices, self._lgh_mdna_mask
-        ):
-            return False, None, None, None
+        out = None
+        if self._lgh_use_int8 and _cpp_has('geometric_manifold_forward_avx512_int8'):
+            manifold_q, manifold_scale = self._quantize_lgh_manifold()
+            if manifold_q is not None and manifold_scale is not None and _cpp_ready(
+                p_brain, H, gate_cpp, manifold_q, manifold_scale, curve_idx, inv_order, self._lgh_mdna_mask
+            ):
+                out = _cpp_try(
+                    'geometric_manifold_forward_avx512_int8',
+                    p_brain.float().contiguous(),
+                    H.contiguous(),
+                    gate_cpp,
+                    manifold_q,
+                    manifold_scale.float().contiguous(),
+                    curve_idx,
+                    inv_order,
+                    self._lgh_mdna_mask.contiguous(),
+                    int(h_cycles),
+                    int(l_cycles),
+                    float(dyn_threshold),
+                    int(self.lgh_cfg.prefetch_distance),
+                    float(thermal_penalty),
+                    tensors=(p_brain, H, gate_cpp, manifold_q, manifold_scale, curve_idx, inv_order, self._lgh_mdna_mask)
+                )
 
-        out = _cpp_try(
-            'geometric_manifold_forward_avx512',
-            p_brain.float().contiguous(),
-            H.contiguous(),
-            gate_cpp,
-            manifold_morton.float().contiguous(),
-            self._lgh_curve_indices.contiguous(),
-            self._lgh_mdna_mask.contiguous(),
-            int(h_cycles),
-            int(l_cycles),
-            float(dyn_threshold),
-            int(self.lgh_cfg.prefetch_distance),
-            float(thermal_penalty),
-            tensors=(p_brain, H, gate_cpp, manifold_morton, self._lgh_curve_indices, self._lgh_mdna_mask)
-        )
+        if out is None:
+            if not _cpp_has(
+                'geometric_manifold_forward_avx512',
+                p_brain, H, gate_cpp, manifold_morton, curve_idx, inv_order, self._lgh_mdna_mask
+            ):
+                return False, None, None, None
+            out = _cpp_try(
+                'geometric_manifold_forward_avx512',
+                p_brain.float().contiguous(),
+                H.contiguous(),
+                gate_cpp,
+                manifold_morton.float().contiguous(),
+                curve_idx,
+                inv_order,
+                self._lgh_mdna_mask.contiguous(),
+                int(h_cycles),
+                int(l_cycles),
+                float(dyn_threshold),
+                int(self.lgh_cfg.prefetch_distance),
+                float(thermal_penalty),
+                tensors=(p_brain, H, gate_cpp, manifold_morton, curve_idx, inv_order, self._lgh_mdna_mask)
+            )
         if not isinstance(out, (list, tuple)) or len(out) != 3:
             return False, None, None, None
 
@@ -1907,7 +2005,7 @@ class CognitiveOrganism(BaseCognitiveModule):
             h_cycles_used = 0.0
         else:
             lgh_ok, z_L_lgh, H_next_lgh, halting_probability_lgh = self._run_lgh_cycle(
-                p_brain, H, gate, B, T, h_cycles_cfg, l_cycles_cfg, dyn_threshold
+                p_brain, H, gate, B, T, h_cycles_cfg, l_cycles_cfg, dyn_threshold, p_s1=p
             )
             if lgh_ok:
                 z_L = z_L_lgh

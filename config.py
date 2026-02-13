@@ -228,6 +228,7 @@ class Config:
     LGH_THERMAL_FREQ_MIN_GHZ = float(_CONFIG_DATA.get('runtime', {}).get('lgh_thermal_freq_min_ghz', 3.0))
     LGH_THERMAL_EMA_DECAY = float(_CONFIG_DATA.get('runtime', {}).get('lgh_thermal_ema_decay', 0.95))
     LGH_THERMAL_PENALTY_WEIGHT = float(_CONFIG_DATA.get('runtime', {}).get('lgh_thermal_penalty_weight', 0.25))
+    LGH_THERMAL_SAMPLE_EVERY_S = float(_CONFIG_DATA.get('runtime', {}).get('lgh_thermal_sample_every_s', 2.0))
     RUNTIME_DEVICE = str(_CONFIG_DATA.get('runtime', {}).get('device', 'auto')).lower()
     STRICT_CPU_ONLY = bool(_CONFIG_DATA.get('runtime', {}).get('strict_cpu_only', True))
     VIRTUAL_LAB_ENABLED = bool(_CONFIG_DATA.get('runtime', {}).get('virtual_lab_enabled', False))

@@ -36,6 +36,14 @@ class MortonBuffer:
         self.inverse_order[self.order] = torch.arange(self.order.numel(), device=self.device)
         self.size = int(self.order.numel())
 
+    def morton_to_original(self, morton_indices: torch.Tensor) -> torch.Tensor:
+        morton_indices = morton_indices.to(dtype=torch.long, device=self.device)
+        return self.order[morton_indices]
+
+    def original_to_morton(self, original_indices: torch.Tensor) -> torch.Tensor:
+        original_indices = original_indices.to(dtype=torch.long, device=self.device)
+        return self.inverse_order[original_indices]
+
     def reorder_rows(self, rows: torch.Tensor) -> torch.Tensor:
         if rows.size(0) != self.size:
             raise ValueError(f"Expected first dim={self.size}, got {rows.size(0)}")
@@ -76,3 +84,11 @@ class MortonBuffer:
                 pad = torch.full((length - idx.numel(),), hi - 1, device=self.device, dtype=torch.long)
                 idx = torch.cat([idx, pad], dim=0)
         return idx
+
+    def curve_segment_original(self, start: int, length: int, wrap=True) -> torch.Tensor:
+        """
+        Returns a curve segment encoded in original (topology) row indices.
+        Kernel can map them back to Morton rows using inverse_order.
+        """
+        morton_idx = self.curve_segment(start, length, wrap=wrap)
+        return self.morton_to_original(morton_idx)

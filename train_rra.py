@@ -256,6 +256,57 @@ class TrainingWatchdog(threading.Thread):
                 
             time.sleep(5)
 
+
+class ThermalWatchdog(threading.Thread):
+    def __init__(self, min_freq_ghz=3.0, sample_every_s=2.0):
+        super().__init__(daemon=True)
+        self.min_freq_ghz = max(0.1, float(min_freq_ghz))
+        self.sample_every_s = max(0.25, float(sample_every_s))
+        self.running = True
+        self.current_freq_ghz = 0.0
+        self.current_temp_c = None
+        self.throttled = False
+        self._lock = threading.Lock()
+
+    def snapshot(self):
+        with self._lock:
+            return {
+                'freq_ghz': float(self.current_freq_ghz),
+                'temp_c': None if self.current_temp_c is None else float(self.current_temp_c),
+                'throttled': bool(self.throttled),
+            }
+
+    def run(self):
+        while self.running:
+            freq_ghz = 0.0
+            temp_c = None
+            try:
+                freq = psutil.cpu_freq()
+                if freq is not None and getattr(freq, 'current', None) is not None:
+                    freq_ghz = max(0.0, float(freq.current) / 1000.0)
+            except Exception:
+                freq_ghz = 0.0
+
+            try:
+                temps = psutil.sensors_temperatures(fahrenheit=False)
+                if isinstance(temps, dict) and temps:
+                    vals = []
+                    for _, entries in temps.items():
+                        for e in entries:
+                            if getattr(e, 'current', None) is not None:
+                                vals.append(float(e.current))
+                    if vals:
+                        temp_c = max(vals)
+            except Exception:
+                temp_c = None
+
+            with self._lock:
+                self.current_freq_ghz = freq_ghz
+                self.current_temp_c = temp_c
+                self.throttled = bool(freq_ghz > 0.0 and freq_ghz < self.min_freq_ghz)
+
+            time.sleep(self.sample_every_s)
+
 # --- SETTINGS ---
 CHECKPOINT_DIR = "checkpoints"
 DATA_PATH = "."
@@ -591,6 +642,9 @@ class RRATrainer:
             genome_step_update_every=max(0, int(getattr(Config, 'GENOME_STEP_UPDATE_EVERY', 5000))),
             train_loss_ema_decay=float(getattr(Config, 'TRAIN_LOSS_EMA_DECAY', 0.98)),
             sparsity_log_every=max(1, int(getattr(Config, 'SPARSITY_LOG_EVERY', 50))),
+            thermal_freq_min_ghz=float(getattr(Config, 'LGH_THERMAL_FREQ_MIN_GHZ', 3.0)),
+            thermal_sample_every_s=float(getattr(Config, 'LGH_THERMAL_SAMPLE_EVERY_S', 2.0)),
+            thermal_penalty_weight=float(getattr(Config, 'LGH_THERMAL_PENALTY_WEIGHT', 0.25)),
         )
         
         # Use AdEMAMix optimizer with Omega-linked dual-momentum
@@ -622,6 +676,11 @@ class RRATrainer:
         # Start Watchdog
         self.watchdog = TrainingWatchdog(self)
         self.watchdog.start()
+        self.thermal_watchdog = ThermalWatchdog(
+            min_freq_ghz=self.cfg.thermal_freq_min_ghz,
+            sample_every_s=self.cfg.thermal_sample_every_s,
+        )
+        self.thermal_watchdog.start()
 
         # Create Once, Reuse Forever: Persistent Hidden State Buffer
         self.register_h_buffer(self.cfg.batch_size)
@@ -713,6 +772,22 @@ class RRATrainer:
             return
         use_step = self.global_step if step is None else step
         self.model.virtual_lab.writer.add_scalar(tag, value, use_step)
+
+    def _thermal_status(self):
+        if not hasattr(self, 'thermal_watchdog'):
+            return {'freq_ghz': 0.0, 'temp_c': None, 'throttled': False}
+        return self.thermal_watchdog.snapshot()
+
+    def _thermal_penalty(self):
+        snap = self._thermal_status()
+        freq = float(snap.get('freq_ghz', 0.0))
+        throttled = bool(snap.get('throttled', False))
+        target = max(0.1, float(self.cfg.thermal_freq_min_ghz))
+        freq_penalty = 0.0 if freq <= 0.0 else max(0.0, (target - freq) / target)
+        dense_pressure = max(0.0, 1.0 - float(getattr(self.model, 'mask_sparsity_bias', 0.5)))
+        if throttled:
+            freq_penalty += self.cfg.thermal_penalty_weight * dense_pressure
+        return float(max(0.0, freq_penalty)), snap
 
     @staticmethod
     def _finite(x, nan=0.0, posinf=None, neginf=None):
@@ -824,20 +899,26 @@ class RRATrainer:
 
         genome_every = int(self.cfg.genome_step_update_every)
         if genome_every > 0 and (step % genome_every) == 0:
-            thermal_penalty = 0.0
-            if hasattr(self.model, 'get_thermal_penalty'):
-                thermal_penalty = float(self.model.get_thermal_penalty())
+            thermal_penalty_model = float(self.model.get_thermal_penalty()) if hasattr(self.model, 'get_thermal_penalty') else 0.0
+            thermal_penalty_watchdog, thermal_status = self._thermal_penalty()
+            thermal_penalty = max(thermal_penalty_model, thermal_penalty_watchdog)
             evolved = bool(
                 self.model.genome.evolutionary_step(
                     self.model,
                     {
                         'val_loss': float(ema),
                         'thermal_penalty': thermal_penalty,
+                        'thermal_status': thermal_status,
                         'tps_pressure': float(self.model._get_tps_pressure()) if hasattr(self.model, '_get_tps_pressure') else 0.0,
                     }
                 )
             )
             self._update_lr_from_genome()
+            if thermal_status.get('throttled', False):
+                logger.warning(
+                    f">>> HEAT STRESS @step={step}: freq={thermal_status.get('freq_ghz', 0.0):.2f}GHz "
+                    f"< target={self.cfg.thermal_freq_min_ghz:.2f}GHz. Applying thermal evolution pressure."
+                )
             logger.info(
                 f">>> STEP GENOME UPDATE @step={step}: evolved={evolved} "
                 f"(proxy_val={ema:.4f}, FKBP5={self.model.genome.fkbp5:.4f}, "
@@ -1505,7 +1586,9 @@ class RRATrainer:
         
         self.model.train()
         val_loss = val_loss / max(1, val_count) if val_count > 0 else epoch_loss
-        thermal_penalty = float(self.model.get_thermal_penalty()) if hasattr(self.model, 'get_thermal_penalty') else 0.0
+        thermal_penalty_model = float(self.model.get_thermal_penalty()) if hasattr(self.model, 'get_thermal_penalty') else 0.0
+        thermal_penalty_watchdog, thermal_status = self._thermal_penalty()
+        thermal_penalty = max(thermal_penalty_model, thermal_penalty_watchdog)
         
         # Log validation loss to VirtualLab
         if self.model.virtual_lab.enabled:
@@ -1513,6 +1596,7 @@ class RRATrainer:
                 'val_loss': val_loss,
                 'loss_task': torch.tensor(epoch_loss),
                 'thermal_penalty': thermal_penalty,
+                'thermal_freq_ghz': float(thermal_status.get('freq_ghz', 0.0)),
                 't': self.cfg.seq_len,
             })
             self._tb_add_scalar("VirtualLab/val_loss", val_loss)
@@ -1539,6 +1623,7 @@ class RRATrainer:
             {
                 'val_loss': val_loss,
                 'thermal_penalty': thermal_penalty,
+                'thermal_status': thermal_status,
                 'tps_pressure': float(self.model._get_tps_pressure()) if hasattr(self.model, '_get_tps_pressure') else 0.0,
             }
         )
@@ -2186,6 +2271,9 @@ def main():
         if hasattr(trainer, 'watchdog'):
             trainer.watchdog.running = False
             trainer.watchdog.join(timeout=1.0)
+        if hasattr(trainer, 'thermal_watchdog'):
+            trainer.thermal_watchdog.running = False
+            trainer.thermal_watchdog.join(timeout=1.0)
         if hasattr(model, 'virtual_lab') and getattr(model.virtual_lab, 'writer', None) is not None:
             model.virtual_lab.writer.flush()
             model.virtual_lab.writer.close()
