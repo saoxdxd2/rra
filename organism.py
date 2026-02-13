@@ -1,5 +1,7 @@
 import torch
 import torch.nn as nn
+from dataclasses import dataclass
+from typing import List, Dict, Any, Optional
 import torch.nn.functional as F
 import numpy as np
 import psutil
@@ -8,7 +10,7 @@ import time
 import random
 import yaml
 import os
-from genome import Genome
+# from genome import Genome <-- Removed (Integrated into CognitiveOrganism)
 # from morton import MortonBuffer  <-- Removed
 import math
 from types import SimpleNamespace
