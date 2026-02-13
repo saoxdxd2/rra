@@ -38,7 +38,7 @@ class MortonBuffer:
     Morton/Z-order index buffer for mapping 3D topology to linear memory.
     """
 
-    def __init__(self, shape3d, device="cpu", align_multiple=1):
+    def __init__(self, shape3d, device="cpu", align_multiple=1, temporal_bins=16):
         if len(shape3d) != 3:
             raise ValueError(f"MortonBuffer expects shape=(X,Y,Z), got {shape3d}")
         self.shape3d = tuple(max(1, int(s)) for s in shape3d)
@@ -56,7 +56,7 @@ class MortonBuffer:
             device=self.device
         )
         self._coords_original_norm = self._coords_original / norm
-        self.temporal_bins = 16
+        self.temporal_bins = max(1, int(temporal_bins))
         codes = morton3d_code(gx.reshape(-1), gy.reshape(-1), gz.reshape(-1))
 
         self.order = torch.argsort(codes)
@@ -76,6 +76,7 @@ class MortonBuffer:
         if self.size > self.size_original:
             tail = torch.arange(self.size_original, self.size, device=self.device, dtype=torch.long)
             self.inverse_order[self.size_original:] = tail
+        self._build_spatiotemporal_atlas(self.temporal_bins)
 
     def morton_to_original(self, morton_indices: torch.Tensor) -> torch.Tensor:
         morton_indices = morton_indices.to(dtype=torch.long, device=self.device)
@@ -153,8 +154,37 @@ class MortonBuffer:
         dist = torch.linalg.norm(coords - focus.view(1, 3), dim=-1)
         return dist
 
+    def _build_spatiotemporal_atlas(self, temporal_bins: int):
+        bins = max(1, int(temporal_bins))
+        self.temporal_bins = bins
+        morton_rows = torch.arange(self.size, device=self.device, dtype=torch.long)
+        row_major_rows = morton_rows.repeat_interleave(bins)
+        row_major_t = torch.arange(bins, device=self.device, dtype=torch.long).repeat(self.size)
+        orig_idx = self.morton_to_original(row_major_rows).clamp(0, max(0, self.size_original - 1))
+        coords = self._coords_original[orig_idx].to(dtype=torch.long)
+        codes4d = morton4d_code(coords[:, 0], coords[:, 1], coords[:, 2], row_major_t)
+        order4d = torch.argsort(codes4d)
+        inverse4d = torch.empty_like(order4d)
+        inverse4d[order4d] = torch.arange(order4d.numel(), device=self.device, dtype=torch.long)
+
+        self.atlas_size = int(row_major_rows.numel())
+        self.atlas_row_to_morton = row_major_rows
+        self.atlas_row_to_time = row_major_t
+        self.atlas_order4d = order4d
+        self.atlas_inverse4d = inverse4d
+        self.atlas_linear_row_major = (row_major_rows * bins) + row_major_t
+        self.atlas_linear_4d = self.atlas_linear_row_major[order4d]
+
     def set_temporal_bins(self, bins: int):
-        self.temporal_bins = max(1, int(bins))
+        self._build_spatiotemporal_atlas(max(1, int(bins)))
+
+    def spatiotemporal_row(self, morton_rows: torch.Tensor, delta_t: int, temporal_bins: int = None) -> torch.Tensor:
+        if temporal_bins is None:
+            temporal_bins = self.temporal_bins
+        bins = max(1, int(temporal_bins))
+        rows = morton_rows.to(dtype=torch.long, device=self.device).clamp(0, max(0, self.size - 1))
+        t = int(delta_t) % bins
+        return rows * bins + t
 
     def temporal_fold_morton(
         self,

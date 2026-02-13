@@ -2601,11 +2601,13 @@ std::vector<at::Tensor> geometric_manifold_forward_avx512(
     const int64_t R = h_c.size(2);
     const int64_t D = h_c.size(3);
     const int64_t C = h_c.size(4);
-    const int64_t N = m_c.size(0);
+    const int64_t N_atlas = m_c.size(0);
+    const int64_t N3 = inv_c.size(0);
     TORCH_CHECK(M == D * C, "p_brain feature dim must match H_state D*C.");
     TORCH_CHECK(m_c.size(1) == M, "manifold_morton feature dim must match p_brain feature dim.");
-    TORCH_CHECK(inv_c.size(0) == N, "morton_inverse_order must have length N.");
-    TORCH_CHECK(trace_c.size(0) == N, "synaptic_trace must have length N.");
+    TORCH_CHECK(N3 > 0, "morton_inverse_order must have positive length.");
+    TORCH_CHECK((N_atlas % N3) == 0, "manifold_morton rows must be a multiple of morton_inverse_order length.");
+    TORCH_CHECK(trace_c.size(0) == N_atlas, "synaptic_trace must have length equal to manifold rows.");
     TORCH_CHECK(g_c.size(0) == L && g_c.size(1) == R, "gate must match [L, R].");
     TORCH_CHECK(mdna_c.size(0) == L && mdna_c.size(1) == R, "mdna_mask must match [L, R].");
 
@@ -2631,6 +2633,9 @@ std::vector<at::Tensor> geometric_manifold_forward_avx512(
 
     const int64_t S = idx_c.numel();
     const int64_t S_prefetch = pidx_c.numel();
+    const int64_t atlas_bins = std::max<int64_t>(1, N_atlas / N3);
+    const int64_t runtime_bins = std::max<int64_t>(1, std::min<int64_t>(atlas_bins, std::max<int64_t>(1, temporal_bins)));
+    const int64_t base_phase = lgh_wrap_row(time_phase, runtime_bins);
     const int64_t prefetch_d = std::max<int64_t>(1, prefetch_distance);
     const float thermal = static_cast<float>(std::max(0.0, std::min(0.95, thermal_penalty)));
     const float thermal_scale = 1.0f - 0.5f * thermal;
@@ -2641,32 +2646,47 @@ std::vector<at::Tensor> geometric_manifold_forward_avx512(
     const float wave_decay_f = static_cast<float>(std::max(0.01, wave_decay));
     const float trace_decay_f = static_cast<float>(std::max(0.0, std::min(0.9999, trace_decay)));
     const float trace_gain_f = static_cast<float>(std::max(0.0, trace_gain));
-    const int64_t t_bins = std::max<int64_t>(1, temporal_bins);
+    const int64_t t_bins = runtime_bins;
 
     Perf::g_lgh_calls.fetch_add(1ULL, std::memory_order_relaxed);
     const uint64_t tsc_start = __rdtsc();
+
+    // Synaptic trace decay (recovery).
+    if (trace_decay_f < 0.9999f) {
+        for (int64_t i = 0; i < N_atlas; i++) {
+            trace_ptr[i] *= trace_decay_f;
+        }
+    }
 
     // Curve prototype in Morton space with prefetching.
     if (S > 0) {
         float contrib_count = 0.0f;
         for (int64_t s = 0; s < S; s++) {
-            const int64_t dt = time_phase + s;
-            const int64_t row_base = lgh_map_curve_row(idx_ptr[s], inv_ptr, N);
-            const int64_t row = lgh_temporal_fold_row(row_base, dt, N, t_bins, Core::g_hpc_fold_alpha);
+            const int64_t dt = base_phase + s;
+            const int64_t tbin = lgh_wrap_row(dt, t_bins);
+            const int64_t row_base = lgh_map_curve_row(idx_ptr[s], inv_ptr, N3);
+            const int64_t row = lgh_temporal_fold_row(row_base, dt, N3, t_bins, Core::g_hpc_fold_alpha);
             if (S_prefetch > 0) {
-                const int64_t p_base = lgh_map_curve_row(pidx_ptr[s % S_prefetch], inv_ptr, N);
-                const int64_t p_row = lgh_temporal_fold_row(p_base, dt + prefetch_d, N, t_bins, Core::g_hpc_fold_alpha);
+                const int64_t p_dt = dt + prefetch_d;
+                const int64_t p_tbin = lgh_wrap_row(p_dt, t_bins);
+                const int64_t p_base = lgh_map_curve_row(pidx_ptr[s % S_prefetch], inv_ptr, N3);
+                const int64_t p_row3 = lgh_temporal_fold_row(p_base, p_dt, N3, t_bins, Core::g_hpc_fold_alpha);
+                const int64_t p_row = p_row3 * atlas_bins + (p_tbin % atlas_bins);
                 const float* p_ptr_prefetch = m_ptr + p_row * M;
                 _mm_prefetch(reinterpret_cast<const char*>(p_ptr_prefetch), _MM_HINT_T0);
             }
             if (s + prefetch_d < S) {
-                const int64_t next_base = lgh_map_curve_row(idx_ptr[s + prefetch_d], inv_ptr, N);
-                const int64_t next_row = lgh_temporal_fold_row(next_base, dt + prefetch_d, N, t_bins, Core::g_hpc_fold_alpha);
+                const int64_t n_dt = dt + prefetch_d;
+                const int64_t n_tbin = lgh_wrap_row(n_dt, t_bins);
+                const int64_t next_base = lgh_map_curve_row(idx_ptr[s + prefetch_d], inv_ptr, N3);
+                const int64_t next_row3 = lgh_temporal_fold_row(next_base, n_dt, N3, t_bins, Core::g_hpc_fold_alpha);
+                const int64_t next_row = next_row3 * atlas_bins + (n_tbin % atlas_bins);
                 const float* next_ptr = m_ptr + next_row * M;
                 _mm_prefetch(reinterpret_cast<const char*>(next_ptr), _MM_HINT_T0);
             }
             for (int64_t off = -wave_r; off <= wave_r; off++) {
-                const int64_t w_row = lgh_wrap_row(row + off, N);
+                const int64_t w_row3 = lgh_wrap_row(row + off, N3);
+                const int64_t w_row = w_row3 * atlas_bins + (tbin % atlas_bins);
                 const float phase = 0.5f + 0.5f * std::cos(0.35f * static_cast<float>(dt + off));
                 const float ripple = std::exp(-std::abs(static_cast<float>(off)) * wave_decay_f);
                 const float trace_v = trace_ptr[w_row];
@@ -2688,7 +2708,7 @@ std::vector<at::Tensor> geometric_manifold_forward_avx512(
                     proto_ptr[m] += coeff * row_ptr[m];
                 }
 #endif
-                trace_ptr[w_row] = (trace_decay_f * trace_v) + ((1.0f - trace_decay_f) * std::min(1.0f, std::abs(coeff)));
+                trace_ptr[w_row] = std::min(2.0f, trace_v + trace_gain_f * std::abs(coeff));
                 contrib_count += std::max(0.001f, ripple * phase);
             }
         }
@@ -2928,12 +2948,14 @@ std::vector<at::Tensor> geometric_manifold_forward_avx512_int8(
     const int64_t R = h_c.size(2);
     const int64_t D = h_c.size(3);
     const int64_t C = h_c.size(4);
-    const int64_t N = q_c.size(0);
+    const int64_t N_atlas = q_c.size(0);
+    const int64_t N3 = inv_c.size(0);
     TORCH_CHECK(M == D * C, "p_brain feature dim must match H_state D*C.");
     TORCH_CHECK(q_c.size(1) == M, "manifold_morton_q feature dim must match p_brain feature dim.");
-    TORCH_CHECK(sc_c.size(0) == N, "manifold_scale must have shape [N].");
-    TORCH_CHECK(inv_c.size(0) == N, "morton_inverse_order must have length N.");
-    TORCH_CHECK(trace_c.size(0) == N, "synaptic_trace must have length N.");
+    TORCH_CHECK(sc_c.size(0) == N_atlas, "manifold_scale must have shape [N_atlas].");
+    TORCH_CHECK(N3 > 0, "morton_inverse_order must have positive length.");
+    TORCH_CHECK((N_atlas % N3) == 0, "manifold_morton_q rows must be a multiple of morton_inverse_order length.");
+    TORCH_CHECK(trace_c.size(0) == N_atlas, "synaptic_trace must have length equal to manifold rows.");
     TORCH_CHECK(g_c.size(0) == L && g_c.size(1) == R, "gate must match [L, R].");
     TORCH_CHECK(mdna_c.size(0) == L && mdna_c.size(1) == R, "mdna_mask must match [L, R].");
 
@@ -2960,6 +2982,9 @@ std::vector<at::Tensor> geometric_manifold_forward_avx512_int8(
 
     const int64_t S = idx_c.numel();
     const int64_t S_prefetch = pidx_c.numel();
+    const int64_t atlas_bins = std::max<int64_t>(1, N_atlas / N3);
+    const int64_t runtime_bins = std::max<int64_t>(1, std::min<int64_t>(atlas_bins, std::max<int64_t>(1, temporal_bins)));
+    const int64_t base_phase = lgh_wrap_row(time_phase, runtime_bins);
     const int64_t prefetch_d = std::max<int64_t>(1, prefetch_distance);
     const float thermal = static_cast<float>(std::max(0.0, std::min(0.95, thermal_penalty)));
     const float thermal_scale = 1.0f - 0.5f * thermal;
@@ -2970,32 +2995,47 @@ std::vector<at::Tensor> geometric_manifold_forward_avx512_int8(
     const float wave_decay_f = static_cast<float>(std::max(0.01, wave_decay));
     const float trace_decay_f = static_cast<float>(std::max(0.0, std::min(0.9999, trace_decay)));
     const float trace_gain_f = static_cast<float>(std::max(0.0, trace_gain));
-    const int64_t t_bins = std::max<int64_t>(1, temporal_bins);
+    const int64_t t_bins = runtime_bins;
 
     Perf::g_lgh_calls.fetch_add(1ULL, std::memory_order_relaxed);
     const uint64_t tsc_start = __rdtsc();
+
+    // Synaptic trace decay (recovery).
+    if (trace_decay_f < 0.9999f) {
+        for (int64_t i = 0; i < N_atlas; i++) {
+            trace_ptr[i] *= trace_decay_f;
+        }
+    }
 
     // Build float prototype from Morton-ordered int8 manifold.
     if (S > 0) {
         float contrib_count = 0.0f;
         for (int64_t s = 0; s < S; s++) {
-            const int64_t dt = time_phase + s;
-            const int64_t row_base = lgh_map_curve_row(idx_ptr[s], inv_ptr, N);
-            const int64_t row = lgh_temporal_fold_row(row_base, dt, N, t_bins, Core::g_hpc_fold_alpha);
+            const int64_t dt = base_phase + s;
+            const int64_t tbin = lgh_wrap_row(dt, t_bins);
+            const int64_t row_base = lgh_map_curve_row(idx_ptr[s], inv_ptr, N3);
+            const int64_t row = lgh_temporal_fold_row(row_base, dt, N3, t_bins, Core::g_hpc_fold_alpha);
             if (S_prefetch > 0) {
-                const int64_t p_base = lgh_map_curve_row(pidx_ptr[s % S_prefetch], inv_ptr, N);
-                const int64_t p_row = lgh_temporal_fold_row(p_base, dt + prefetch_d, N, t_bins, Core::g_hpc_fold_alpha);
+                const int64_t p_dt = dt + prefetch_d;
+                const int64_t p_tbin = lgh_wrap_row(p_dt, t_bins);
+                const int64_t p_base = lgh_map_curve_row(pidx_ptr[s % S_prefetch], inv_ptr, N3);
+                const int64_t p_row3 = lgh_temporal_fold_row(p_base, p_dt, N3, t_bins, Core::g_hpc_fold_alpha);
+                const int64_t p_row = p_row3 * atlas_bins + (p_tbin % atlas_bins);
                 const int8_t* p_ptr_prefetch = q_ptr + p_row * M;
                 _mm_prefetch(reinterpret_cast<const char*>(p_ptr_prefetch), _MM_HINT_T0);
             }
             if (s + prefetch_d < S) {
-                const int64_t next_base = lgh_map_curve_row(idx_ptr[s + prefetch_d], inv_ptr, N);
-                const int64_t next_row = lgh_temporal_fold_row(next_base, dt + prefetch_d, N, t_bins, Core::g_hpc_fold_alpha);
+                const int64_t n_dt = dt + prefetch_d;
+                const int64_t n_tbin = lgh_wrap_row(n_dt, t_bins);
+                const int64_t next_base = lgh_map_curve_row(idx_ptr[s + prefetch_d], inv_ptr, N3);
+                const int64_t next_row3 = lgh_temporal_fold_row(next_base, n_dt, N3, t_bins, Core::g_hpc_fold_alpha);
+                const int64_t next_row = next_row3 * atlas_bins + (n_tbin % atlas_bins);
                 const int8_t* next_ptr = q_ptr + next_row * M;
                 _mm_prefetch(reinterpret_cast<const char*>(next_ptr), _MM_HINT_T0);
             }
             for (int64_t off = -wave_r; off <= wave_r; off++) {
-                const int64_t w_row = lgh_wrap_row(row + off, N);
+                const int64_t w_row3 = lgh_wrap_row(row + off, N3);
+                const int64_t w_row = w_row3 * atlas_bins + (tbin % atlas_bins);
                 const float phase = 0.5f + 0.5f * std::cos(0.35f * static_cast<float>(dt + off));
                 const float ripple = std::exp(-std::abs(static_cast<float>(off)) * wave_decay_f);
                 const float trace_v = trace_ptr[w_row];
@@ -3006,7 +3046,7 @@ std::vector<at::Tensor> geometric_manifold_forward_avx512_int8(
                 for (int64_t m = 0; m < M; m++) {
                     proto_ptr[m] += static_cast<float>(row_ptr[m]) * total_scale;
                 }
-                trace_ptr[w_row] = (trace_decay_f * trace_v) + ((1.0f - trace_decay_f) * std::min(1.0f, std::abs(coeff)));
+                trace_ptr[w_row] = std::min(2.0f, trace_v + trace_gain_f * std::abs(coeff));
                 contrib_count += std::max(0.001f, ripple * phase);
             }
         }

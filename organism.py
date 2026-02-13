@@ -1009,11 +1009,13 @@ class CognitiveOrganism(BaseCognitiveModule):
         self._lgh_morton = MortonBuffer(
             self._lgh_shape3d,
             device=self.device,
-            align_multiple=self.lgh_cfg.align_multiple
+            align_multiple=self.lgh_cfg.align_multiple,
+            temporal_bins=self.lgh_cfg.temporal_bins
         )
         self._lgh_morton.set_temporal_bins(self.lgh_cfg.temporal_bins)
         if self.cfg_lgh_enabled:
-            n = int(self._lgh_morton.size)
+            n3 = int(self._lgh_morton.size)
+            n = int(n3 * self.lgh_cfg.temporal_bins)
             m = int(self.d_s2 * self.C)
             self.lgh_manifold_morton = nn.Parameter(torch.randn(n, m, device=self.device) * 0.01)
             curve_len = min(self.lgh_cfg.curve_length, int(self._lgh_morton.size_original))
@@ -1749,29 +1751,41 @@ class CognitiveOrganism(BaseCognitiveModule):
         focus_strength_f = max(0.0, min(1.0, focus_strength_f))
         focus_sharp_f = float(self.lgh_cfg.focus_sharpness if focus_sharpness is None else focus_sharpness)
         focus_sharp_f = max(0.01, focus_sharp_f)
-        key = (bits, focus_row_i, round(focus_strength_f, 3), round(focus_sharp_f, 3))
+        phase = step % max(1, int(self.lgh_cfg.temporal_bins))
+        key = (bits, focus_row_i, round(focus_strength_f, 3), round(focus_sharp_f, 3), int(phase))
         if self._lgh_q_step == step and key in self._lgh_q_cache and key in self._lgh_q_scale:
             return self._lgh_q_cache[key], self._lgh_q_scale[key]
         with torch.no_grad():
             qmax_base = 7.0 if bits <= 4 else 127.0
             qmax = torch.full((manifold.size(0),), qmax_base, dtype=torch.float32, device=manifold.device)
-            if focus_row_i >= 0 and focus_strength_f > 0.0:
-                rows = torch.arange(manifold.size(0), device=manifold.device, dtype=torch.float32)
-                denom = max(1.0, float(max(1, manifold.size(0) - 1)))
-                dist = (rows - float(focus_row_i)).abs() / denom
-                core = torch.exp(-focus_sharp_f * dist * dist)
-                target_high = 127.0
-                qmax = qmax + (focus_strength_f * core * (target_high - qmax))
+            bins = max(1, int(self.lgh_cfg.temporal_bins))
+            n3 = max(1, int(self._lgh_morton.size))
+            rows = torch.arange(manifold.size(0), device=manifold.device, dtype=torch.long)
+            morton_rows = torch.div(rows, bins, rounding_mode='floor').clamp(0, max(0, n3 - 1))
+            time_rows = torch.remainder(rows, bins).to(dtype=torch.float32)
+            original_rows = self._lgh_morton.morton_to_original(morton_rows).clamp(0, max(0, self._lgh_morton.size_original - 1))
+            space_dist = self._lgh_morton.focus_distance(original_rows, self._lgh_focus_point()).to(dtype=torch.float32)
+            phase_f = float(phase)
+            tdiff = torch.abs(time_rows - phase_f)
+            tdist = torch.minimum(tdiff, float(bins) - tdiff) / max(1.0, float(bins))
+            focal = torch.exp(-focus_sharp_f * (space_dist + 0.5 * tdist) * (space_dist + 0.5 * tdist))
+            if focus_strength_f > 0.0:
+                qmax = qmax + (focus_strength_f * focal * (127.0 - qmax))
             absmax = manifold.abs().amax(dim=1).clamp_min(1e-8)
             scale = absmax / qmax.clamp_min(1.0)
             q = torch.round(manifold / scale.unsqueeze(-1))
             q = torch.maximum(q, -qmax.unsqueeze(-1))
             q = torch.minimum(q, qmax.unsqueeze(-1))
+            if bits <= 4 and focus_strength_f > 0.0:
+                far_cut = 0.20 + (0.25 * (1.0 - focus_strength_f))
+                far_mask = focal < float(far_cut)
+                if far_mask.any():
+                    q[far_mask] = 0.0
             q = q.to(torch.int8).contiguous()
         self._lgh_q_step = step
         self._lgh_q_cache[key] = q
         self._lgh_q_scale[key] = scale.contiguous()
-        self._lgh_q_meta[key] = {'bits': bits, 'focus_row': focus_row_i}
+        self._lgh_q_meta[key] = {'bits': bits, 'focus_row': focus_row_i, 'phase': int(phase)}
         return self._lgh_q_cache[key], self._lgh_q_scale[key]
 
     def _predict_curve_chain(self, p_s1):

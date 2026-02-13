@@ -198,7 +198,7 @@ class EvolutionPolicy:
         
         if val_loss > 1.5: return "TASK_FAILURE"
         if throttled or thermal_penalty > 0.25: return "THERMAL_FAILURE"
-        if simd_cycles_per_pulse > self.config.simd_starvation_threshold: return "SILICON_STARVATION"
+        if simd_cycles_per_pulse > self.config.simd_starvation_threshold: return "SILICON_FAILURE"
         # Enterprise tuning: Lower threshold for energy failure to force efficiency early?
         if cost_step > 0.5: return "ENERGY_FAILURE" 
         return "STAGNATION"
@@ -213,7 +213,7 @@ class EvolutionPolicy:
         elif stress_dir == "THERMAL_FAILURE":
             # Favor cooler sparse masks under heat stress.
             return 'mask_sparsity_bias', 1.0
-        elif stress_dir == "SILICON_STARVATION":
+        elif stress_dir == "SILICON_FAILURE":
             # Evolve toward shorter, cheaper manifold traversals.
             target = state.rng.choice(['metabolic_efficiency', 'wormhole_jump_bias', 'mask_sparsity_bias', 'temporal_trace_bias'])
             return target, 1.0
