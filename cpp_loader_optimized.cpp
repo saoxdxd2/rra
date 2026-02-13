@@ -2865,12 +2865,19 @@ std::vector<at::Tensor> geometric_manifold_forward_avx512_int8(
     at::Tensor prefetch_curve_indices, // [S_prefetch] original topology indices
     at::Tensor morton_inverse_order, // [N]
     at::Tensor mdna_mask,        // [L, R]
+    at::Tensor synaptic_trace,   // [N]
+    int64_t time_phase,
     int64_t h_cycles,
     int64_t l_cycles,
     double halt_threshold,
     int64_t prefetch_distance,
     double thermal_penalty,
-    double temporal_fold_threshold
+    double temporal_fold_threshold,
+    int64_t wave_radius,
+    double wave_decay,
+    double trace_decay,
+    double trace_gain,
+    int64_t temporal_bins
 ) {
     check_cpu(p_brain, "p_brain");
     check_cpu(H_state, "H_state");
@@ -2881,6 +2888,7 @@ std::vector<at::Tensor> geometric_manifold_forward_avx512_int8(
     check_cpu(prefetch_curve_indices, "prefetch_curve_indices");
     check_cpu(morton_inverse_order, "morton_inverse_order");
     check_cpu(mdna_mask, "mdna_mask");
+    check_cpu(synaptic_trace, "synaptic_trace");
     check_dim(p_brain, 3, "p_brain");
     check_dim(H_state, 5, "H_state");
     check_dim(gate, 2, "gate");
@@ -2890,6 +2898,7 @@ std::vector<at::Tensor> geometric_manifold_forward_avx512_int8(
     check_dim(prefetch_curve_indices, 1, "prefetch_curve_indices");
     check_dim(morton_inverse_order, 1, "morton_inverse_order");
     check_dim(mdna_mask, 2, "mdna_mask");
+    check_dim(synaptic_trace, 1, "synaptic_trace");
     check_dtype(p_brain, at::kFloat, "p_brain");
     check_dtype(H_state, at::kFloat, "H_state");
     check_dtype(gate, at::kFloat, "gate");
@@ -2899,6 +2908,7 @@ std::vector<at::Tensor> geometric_manifold_forward_avx512_int8(
     check_dtype(prefetch_curve_indices, at::kLong, "prefetch_curve_indices");
     check_dtype(morton_inverse_order, at::kLong, "morton_inverse_order");
     check_dtype(mdna_mask, at::kFloat, "mdna_mask");
+    check_dtype(synaptic_trace, at::kFloat, "synaptic_trace");
 
     auto p_c = ensure_contig(p_brain);
     auto h_c = ensure_contig(H_state);
@@ -2909,6 +2919,7 @@ std::vector<at::Tensor> geometric_manifold_forward_avx512_int8(
     auto pidx_c = ensure_contig(prefetch_curve_indices);
     auto inv_c = ensure_contig(morton_inverse_order);
     auto mdna_c = ensure_contig(mdna_mask);
+    auto trace_c = ensure_contig(synaptic_trace);
 
     const int64_t B = p_c.size(0);
     const int64_t T = p_c.size(1);
@@ -2922,6 +2933,7 @@ std::vector<at::Tensor> geometric_manifold_forward_avx512_int8(
     TORCH_CHECK(q_c.size(1) == M, "manifold_morton_q feature dim must match p_brain feature dim.");
     TORCH_CHECK(sc_c.size(0) == N, "manifold_scale must have shape [N].");
     TORCH_CHECK(inv_c.size(0) == N, "morton_inverse_order must have length N.");
+    TORCH_CHECK(trace_c.size(0) == N, "synaptic_trace must have length N.");
     TORCH_CHECK(g_c.size(0) == L && g_c.size(1) == R, "gate must match [L, R].");
     TORCH_CHECK(mdna_c.size(0) == L && mdna_c.size(1) == R, "mdna_mask must match [L, R].");
 
@@ -2944,6 +2956,7 @@ std::vector<at::Tensor> geometric_manifold_forward_avx512_int8(
     const int64_t* pidx_ptr = pidx_c.data_ptr<int64_t>();
     const int64_t* inv_ptr = inv_c.data_ptr<int64_t>();
     const float* mdna_ptr = mdna_c.data_ptr<float>();
+    float* trace_ptr = trace_c.data_ptr<float>();
 
     const int64_t S = idx_c.numel();
     const int64_t S_prefetch = pidx_c.numel();
@@ -2953,6 +2966,11 @@ std::vector<at::Tensor> geometric_manifold_forward_avx512_int8(
     const float cycle_scale = static_cast<float>(std::max<int64_t>(1, h_cycles) * std::max<int64_t>(1, l_cycles));
     const float eps = 1e-8f;
     const float temporal_fold = static_cast<float>(std::max(0.0, temporal_fold_threshold));
+    const int64_t wave_r = std::max<int64_t>(0, wave_radius);
+    const float wave_decay_f = static_cast<float>(std::max(0.01, wave_decay));
+    const float trace_decay_f = static_cast<float>(std::max(0.0, std::min(0.9999, trace_decay)));
+    const float trace_gain_f = static_cast<float>(std::max(0.0, trace_gain));
+    const int64_t t_bins = std::max<int64_t>(1, temporal_bins);
 
     Perf::g_lgh_calls.fetch_add(1ULL, std::memory_order_relaxed);
     const uint64_t tsc_start = __rdtsc();
