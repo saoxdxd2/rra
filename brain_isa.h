@@ -147,5 +147,6 @@
 #define NIS_MAX_LOG_ENTRIES         1000
 #define NIS_EPSILON                 1e-8f
 #define NIS_WARM_UP_STEPS           2000.0f
+#define NIS_SCALE_CONSTANT          0.1f
 
 #endif // BRAIN_ISA_H
