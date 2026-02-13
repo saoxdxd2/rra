@@ -178,6 +178,29 @@ class MortonBuffer:
     def set_temporal_bins(self, bins: int):
         self._build_spatiotemporal_atlas(max(1, int(bins)))
 
+    def get_morton_coords(self, morton_index: int, t: int = 0) -> torch.Tensor:
+        """Returns normalized [X, Y, Z, T] coordinates for a Morton index."""
+        orig_idx = self.morton_to_original(torch.tensor([morton_index], device=self.device)).item()
+        coords_3d = self._coords_original_norm[int(orig_idx)]
+        t_norm = torch.tensor([float(t) / max(1, self.temporal_bins)], device=self.device)
+        return torch.cat([coords_3d, t_norm])
+
+    def get_path_momentum(self, start_idx: int, end_idx: int, t_start: int, t_end: int) -> torch.Tensor:
+        """Calculates the 4D momentum vector between two points in Morton-Time space."""
+        c1 = self.get_morton_coords(start_idx, t_start)
+        c2 = self.get_morton_coords(end_idx, t_end)
+        return c2 - c1
+
+    def get_path_momentum_vec(self, chain_indices: torch.Tensor, t_start: int) -> torch.Tensor:
+        """Calculates the aggregate 4D momentum vector for a sequence of points."""
+        if chain_indices.numel() < 2:
+            return torch.zeros(4, device=self.device)
+        
+        # Look at the start and end of the chain for momentum
+        c_start = self.get_morton_coords(int(chain_indices[0].item()), t_start)
+        c_end = self.get_morton_coords(int(chain_indices[-1].item()), t_start + chain_indices.numel())
+        return c_end - c_start
+
     def spatiotemporal_row(self, morton_rows: torch.Tensor, delta_t: int, temporal_bins: int = None) -> torch.Tensor:
         if temporal_bins is None:
             temporal_bins = self.temporal_bins

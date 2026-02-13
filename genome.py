@@ -303,21 +303,29 @@ class Genome: # Renamed from GenomeEngine to maintain compat with organism.py
         return int((base + (self.state.generation * stride) + int(hint)) % total)
 
     def build_curve_chain(self, total_nodes: int, length: int, hint: int = 0) -> List[int]:
+        """
+        Builds a deterministic curve segment using Predictive Drifting.
+        No random sampling; jumps are locked to trajectory curvature.
+        """
         total = max(1, int(total_nodes))
         length = max(1, min(int(length), total))
         start = self.next_curve_anchor(total, hint=hint)
         trajectory = max(0.0, min(1.0, self.curve_trajectory))
         step = max(1, int(round(1 + trajectory * 5)))
         jump_bias = max(0.0, min(1.0, self.wormhole_jump_bias))
-        jump_prob = min(0.75, 0.10 + 0.55 * jump_bias)
+        
+        # Use trajectory to decide jumps deterministically
         chain = []
         cursor = int(start)
-        for _ in range(length):
+        for i in range(length):
             chain.append(int(cursor))
-            if self.state.rng.random() < jump_prob:
-                # Topological shortcut: long-range jump (wormhole).
-                jump_span = self.state.rng.randint(max(1, total // 8), max(1, (total * 3) // 4))
-                direction = -1 if self.state.rng.random() < 0.5 else 1
+            # Deterministic jump: frequency controlled by jump_bias
+            # Using i + generation for temporal drift
+            jump_trigger = (hash(f"{self.state.generation}_{i}") % 100) / 100.0
+            if jump_trigger < jump_bias:
+                # Topological shortcut: deterministic span based on trajectory
+                jump_span = int(max(1, (total // 8) + (trajectory * (total // 2))))
+                direction = -1 if (hash(f"dir_{i}") % 2) == 0 else 1
                 cursor = int((cursor + direction * jump_span + hint) % total)
             else:
                 cursor = int((cursor + step) % total)
@@ -332,16 +340,22 @@ class Genome: # Renamed from GenomeEngine to maintain compat with organism.py
         target_name, direction = self.policy.propose_mutation(self.state, stress_dir)
         intensity = self.policy.calculate_intensity(self.state)
         
-        # 1. Primary
+        # 1. Primary (Predictive Drifting)
         if target_name in self.state.genes:
             gene = self.state.genes[target_name]
-            delta = self.state.rng.gauss(direction * intensity, intensity * 0.5)
-            actual_delta = gene.apply_mutation('allele_1', delta)
             
-            self.logger.emit("mutation_primary", {
+            # Drift is calculated from path momentum (current delta is guided by trajectory gene)
+            # This makes the mutation "lean" into the path.
+            path_momentum = (self.curve_trajectory - 0.5) * 2.0 # range [-1, 1]
+            drift = direction * intensity * (1.0 + 0.5 * path_momentum)
+            
+            actual_delta = gene.apply_mutation('allele_1', drift)
+            
+            self.logger.emit("predictive_drift_primary", {
                 "gene": target_name,
                 "target": "allele_1",
                 "delta": actual_delta,
+                "momentum": path_momentum,
                 "reason": stress_dir
             })
             
@@ -359,17 +373,22 @@ class Genome: # Renamed from GenomeEngine to maintain compat with organism.py
                             "delta": actual_nudge
                         })
 
-        # 3. Drift (All others)
+        # 3. Drift (All others) - Deterministic "Thermal Background"
         drift_rate = self.policy.config.base_rate * 0.5
         drift_intensity = intensity * 0.5
         
         for name, gene in self.state.genes.items():
             if name != target_name:
-                if self.state.rng.random() < drift_rate:
-                    d = self.state.rng.gauss(0, drift_intensity)
+                # Deterministic drift trigger using hash of generation and gene name
+                drift_trigger = (hash(f"drift_{self.state.generation}_{name}") % 100) / 100.0
+                if drift_trigger < drift_rate:
+                    # Deterministic drift value
+                    d = ((hash(f"val_{self.state.generation}_{name}") % 200) - 100) / 100.0 * drift_intensity
                     gene.apply_mutation('allele_1', d)
-                if self.state.rng.random() < drift_rate:
-                    d = self.state.rng.gauss(0, drift_intensity)
+                
+                drift_trigger_2 = (hash(f"drift2_{self.state.generation}_{name}") % 100) / 100.0
+                if drift_trigger_2 < drift_rate:
+                    d = ((hash(f"val2_{self.state.generation}_{name}") % 200) - 100) / 100.0 * drift_intensity
                     gene.apply_mutation('allele_2', d)
 
         self.state.generation += 1

@@ -2100,7 +2100,10 @@ class CognitiveOrganism(BaseCognitiveModule):
         # Apply noise to the latent space (p) to ensure it works for both 
         # Token-based and Embedding-based inputs.
         if self.training and self.noise_scale > 0:
-            noise = torch.randn_like(p) * self.noise_scale
+            # Deterministic noise based on input hash and step counter
+            step_seed = int(self.step_counter.item())
+            # Simple deterministic pseudo-noise: sin-based spread
+            noise = (torch.sin(p * 100.0 + step_seed) * self.noise_scale).to(p.device)
             p = p + noise
         # ----------------------------------------------------
             
@@ -2112,9 +2115,11 @@ class CognitiveOrganism(BaseCognitiveModule):
             # Blend behavioral usage with learning contribution (Knowledge Map)
             combined_scores = 0.5 * combined_scores + 0.5 * learning_brain.knowledge_map
         
-        # Add tie-breaking noise to prevent mass-extinction of equal-score neurons
-        noise = torch.randn_like(combined_scores) * 1e-6
+        # Add tie-breaking pseudo-noise to prevent mass-extinction of equal-score neurons.
+        # Deterministic: based on level/region indices to ensure reproducibility.
+        noise = torch.linspace(1e-8, 1e-7, combined_scores.numel(), device=self.device).view_as(combined_scores)
         combined_scores = combined_scores + noise
+
 
         # --- PERFORMANCE CONTROL: TPS Pressure ---
         tps_pressure = self._get_tps_pressure()
