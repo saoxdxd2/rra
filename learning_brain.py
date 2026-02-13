@@ -181,10 +181,6 @@ class LearningBrain(nn.Module):
             if hook_handle:
                 hook_handle.remove()
 
-        for param in model.parameters():
-            if param.grad is not None and torch.is_floating_point(param.grad):
-                if not torch.isfinite(param.grad).all():
-                    param.grad.data = torch.nan_to_num(param.grad.data, nan=0.0, posinf=1.0, neginf=-1.0)
         
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step(omega=omega) if hasattr(optimizer.step, '__code__') and 'omega' in optimizer.step.__code__.co_varnames else optimizer.step()

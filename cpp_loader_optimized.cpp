@@ -2531,6 +2531,27 @@ inline bool lgh_should_temporal_fold(
     const float mean_delta = accum / static_cast<float>(std::max<int64_t>(1, samples));
     return mean_delta < threshold;
 }
+
+inline float lgh_trace_decay_param(double trace_decay) {
+    return static_cast<float>(std::max(0.0, std::min(0.9999, trace_decay)));
+}
+
+inline float lgh_trace_gain_param(double trace_gain) {
+    return static_cast<float>(std::max(0.0, trace_gain));
+}
+
+inline float lgh_trace_fatigue(float trace_value) {
+    const float t = std::max(0.0f, trace_value);
+    return 1.0f / (1.0f + t);
+}
+
+inline float lgh_trace_recover(float trace_value, float trace_decay) {
+    return std::max(0.0f, trace_value * trace_decay);
+}
+
+inline float lgh_trace_pulse_update(float trace_value, float trace_gain, float activity) {
+    return std::min(2.0f, trace_value + trace_gain * std::max(0.0f, activity));
+}
 } // namespace
 
 std::vector<at::Tensor> geometric_manifold_forward_avx512(
@@ -2644,18 +2665,16 @@ std::vector<at::Tensor> geometric_manifold_forward_avx512(
     const float temporal_fold = static_cast<float>(std::max(0.0, temporal_fold_threshold));
     const int64_t wave_r = std::max<int64_t>(0, wave_radius);
     const float wave_decay_f = static_cast<float>(std::max(0.01, wave_decay));
-    const float trace_decay_f = static_cast<float>(std::max(0.0, std::min(0.9999, trace_decay)));
-    const float trace_gain_f = static_cast<float>(std::max(0.0, trace_gain));
+    const float trace_decay_f = lgh_trace_decay_param(trace_decay);
+    const float trace_gain_f = lgh_trace_gain_param(trace_gain);
     const int64_t t_bins = runtime_bins;
 
     Perf::g_lgh_calls.fetch_add(1ULL, std::memory_order_relaxed);
     const uint64_t tsc_start = __rdtsc();
 
     // Synaptic trace decay (recovery).
-    if (trace_decay_f < 0.9999f) {
-        for (int64_t i = 0; i < N_atlas; i++) {
-            trace_ptr[i] *= trace_decay_f;
-        }
+    for (int64_t i = 0; i < N_atlas; i++) {
+        trace_ptr[i] = lgh_trace_recover(trace_ptr[i], trace_decay_f);
     }
 
     // Curve prototype in Morton space with prefetching.
@@ -2690,7 +2709,8 @@ std::vector<at::Tensor> geometric_manifold_forward_avx512(
                 const float phase = 0.5f + 0.5f * std::cos(0.35f * static_cast<float>(dt + off));
                 const float ripple = std::exp(-std::abs(static_cast<float>(off)) * wave_decay_f);
                 const float trace_v = trace_ptr[w_row];
-                const float coeff = ripple * phase * (1.0f + trace_gain_f * trace_v);
+                const float fatigue = lgh_trace_fatigue(trace_v);
+                const float coeff = ripple * phase * fatigue;
                 const float* row_ptr = m_ptr + w_row * M;
 #ifdef __AVX512F
                 int64_t m = 0;
@@ -2708,7 +2728,7 @@ std::vector<at::Tensor> geometric_manifold_forward_avx512(
                     proto_ptr[m] += coeff * row_ptr[m];
                 }
 #endif
-                trace_ptr[w_row] = std::min(2.0f, trace_v + trace_gain_f * std::abs(coeff));
+                trace_ptr[w_row] = lgh_trace_pulse_update(trace_v, trace_gain_f, std::abs(coeff));
                 contrib_count += std::max(0.001f, ripple * phase);
             }
         }
@@ -2993,18 +3013,16 @@ std::vector<at::Tensor> geometric_manifold_forward_avx512_int8(
     const float temporal_fold = static_cast<float>(std::max(0.0, temporal_fold_threshold));
     const int64_t wave_r = std::max<int64_t>(0, wave_radius);
     const float wave_decay_f = static_cast<float>(std::max(0.01, wave_decay));
-    const float trace_decay_f = static_cast<float>(std::max(0.0, std::min(0.9999, trace_decay)));
-    const float trace_gain_f = static_cast<float>(std::max(0.0, trace_gain));
+    const float trace_decay_f = lgh_trace_decay_param(trace_decay);
+    const float trace_gain_f = lgh_trace_gain_param(trace_gain);
     const int64_t t_bins = runtime_bins;
 
     Perf::g_lgh_calls.fetch_add(1ULL, std::memory_order_relaxed);
     const uint64_t tsc_start = __rdtsc();
 
     // Synaptic trace decay (recovery).
-    if (trace_decay_f < 0.9999f) {
-        for (int64_t i = 0; i < N_atlas; i++) {
-            trace_ptr[i] *= trace_decay_f;
-        }
+    for (int64_t i = 0; i < N_atlas; i++) {
+        trace_ptr[i] = lgh_trace_recover(trace_ptr[i], trace_decay_f);
     }
 
     // Build float prototype from Morton-ordered int8 manifold.
@@ -3039,14 +3057,15 @@ std::vector<at::Tensor> geometric_manifold_forward_avx512_int8(
                 const float phase = 0.5f + 0.5f * std::cos(0.35f * static_cast<float>(dt + off));
                 const float ripple = std::exp(-std::abs(static_cast<float>(off)) * wave_decay_f);
                 const float trace_v = trace_ptr[w_row];
-                const float coeff = ripple * phase * (1.0f + trace_gain_f * trace_v);
+                const float fatigue = lgh_trace_fatigue(trace_v);
+                const float coeff = ripple * phase * fatigue;
                 const int8_t* row_ptr = q_ptr + w_row * M;
                 const float row_scale = sc_ptr[w_row];
                 const float total_scale = coeff * row_scale;
                 for (int64_t m = 0; m < M; m++) {
                     proto_ptr[m] += static_cast<float>(row_ptr[m]) * total_scale;
                 }
-                trace_ptr[w_row] = std::min(2.0f, trace_v + trace_gain_f * std::abs(coeff));
+                trace_ptr[w_row] = lgh_trace_pulse_update(trace_v, trace_gain_f, std::abs(coeff));
                 contrib_count += std::max(0.001f, ripple * phase);
             }
         }

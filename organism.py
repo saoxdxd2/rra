@@ -912,6 +912,7 @@ class CognitiveOrganism(BaseCognitiveModule):
         self.omega = 0.0  # Start as Sponge
         self.omega_momentum = self.runtime_cfg.omega_step  # How fast omega changes
         self.omega_history = []  # Track evolution
+        self._params_dirty = True
         
         # --- Autonomous Intelligence: Genome Activation ---
         self.genome = Genome()
@@ -1048,7 +1049,7 @@ class CognitiveOrganism(BaseCognitiveModule):
         Returns a dict of stacked Tensors for all levels.
         """
         step = int(self.step_counter.item())
-        if self._stacked_params is not None and self._stacked_params_step == step:
+        if self._stacked_params is not None and not self._params_dirty:
             return self._stacked_params
         
         # Stack parameters from all levels
@@ -1071,6 +1072,7 @@ class CognitiveOrganism(BaseCognitiveModule):
             'halt_b': halt_b.contiguous(),
         }
         self._stacked_params_step = step
+        self._params_dirty = False
         return self._stacked_params
 
     def _cpp_io_call(self, op_name, x_input, state, params=None, scalars=None):
