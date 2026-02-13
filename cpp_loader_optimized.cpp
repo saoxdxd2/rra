@@ -3393,16 +3393,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("get_perf_counters", &get_perf_counters);
     m.def("init_nis_config", &init_nis_config);
 
-    py::class_<NIS_Config>(m, "NIS_Config")
-        .def_readwrite_static("L", &NIS_Config::L)
-        .def_readwrite_static("R", &NIS_Config::R)
-        .def_readwrite_static("WORKING_DIM", &NIS_Config::WORKING_DIM)
-        .def_readwrite_static("C", &NIS_Config::C)
-        .def_readwrite_static("MEMORY_DEPTH", &NIS_Config::MEMORY_DEPTH)
-        .def_readwrite_static("BATCH_SIZE", &NIS_Config::BATCH_SIZE)
-        .def_readwrite_static("SEQ_LEN", &NIS_Config::SEQ_LEN)
-        .def_readwrite_static("LEARNING_RATE", &NIS_Config::LEARNING_RATE)
-        .def_readwrite_static("HALT_THRESHOLD", &NIS_Config::HALT_THRESHOLD);
+    // NIS_Config bindings removed - fully migrated to brain_isa.h firmware exports below.
     m.def("ademamix_update", &ademamix_update);
     m.def("batched_ademamix_update", &batched_ademamix_update);
     m.def("pulse_gated_forward", &pulse_gated_forward);
