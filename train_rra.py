@@ -55,7 +55,8 @@ def create_optimizer(model, config):
         beta1_fast=getattr(config, 'ADEMAMIX_BETA1_FAST', 0.9),
         beta1_slow=getattr(config, 'ADEMAMIX_BETA1_SLOW', 0.9999),
         beta2=getattr(config, 'ADEMAMIX_BETA2', 0.999),
-        weight_decay=getattr(config, 'WEIGHT_DECAY', 0.0)
+        weight_decay=getattr(config, 'WEIGHT_DECAY', 0.0),
+        sign_sgd=getattr(config, 'USE_SIGN_SGD', False)
     )
 
 # --- LOGGING SETUP ---
@@ -387,8 +388,16 @@ class ByteDataset(Dataset):
         # Use vectorized lookup
         bits = self.byte_bits_lut[torch.from_numpy(b).long()]
         
-        xb = bits[:-1] # [seq_len, 8]
-        yb = bits[1:]  # [seq_len, 8]
+        xb = bits[:-1].clone() # [seq_len, 8]
+        yb = bits[1:].clone()  # [seq_len, 8]
+
+        # --- BIT-FLIP AUGMENTATION (Better than Elite) ---
+        # 1% chance of a random bit-flip to force GeometricManifold robustness
+        if self.random_sampling and random.random() < 0.01:
+            idx_to_flip = random.randint(0, xb.numel() - 1)
+            xb.view(-1)[idx_to_flip] = 1.0 - xb.view(-1)[idx_to_flip]
+            # logger.debug(f">>> BIT-FLIP @ sample {idx}") # Too noisy for regular logs
+
         return xb, yb
 
 
@@ -979,6 +988,22 @@ class RRATrainer:
                     f">>> HEAT STRESS @step={step}: freq={thermal_status.get('freq_ghz', 0.0):.2f}GHz "
                     f"< target={self.cfg.thermal_freq_min_ghz:.2f}GHz. Applying thermal evolution pressure."
                 )
+            
+            # --- THERMAL-REACTIVE LEARNING RATE (Better than Elite) ---
+            # If frequency drops to 2.0GHz, immediately drop LR and increase sparsity.
+            # This prevents "Garbage Gradients" from CPU stalls.
+            if thermal_status.get('freq_ghz', 4.0) < 2.0:
+                logger.critical(f">>> THERMAL EMERGENCY @step={step}: Freq={thermal_status.get('freq_ghz'):.2f}GHz. "
+                                "Emergency LR drop and Sparsity increase triggered.")
+                for param_group in self.optimizer.param_groups:
+                    param_group['lr'] *= 0.5
+                
+                if hasattr(self.model, 'mask_sparsity_bias'):
+                    # Increase sparsity bias to reduce compute load
+                    self.model.mask_sparsity_bias = min(0.95, float(self.model.mask_sparsity_bias) + 0.2)
+                
+                # Set LR cap to prevent immediate recovery while still hot
+                self._lr_cap = self.optimizer.param_groups[0]['lr']
             logger.info(
                 f">>> STEP GENOME UPDATE @step={step}: evolved={evolved} "
                 f"(proxy_val={ema:.4f}, FKBP5={self.model.genome.fkbp5:.4f}, "

@@ -40,11 +40,11 @@ class AdEMAMix(optim.Optimizer):
     - Omega blending (alpha in paper)
     - C++ acceleration via cpp_loader_optimized
     """
-    def __init__(self, params, lr=1e-4, beta1_fast=0.9, beta1_slow=0.9999, beta2=0.999, eps=1e-8, weight_decay=0.0, alpha=5.0):
+    def __init__(self, params, lr=1e-4, beta1_fast=0.9, beta1_slow=0.9999, beta2=0.999, eps=1e-8, weight_decay=0.0, alpha=5.0, sign_sgd=False):
         # Note: alpha=5.0 is default "Mix" factor. 
         # In train_rra.py, 'omega' was passed to step(), overriding alpha.
         # We store alpha in defaults for non-step-specified usage.
-        defaults = dict(lr=lr, beta1_fast=beta1_fast, beta1_slow=beta1_slow, beta2=beta2, eps=eps, weight_decay=weight_decay, alpha=alpha)
+        defaults = dict(lr=lr, beta1_fast=beta1_fast, beta1_slow=beta1_slow, beta2=beta2, eps=eps, weight_decay=weight_decay, alpha=alpha, sign_sgd=sign_sgd)
         super().__init__(params, defaults)
 
     @torch.no_grad()
@@ -70,6 +70,11 @@ class AdEMAMix(optim.Optimizer):
                 grad = p.grad
                 if grad.is_sparse:
                     raise RuntimeError('AdEMAMix does not support sparse gradients')
+
+                # --- SIGN-SGD (Better than Elite Salt) ---
+                # Reduce precision to signs to save RAM bus bandwidth and align with int8 plan.
+                if group.get('sign_sgd', False):
+                    grad = grad.sign()
 
                 state = self.state[p]
 

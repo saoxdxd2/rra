@@ -213,6 +213,7 @@ class Config:
     ADEMAMIX_BETA2 = 0.999         # Variance estimation decay
     AGC_CLIP_FACTOR = 0.1          # Adaptive Gradient Clipping factor (grad/param norm ratio)
     WEIGHT_DECAY = 0.0             # Decoupled weight decay (AdamW-style)
+    USE_SIGN_SGD = bool(_CONFIG_DATA.get('training', {}).get('use_sign_sgd', False))
 
     # Runtime Threading (0 = keep framework defaults)
     TORCH_NUM_THREADS = int(_CONFIG_DATA.get('runtime', {}).get('torch_num_threads', 0))
