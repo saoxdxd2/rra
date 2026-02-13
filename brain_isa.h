@@ -109,13 +109,17 @@ namespace NIS {
     static constexpr float LGH_FOCUS_SHARPNESS = 2.0f;
 
     /**
-     * HPC Metadata
+     * HPC Metadata (Cognitive Monitor)
      */
-    static constexpr int64_t HPC_HIDDEN          = 256;
-    static constexpr float HPC_TARGET_ERROR    = 0.05f;
-    static constexpr float HPC_HALT_GAIN       = 0.35f;
-    static constexpr float HPC_SURPRISE_THRESHOLD = 0.20f;
-    static constexpr float HPC_TEMPORAL_THRESHOLD = 0.08f;
+    static constexpr bool    HPC_ENABLED             = true;
+    static constexpr int64_t HPC_HIDDEN              = 256;
+    static constexpr float   HPC_TARGET_ERROR        = 0.05f;
+    static constexpr float   HPC_HALT_GAIN           = 0.35f;
+    static constexpr float   HPC_ERROR_EMA_DECAY     = 0.01f;
+    static constexpr bool    HPC_TEMPORAL_FOLDING    = true;
+    static constexpr float   HPC_FOLD_ALPHA          = 0.95f;
+    static constexpr float   HPC_SURPRISE_THRESHOLD  = 0.20f;
+    static constexpr float   HPC_TEMPORAL_THRESHOLD  = 0.08f;
 
     /**
      * SIMD & Alignment Physics
@@ -160,8 +164,14 @@ namespace NIS {
     static constexpr bool NEURAL_CACHE_ENABLED    = false;
     static constexpr bool RAM_INT8_INFER          = true;
     static constexpr bool USE_FORWARD_STACK       = true;
-    static constexpr bool USE_FUSED_CYCLE         = true;
+    static constexpr bool USE_FUSED_COGNITIVE_CYCLE = true;
 
+    static constexpr bool  TTFS_ENABLED           = true;
+    static constexpr float TTFS_SLOPE_THRESHOLD   = 0.001f;
+    static constexpr float EVENT_DENSITY_THRESHOLD= 0.1f;
+    static constexpr const char* EVENT_DRIVEN_MODE= "hybrid";
+    
+    static constexpr float PHASE_0_KEEP_RATIO     = 0.5f;
     static constexpr float DISSONANCE_CONFIDENCE_THRESHOLD = 0.5f;
 
     // Hardware Morton Jump (PDEP)
