@@ -897,30 +897,8 @@ class CognitiveOrganism(BaseCognitiveModule):
 
 
         
-        # Cache config values to avoid self.cfg/self.runtime_cfg getattr overhead in hot path
-        self.cfg_mes_enabled = bool(Config.MES_ENABLED)
-        self.cfg_cache_enabled = bool(Config.NEURAL_CACHE_ENABLED)
-        self.cfg_pruning_enabled = True
-        self.cfg_h_cycles = int(Config.H_CYCLES)
-        self.cfg_l_cycles = int(Config.L_CYCLES)
-        self.cfg_dissonance_penalty = float(Config.DISSONANCE_PENALTY)
-        self.cfg_dissonance_threshold = float(Config.DISSONANCE_CONFIDENCE_THRESHOLD)
-        self.cfg_metabolic_tax_rate = float(Config.METABOLIC_TAX_RATE)
-        self.cfg_halt_threshold = float(Config.HALT_THRESHOLD)
-        self.cfg_param_cost_scale = float(Config.PARAM_COST_SCALE)
-        self.cfg_lif_decay = float(Config.LIF_DECAY)
-        self.cfg_lif_threshold = float(Config.LIF_THRESHOLD)
-        self.cfg_lgh_enabled = bool(self.lgh_cfg.enabled)
-        self.cfg_lgh_prefetch_distance = int(self.lgh_cfg.prefetch_distance)
-        self.cfg_lgh_low_entropy_fold_threshold = float(self.lgh_cfg.low_entropy_fold_threshold)
-        self.cfg_lgh_wave_radius = int(self.lgh_cfg.wave_radius)
-        self.cfg_lgh_wave_decay = float(self.lgh_cfg.wave_decay)
-        self.cfg_lgh_trace_decay = float(self.lgh_cfg.trace_decay)
-        self.cfg_lgh_trace_gain = float(self.lgh_cfg.trace_gain)
-        self.cfg_lgh_temporal_bins = int(self.lgh_cfg.temporal_bins)
-        self.cfg_thermal_penalty = float(getattr(self.exec_cfg, 'thermal_penalty', 0.0))
-        
-        # Pre-allocate contiguous state buffer (System 2 States)
+        # BIOS scalars are managed directly via self.governor.config_scalars.
+        # Hot-path config values are accessed directly from Config or self.governor.
         self.max_batch_size = Config.BATCH_SIZE
         self.H_buffer = torch.zeros(
             self.max_batch_size, L, R, self.d_s2, C, 
@@ -955,8 +933,6 @@ class CognitiveOrganism(BaseCognitiveModule):
         # Preflight flag for performance
         self._preflight_ready = False
         self._preflight_steps = 0
-        self.cfg_h_cycles = self.cfg_h_cycles
-        self.cfg_l_cycles = self.cfg_l_cycles
         self.current_phase = 0
         self.register_buffer('step_counter', torch.zeros(1))
         self._current_engagement_rate = torch.tensor(1.0, device=self.device)
@@ -999,13 +975,13 @@ class CognitiveOrganism(BaseCognitiveModule):
         self._stacked_params = None
         self._params_dirty = True
         
-        # --- Autonomous Intelligence: Genome Activation ---
+        # --- Autonomous Intelligence: BIOS Activation ---
         self.metabolic_threshold = 0.0 # Safety Init
-        self.update_phenotype_from_governor()
+        self.update_phenotype()
         # --------------------------------------------------
         
-        # Suggested LR from genome (BDNF expression)
-        # Initialized to Config value, updated by update_phenotype_from_genome()
+        # Suggested LR from governor (BDNF expression)
+        # Initialized to Config value, updated by update_phenotype()
         self.suggested_lr = Config.LEARNING_RATE
         
         # --- Consolidation State ---
@@ -1084,38 +1060,69 @@ class CognitiveOrganism(BaseCognitiveModule):
                 print(">>> LGH requested, but kernel is missing in current extension build; falling back to forward_stack_io.")
             if self._lgh_use_int8:
                 print(">>> LGH int8 manifold mode enabled (RAM_INT8_INFER=true).")
-        if not self.exec_cfg.use_forward_stack:
-            raise RuntimeError("USE_FORWARD_STACK must be enabled; no Python reasoning fallback path exists.")
-        print(">>> LGH-Manifold Consolidated Memory Active.")
+        
+        # BIOS scalars are managed via self.governor.config_scalars.
+        # Sync to levels
+        for level in self.levels:
+            level.h_decay_rate = 0.01 + (0.1 * (1.0 - self.governor.creb))
+            
+        print(f">>> BIOS: State synchronized (Gen {self.governor.generation})")
 
-    def update_phenotype_from_governor(self):
-        """Syncs model hyperparameters with the current Governor state."""
-        self.suggested_lr = self.governor.bdnf * Config.LEARNING_RATE
-        self.lambda_sparsity = self.governor.fkbp5 * Config.LAMBDA_COST
-        self.gaba_inhibition = self.governor.gaba
-        self.curve_trajectory_gene = self.governor.curve_trajectory
-        self.mask_sparsity_bias = self.governor.mask_sparsity_bias
-        self.focus_x = self.governor.focus_x
-        self.focus_y = self.governor.focus_y
-        self.focus_z = self.governor.focus_z
-        self.focus_sharpness = self.governor.focus_sharpness
+    def update_phenotype(self):
+        """Map BIOS state (Governor) to physical model hyperparameters."""
+        # BDNF -> Learning Rate (Handled in Trainer usually, but can be scaled here)
+        creb = self.governor.creb
         
-        # Sync flattened attributes
-        self.cfg_lif_decay = float(Config.LIF_DECAY)
-        self.cfg_lif_threshold = float(Config.LIF_THRESHOLD)
-        self.cfg_halt_threshold = float(Config.HALT_THRESHOLD)
-        self.cfg_mes_enabled = bool(Config.MES_ENABLED)
+        # DRD2 -> Gating Threshold (Confidence)
+        # Map 0.1-0.9 to 1.0-6.0 range for STRICT_CONFIDENCE
+        self.confidence_multiplier = 1.0 + (float(self.governor.drd2) * 5.0) 
         
-        # Sync LGH flattened params
-        if hasattr(self, 'lgh_cfg'):
-            self.cfg_lgh_prefetch_distance = int(self.lgh_cfg.prefetch_distance)
-            self.cfg_lgh_low_entropy_fold_threshold = float(self.lgh_cfg.low_entropy_fold_threshold)
-            self.cfg_lgh_wave_radius = int(self.lgh_cfg.wave_radius)
-            self.cfg_lgh_wave_decay = float(self.lgh_cfg.wave_decay)
-            self.cfg_lgh_trace_decay = float(self.lgh_cfg.trace_decay)
-            self.cfg_lgh_trace_gain = float(self.lgh_cfg.trace_gain)
-            self.cfg_lgh_temporal_bins = int(self.lgh_cfg.temporal_bins)
-            self.cfg_thermal_penalty = float(getattr(self.exec_cfg, 'thermal_penalty', 0.0))
+        # FKBP5 -> Target Sparsity Pressure (Metabolic Hunger) & Resonance Error Sensitivity
+        fkbp5 = float(self.governor.fkbp5)
+        metabolic_efficiency = float(getattr(self.governor, 'metabolic_efficiency', 0.5))
+        # Map FKBP5 to lambda_sparsity
+        self.lambda_sparsity = (0.01 * fkbp5) / max(0.25, metabolic_efficiency)
+        
+        # --- COGNITIVE RESONANCE: FKBP5 controls error amplification ---
+        self.fkbp5 = fkbp5
+        
+        # GABA -> Inhibition Control 
+        self.gaba_inhibition = float(self.governor.gaba)
+        self.curve_trajectory_gene = float(getattr(self.governor, 'curve_trajectory', 0.5))
+        self.mask_sparsity_bias = float(getattr(self.governor, 'mask_sparsity_bias', 0.5))
+        self.metabolic_efficiency = float(metabolic_efficiency)
+        self.wormhole_jump_bias = float(getattr(self.governor, 'wormhole_jump_bias', 0.1))
+        self.focus_x = float(getattr(self.governor, 'focus_x', 0.5))
+        self.focus_y = float(getattr(self.governor, 'focus_y', 0.5))
+        self.focus_z = float(getattr(self.governor, 'focus_z', 0.5))
+        self.focus_sharpness = float(getattr(self.governor, 'focus_sharpness', self.lgh_cfg.focus_sharpness))
+        self.temporal_trace_bias = float(getattr(self.governor, 'temporal_trace_bias', 0.5))
+        
+        # BDNF: Learning Rate proxy [0.1, 2.0] -> [1e-5, 1e-2]
+        bdnf_expression = float(self.governor.bdnf)
+        self.suggested_lr = 1e-5 + (bdnf_expression / 2.0) * (1e-2 - 1e-5)
+        
+        # Perfection Penalty
+        if getattr(self.governor, 'best_loss', 1.0) < 0.001:
+             self.lambda_sparsity *= 2.0
+        
+        # Metabolic Threshold
+        self.metabolic_threshold = 0.05 * self.omega
+        
+        # Energy-Aware Learning Rate
+        energy_factor = self.metabolic_efficiency / (1.0 + self.lambda_sparsity * 10.0)
+        self.suggested_lr = self.suggested_lr * energy_factor
+        self._refresh_lgh_curve_from_genome()
+        self._refresh_lgh_prefetch_curve()
+        
+        # BDNF-Scaled Omega Momentum
+        self.omega_momentum = float(Config.OMEGA_STEP) * bdnf_expression
+        
+        # Sync to levels
+        for level in self.levels:
+            level.h_decay_rate = 0.01 + (0.1 * (1.0 - creb))
+            
+        print(f">>> BIOS: Phenotype updated (Gen {self.governor.generation})")
         
         # Sync to levels
         for level in self.levels:
@@ -1124,7 +1131,7 @@ class CognitiveOrganism(BaseCognitiveModule):
         print(f">>> GOVERNOR: Phenotype updated (Gen {self.governor.generation})")
 
     def _imprint_to_manifold(self, p, z, importance):
-        """Placeholder for Manifold Imprinting (titans-style FAST learning)."""
+        # Deprecated: Imprinting handled by NIS firmware kernels directly.
         pass
 
     def _compute_importance_threshold(self, score):
@@ -1326,83 +1333,6 @@ class CognitiveOrganism(BaseCognitiveModule):
         return self.omega
 
     def set_phase(self, phase): self.current_phase = phase
-
-    def update_phenotype_from_genome(self):
-        """Map abstract genes to physical model hyperparameters."""
-        if not hasattr(self, 'genome'):
-            return
-
-        # BDNF -> Learning Rate (Handled in Trainer usually, but can be scaled here)
-        # CREB -> Memory Focus (Currently influence curiosity/stability weights)
-        creb = self.governor.creb
-        # Metabolism gamma is now handled internally by Genome based on CREB
-        
-        # DRD2 -> Gating Threshold (Confidence)
-        drd2 = self.governor.drd2
-        # Map 0.1-0.9 to 1.0-6.0 range for STRICT_CONFIDENCE
-        self.confidence_multiplier = 1.0 + (drd2 * 5.0) # Higher DRD2 -> higher confidence multiplier
-        
-        # FKBP5 -> Target Sparsity Pressure (Metabolic Hunger) & Resonance Error Sensitivity
-        fkbp5 = self.governor.fkbp5
-        metabolic_efficiency = getattr(self.governor, 'metabolic_efficiency', 0.5)
-        # Map FKBP5 to lambda_sparsity
-        self.lambda_sparsity = (0.01 * fkbp5) / max(0.25, metabolic_efficiency)
-        
-        # --- COGNITIVE RESONANCE: FKBP5 controls error amplification ---
-        # High FKBP5 = High stress = High sensitivity to prediction error
-        # Input = (1-GABA)*Raw + FKBP5*Error
-        self.fkbp5 = fkbp5
-        
-        # GABA -> Inhibition Control (Transparency Gate threshold modifier)
-        gaba = self.governor.gaba
-        # Higher GABA = more inhibitory = higher engagement threshold = more bypasses
-        self.gaba_inhibition = gaba
-        self.curve_trajectory_gene = float(getattr(self.governor, 'curve_trajectory', 0.5))
-        self.mask_sparsity_bias = float(getattr(self.governor, 'mask_sparsity_bias', 0.5))
-        self.metabolic_efficiency = float(metabolic_efficiency)
-        self.wormhole_jump_bias = float(getattr(self.governor, 'wormhole_jump_bias', 0.1))
-        self.focus_x = float(getattr(self.governor, 'focus_x', 0.5))
-        self.focus_y = float(getattr(self.governor, 'focus_y', 0.5))
-        self.focus_z = float(getattr(self.governor, 'focus_z', 0.5))
-        self.focus_sharpness = float(getattr(self.governor, 'focus_sharpness', self.lgh_cfg.focus_sharpness))
-        self.temporal_trace_bias = float(getattr(self.governor, 'temporal_trace_bias', 0.5))
-        
-        # BDNF: Learning Rate proxy
-        bdnf_expression = self.governor.bdnf
-        # Map BDNF [0.1, 2.0] to learning rate [1e-5, 1e-2]
-        self.suggested_lr = 1e-5 + (bdnf_expression / 2.0) * (1e-2 - 1e-5)
-        
-        # Perfection Penalty: dynamic multiplier if loss is too low
-        if getattr(self.governor, 'best_loss', 1.0) < 0.001:
-             print(">>> METABOLIC HUNGER: Perfection Penalty Active (2x Sparsity Pressure)")
-             self.lambda_sparsity *= 2.0
-        
-        # --- Metabolic Threshold (Efficiency Pressure) ---
-        # As Omega rises (Autonomy), the threshold for neurons to fire increases
-        self.metabolic_threshold = 0.05 * self.omega
-        
-        # --- Energy-Aware Learning Rate ---
-        # If sparsity pressure is high (FKBP5), effectively "energy is low"
-        # Reduce LR to prevent burnout/instability under high pressure
-        energy_factor = self.metabolic_efficiency / (1.0 + self.lambda_sparsity * 10.0)
-        self.suggested_lr = self.suggested_lr * energy_factor
-        self._refresh_lgh_curve_from_genome()
-        self._refresh_lgh_prefetch_curve()
-        
-        # --- BDNF-Scaled Omega Momentum ---
-        # Omega changes faster when BDNF is high (higher plasticity)
-        self.omega_momentum = self.runtime_cfg.omega_step * bdnf_expression
-        
-        print(f">>> Phenotype Updated (Gen {self.governor.generation}): CREB={creb:.2f} (Stab={self.governor.creb_gamma:.3f}), "
-              f"DRD2={drd2:.2f} (Conf={self.confidence_multiplier:.2f}), "
-              f"FKBP5={fkbp5:.2f} (Sparsity={self.lambda_sparsity:.6f}, Thresh={self.metabolic_threshold:.6f})")
-        print(
-            f">>> GABA={gaba:.2f} | mEff={self.metabolic_efficiency:.2f} | "
-            f"Curve={self.curve_trajectory_gene:.2f} | MaskBias={self.mask_sparsity_bias:.2f} | "
-            f"Wormhole={self.wormhole_jump_bias:.2f} | Focus=({self.focus_x:.2f},{self.focus_y:.2f},{self.focus_z:.2f}) "
-            f"| TraceBias={self.temporal_trace_bias:.2f} | Energy Factor={energy_factor:.2f} "
-            f"-> LR={self.suggested_lr:.2e} | Omega_mom={self.omega_momentum:.4f}"
-        )
 
     def get_engagement_rate(self):
         """Returns current engagement rate for efficiency bonus calculation."""
