@@ -787,6 +787,16 @@ class CognitiveOrganism(BaseCognitiveModule):
             self.max_batch_size, L, R, self.d_s2, C, 
             device=device
         ).contiguous()
+        
+        # Phase 3: Zero-Copy Workspace Allocation (~1GB for B=64, T=512, M=1024)
+        M_dim = self.d_s2 * C
+        self._lgh_workspace_size = Config.BATCH_SIZE * (
+            L * R * M_dim +          # Zone A: H_next
+            Config.SEQ_LEN * R * M_dim + # Zone B: out
+            Config.SEQ_LEN           # Zone C: halt_probs
+        )
+        self.register_buffer('_lgh_workspace', torch.zeros(self._lgh_workspace_size, dtype=torch.float32, device=device))
+        
         self._init_manifold()
         self.register_buffer('_lgh_thermal_penalty_ema', torch.tensor(0.0, dtype=torch.float32, device=self.device))
         self.register_buffer('_lgh_last_freq_ghz', torch.tensor(0.0, dtype=torch.float32, device=self.device))
@@ -1666,7 +1676,7 @@ class CognitiveOrganism(BaseCognitiveModule):
 
         step = int(self.step_counter.item()) if hasattr(self, 'step_counter') else 0
         
-        if self._lgh_use_int8:
+        if self._lgh_use_int8 and hasattr(cpp_loader, 'geometric_manifold_forward_avx512_int8'):
             q_manifold, q_scale = self._quantize_lgh_manifold(bits=8)
             z_lgh, H_next, halt_probs = cpp_loader.geometric_manifold_forward_avx512_int8(
                 p_brain_c, H_c, gate_c, q_manifold, q_scale, idx_c, pidx_c, mdna_c, trace_c,
@@ -1678,6 +1688,16 @@ class CognitiveOrganism(BaseCognitiveModule):
                 float(self.lgh_cfg.wave_decay),
                 float(self.lgh_cfg.trace_decay),
                 float(self.lgh_cfg.trace_gain),
+                int(self.lgh_cfg.temporal_bins)
+            )
+        elif hasattr(cpp_loader, 'pulse_gated_forward'):
+            # Phase 2 & 3: Hardware-Native Pulse + Zero-Copy Workspace
+            z_lgh, H_next, halt_probs = cpp_loader.pulse_gated_forward(
+                p_brain_c, H_c, gate_c, mdna_c, idx_c, manifold, self._lgh_workspace,
+                step, int(h_cycles), int(l_cycles), float(dyn_threshold),
+                int(self.lgh_cfg.prefetch_distance),
+                float(self.exec_cfg.thermal_penalty if hasattr(self.exec_cfg, 'thermal_penalty') else 0.0),
+                float(self.lgh_cfg.low_entropy_fold_threshold),
                 int(self.lgh_cfg.temporal_bins)
             )
         else:
