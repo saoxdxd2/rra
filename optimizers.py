@@ -19,10 +19,15 @@ def adaptive_gradient_clip(model, clip_factor=0.1, eps=1e-3):
     Clips gradients based on the ratio of parameter norm to gradient norm.
     Similar to block-wise AGC.
     """
-    for p in model.parameters():
-        if p.grad is None: continue
-        p_norm = p.detach().data.norm(2)
-        g_norm = p.grad.detach().data.norm(2)
+    params = [p for p in model.parameters() if p.grad is not None]
+    if not params:
+        return
+    
+    # Vectorized norm calculation (much faster than Python loop)
+    p_norms = torch._foreach_norm(params, 2)
+    g_norms = torch._foreach_norm([p.grad for p in params], 2)
+    
+    for p, p_norm, g_norm in zip(params, p_norms, g_norms):
         max_g = p_norm * clip_factor + eps
         if g_norm > max_g:
             p.grad.detach().data.mul_(max_g / (g_norm + eps))

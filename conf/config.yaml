@@ -11,7 +11,7 @@ model:
   C: 4        # Doubled columns for diverse feature extraction
   memory_depth: 8 # Extended hierarchical memory
   neural_cache_enabled: false # Disable reflex pattern cache for reasoning-first training
-  use_fused_cognitive_cycle: false # Keep default off; fused mode needs more stabilization before production training.
+  use_fused_cognitive_cycle: true # Enabled for optimized orchestration.
   use_forward_stack: true # Enabled for C++ stacked reasoning path.
   lgh_enabled: true # Enable Liquid Geometric Hypernetwork path.
   lgh_replace_forward_stack: true # Prefer LGH kernel over legacy forward_stack_io.

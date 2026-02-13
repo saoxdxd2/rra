@@ -382,8 +382,10 @@ class ByteDataset(Dataset):
             start = self.start_offset + ((idx * stride) % self.window_count)
         chunk = self.data[start : start + self.seq_len + 1]
         
-        b = torch.from_numpy(np.frombuffer(chunk, dtype=np.uint8).copy()).long()
-        bits = self.byte_bits_lut[b]
+        # Minimize byte copies by using frombuffer directly
+        b = np.frombuffer(chunk, dtype=np.uint8)
+        # Use vectorized lookup
+        bits = self.byte_bits_lut[torch.from_numpy(b).long()]
         
         xb = bits[:-1] # [seq_len, 8]
         yb = bits[1:]  # [seq_len, 8]
@@ -739,6 +741,11 @@ class RRATrainer:
             step_fn(omega=self.model.omega)
         else:
             step_fn()
+        
+        # After optimizer step, the model parameters (ram_tables usually) changed.
+        # Mark parameters as dirty to force stack sync if using forward_stack kernel.
+        if hasattr(self.model, '_params_dirty'):
+            self.model._params_dirty = True
 
     def _cache(self):
         if not getattr(self.model, 'cache_enabled', False):
