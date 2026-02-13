@@ -148,5 +148,6 @@
 #define NIS_EPSILON                 1e-8f
 #define NIS_WARM_UP_STEPS           2000.0f
 #define NIS_SCALE_CONSTANT          0.1f
+#define NIS_STRICT_CPU_ONLY         0
 
 #endif // BRAIN_ISA_H

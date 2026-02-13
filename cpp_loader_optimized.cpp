@@ -3492,4 +3492,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.attr("OP_GATE") = NIS_OP_GATE;
     m.attr("OP_REFLECT") = NIS_OP_REFLECT;
     m.attr("OP_JMP") = NIS_OP_JMP;
+
+    m.attr("STRICT_CPU_ONLY") = (bool)NIS_STRICT_CPU_ONLY;
 }
