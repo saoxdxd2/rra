@@ -170,6 +170,12 @@ def run_preflight_checks(model, device):
     missing = [op for op in required_ops if not hasattr(cpp_loader, op)]
     if missing:
         raise RuntimeError(f"Missing required cpp_loader ops: {', '.join(missing)}")
+    if bool(getattr(Config, 'LGH_ENABLED', False)) and bool(getattr(Config, 'LGH_REPLACE_FORWARD_STACK', False)):
+        if not hasattr(cpp_loader, 'geometric_manifold_forward_avx512'):
+            logger.warning(
+                ">>> LGH is enabled in config, but C++ op 'geometric_manifold_forward_avx512' is missing. "
+                "Falling back to forward_stack_io path."
+            )
 
     if isinstance(device, torch.device) and device.type != 'cpu':
         raise RuntimeError(
@@ -1499,16 +1505,19 @@ class RRATrainer:
         
         self.model.train()
         val_loss = val_loss / max(1, val_count) if val_count > 0 else epoch_loss
+        thermal_penalty = float(self.model.get_thermal_penalty()) if hasattr(self.model, 'get_thermal_penalty') else 0.0
         
         # Log validation loss to VirtualLab
         if self.model.virtual_lab.enabled:
             self.model.virtual_lab.log_step({
                 'val_loss': val_loss,
                 'loss_task': torch.tensor(epoch_loss),
+                'thermal_penalty': thermal_penalty,
                 't': self.cfg.seq_len,
             })
             self._tb_add_scalar("VirtualLab/val_loss", val_loss)
             self._tb_add_scalar("VirtualLab/generalization_gap", val_loss - epoch_loss)
+            self._tb_add_scalar("VirtualLab/thermal_penalty", thermal_penalty)
             
             # Log warning if memorizing
             if val_loss - epoch_loss > 0.5:
@@ -1525,7 +1534,6 @@ class RRATrainer:
              self._tb_add_scalar("Omega/epoch_value", new_omega, step=self.current_epoch)
 
         # Meta-Evolutionary Loop
-        thermal_penalty = float(self.model.get_thermal_penalty()) if hasattr(self.model, 'get_thermal_penalty') else 0.0
         self.model.genome.evolutionary_step(
             self.model,
             {
