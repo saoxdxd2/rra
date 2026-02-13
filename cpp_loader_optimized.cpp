@@ -1047,7 +1047,7 @@ std::vector<torch::Tensor> neural_cache_lookup_fast(
     const int64_t D = q_c.size(1);
     const int64_t TBL = k_c.size(0);
     const int64_t RAM = k_c.size(1);
-    const int64_t Bits = p_c.size(2);
+    const int64_t Bits = p_c.size(1);
     const int64_t O = v_c.size(2);
 
     auto out = torch::zeros({B, O}, q_c.options());
@@ -1066,19 +1066,41 @@ std::vector<torch::Tensor> neural_cache_lookup_fast(
     #pragma omp parallel for schedule(static)
     for (int64_t b = 0; b < B; b++) {
         const float* q_b = q_ptr + b * D;
+        
+        // Pre-compute query norm squared
+        float q_n = 0.0f;
+#ifdef __AVX512F
+        __m512 q_n_v = _mm512_setzero_ps();
+        for (int64_t d = 0; d < D; d += 16) {
+            __m512 v = _mm512_loadu_ps(q_b + d);
+            q_n_v = _mm512_fmadd_ps(v, v, q_n_v);
+        }
+        q_n = _mm512_reduce_add_ps(q_n_v);
+#else
+        for (int64_t d = 0; d < D; d++) q_n += q_b[d] * q_b[d];
+#endif
+
         float best_sim = -1.0f;
         int64_t best_table_idx = -1;
         int64_t best_slot_idx = -1;
 
         for (int64_t t = 0; t < TBL; t++) {
-            // LSH Hashing Internally (CPU Cache)
+            // LSH Hashing: Optimized [TBL, Bits, D] Layout
             uint64_t hash = 0;
+            const float* p_t = plane_ptr + t * Bits * D;
+            
             for (int64_t bit = 0; bit < Bits; bit++) {
+                const float* p_row = p_t + bit * D;
                 float dot = 0.0f;
-                const float* p_tb = plane_ptr + (t * D * Bits + 0 * Bits + bit);
-                for (int64_t d = 0; d < D; d++) {
-                    dot += q_b[d] * plane_ptr[t * D * Bits + d * Bits + bit];
+#ifdef __AVX512F
+                __m512 dot_v = _mm512_setzero_ps();
+                for (int64_t d = 0; d < D; d += 16) {
+                    dot_v = _mm512_fmadd_ps(_mm512_loadu_ps(q_b + d), _mm512_loadu_ps(p_row + d), dot_v);
                 }
+                dot = _mm512_reduce_add_ps(dot_v);
+#else
+                for (int64_t d = 0; d < D; d++) dot += q_b[d] * p_row[d];
+#endif
                 if (dot > 0.0f) hash |= (1ULL << bit);
             }
             
@@ -1087,16 +1109,27 @@ std::vector<torch::Tensor> neural_cache_lookup_fast(
 
             if (!valid_ptr[t * RAM + slot]) continue;
 
-            // Cosine Similarity
+            // Cosine Similarity: AVX-512 Accelerated
             const float* k_s = k_ptr + (t * RAM + slot) * D;
             float dot_k = 0.0f;
-            float q_n = 0.0f;
             float k_n = 0.0f;
+#ifdef __AVX512F
+            __m512 dot_k_v = _mm512_setzero_ps();
+            __m512 k_n_v = _mm512_setzero_ps();
+            for (int64_t d = 0; d < D; d += 16) {
+                __m512 q_v = _mm512_loadu_ps(q_b + d);
+                __m512 k_v = _mm512_loadu_ps(k_s + d);
+                dot_k_v = _mm512_fmadd_ps(q_v, k_v, dot_k_v);
+                k_n_v = _mm512_fmadd_ps(k_v, k_v, k_n_v);
+            }
+            dot_k = _mm512_reduce_add_ps(dot_k_v);
+            k_n = _mm512_reduce_add_ps(k_n_v);
+#else
             for (int64_t d = 0; d < D; d++) {
                 dot_k += q_b[d] * k_s[d];
-                q_n += q_b[d] * q_b[d];
                 k_n += k_s[d] * k_s[d];
             }
+#endif
             float sim = dot_k / (std::sqrt(q_n * k_n) + 1e-8f);
             
             if (sim > key_similarity_threshold && sim > best_sim) {
@@ -1814,8 +1847,8 @@ std::vector<at::Tensor> mes_super_step_io(at::Tensor, at::Tensor, std::vector<at
 torch::Tensor survival_update_io(at::Tensor, at::Tensor, std::vector<at::Tensor>, at::Tensor);
 torch::Tensor survival_mask_io(at::Tensor, at::Tensor, std::vector<at::Tensor>, at::Tensor);
 std::vector<torch::Tensor> survival_losses_io(at::Tensor, at::Tensor, std::vector<at::Tensor>, at::Tensor);
-std::vector<at::Tensor> fused_cognitive_step(at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, int64_t, int64_t, float, float, float, at::Tensor, at::Tensor, float);
-std::vector<at::Tensor> fused_cognitive_cycle_ultra(at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, int64_t, int64_t, float, float, float, at::Tensor, at::Tensor, float);
+std::vector<at::Tensor> fused_cognitive_step(at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, int64_t, int64_t, float, float, float, at::Tensor, at::Tensor, float, bool=false, at::Tensor=at::Tensor(), at::Tensor=at::Tensor(), at::Tensor=at::Tensor(), at::Tensor=at::Tensor());
+std::vector<at::Tensor> fused_cognitive_cycle_ultra(at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, int64_t, int64_t, float, float, float, at::Tensor, at::Tensor, float, bool=false, at::Tensor=at::Tensor(), at::Tensor=at::Tensor(), at::Tensor=at::Tensor(), at::Tensor=at::Tensor());
 
 // Command codes for unified_dispatch_io
 enum CognitiveCmd {
@@ -1835,7 +1868,12 @@ std::vector<at::Tensor> fused_cognitive_step(
     int64_t h_cycles, int64_t l_cycles,
     float lif_decay, float lif_threshold, float halt_threshold,
     at::Tensor h_out, at::Tensor y_out,
-    float tax_rate
+    float tax_rate,
+    bool survival_enabled,
+    at::Tensor usage,
+    at::Tensor reliability,
+    at::Tensor H_prev,
+    at::Tensor survival_scalars
 ) {
     const int64_t B = x.size(0);
     const int64_t T = x.size(1);
@@ -1844,23 +1882,31 @@ std::vector<at::Tensor> fused_cognitive_step(
     const int64_t M = H.size(3) * H.size(4);
     
     auto x_c = ensure_contig(x);
-    auto h_c = h_out.defined() ? ensure_contig(h_out) : H.clone();
-    auto m_c = ensure_contig(mask);
+    auto h_curr = h_out.defined() ? ensure_contig(h_out) : H.clone();
+    
+    at::Tensor m_c;
+    float* m_ptr = nullptr;
+    if (survival_enabled && usage.defined() && reliability.defined() && survival_scalars.defined() && survival_scalars.numel() >= 3) {
+        m_c = survival_mask(usage, reliability, survival_scalars[0].item<float>(), survival_scalars[1].item<float>(), survival_scalars[2].item<float>());
+        m_ptr = m_c.data_ptr<float>();
+    } else {
+        m_c = ensure_contig(mask);
+        m_ptr = m_c.data_ptr<float>();
+    }
     auto t_c = ensure_contig(tables);
     auto d_c = ensure_contig(delays);
     auto c_c = ensure_contig(conns);
     auto dec_c = ensure_contig(decays);
     
-    float* h_ptr = h_c.data_ptr<float>();
-    float* m_ptr = m_c.data_ptr<float>();
+    float* h_ptr = h_curr.data_ptr<float>();
     float* t_ptr = t_c.data_ptr<float>();
     float* d_ptr = d_c.data_ptr<float>();
     int64_t* c_ptr = c_c.data_ptr<int64_t>();
     float* dec_ptr = dec_c.data_ptr<float>();
     
     int total_steps = (int)(h_cycles * l_cycles);
-    auto y_seq = y_out.defined() ? y_out : torch::zeros({B, T, R, M}, x.options());
-    float* y_ptr = y_seq.data_ptr<float>();
+    auto y_seq_step = y_out.defined() ? y_out : torch::zeros({B, T, R, M}, x.options());
+    float* y_ptr = y_seq_step.data_ptr<float>();
 
     #ifdef __AVX512F
     const __m512 v_lif_threshold = _mm512_set1_ps(lif_threshold);
@@ -1952,7 +1998,7 @@ std::vector<at::Tensor> fused_cognitive_step(
         // 3. Metabolic Taxation
         if (tax_rate > 0.0f) {
             #pragma omp parallel for schedule(static)
-            for (int64_t i = 0; i < h_c.numel(); i++) h_ptr[i] *= (1.0f - tax_rate);
+            for (int64_t i = 0; i < h_curr.numel(); i++) h_ptr[i] *= (1.0f - tax_rate);
         }
 
         if (global_max_delta < 1e-6f) break;
@@ -1969,8 +2015,8 @@ std::vector<at::Tensor> fused_cognitive_step(
             }
         }
     }
-
-    return {y_seq, h_c};
+    
+    return {y_seq_step, h_curr};
 }
 
 // --- FUSED COGNITIVE CYCLE ULTRA (Sequence Loop) ---
@@ -1981,28 +2027,43 @@ std::vector<at::Tensor> fused_cognitive_cycle_ultra(
     int64_t h_cycles, int64_t l_cycles,
     float lif_decay, float lif_threshold, float halt_threshold,
     at::Tensor h_out, at::Tensor y_out,
-    float tax_rate
+    float tax_rate,
+    bool survival_enabled,
+    at::Tensor usage,
+    at::Tensor reliability,
+    at::Tensor H_prev,
+    at::Tensor survival_scalars
 ) {
     const int64_t B = x.size(0);
     const int64_t T = x.size(1);
     
-    at::Tensor h_next = h_out.defined() ? h_out : H.clone();
+    at::Tensor h_iter = h_out.defined() ? h_out : H.clone();
     at::Tensor y_seq = y_out.defined() ? y_out : torch::zeros({B, T, NIS::R, NIS::WORKING_DIM / NIS::C, NIS::C}, x.options());
     
+    // Initial state for survival update logic
+    at::Tensor h_initial = H.clone();
+
     for (int64_t t = 0; t < T; t++) {
         auto out_step = fused_cognitive_step(
-            x.narrow(1, t, 1), h_next, mask,
+            x.narrow(1, t, 1), h_iter, mask,
             delays, tables, conns,
             decays, hw, hb,
             h_cycles, l_cycles,
             lif_decay, lif_threshold, halt_threshold,
-            h_next, at::Tensor(), 
-            tax_rate
+            h_iter, at::Tensor(), 
+            tax_rate,
+            survival_enabled, usage, reliability, at::Tensor(), survival_scalars
         );
+        h_iter = out_step[1];
         y_seq.narrow(1, t, 1).copy_(out_step[0].view_as(y_seq.narrow(1, t, 1)));
     }
     
-    return {y_seq, h_next};
+    at::Tensor new_usage = usage;
+    if (survival_enabled && usage.defined() && survival_scalars.defined() && survival_scalars.numel() >= 6) {
+        new_usage = survival_update(h_iter, h_initial, usage, survival_scalars[3].item<float>(), survival_scalars[4].item<float>(), survival_scalars[5].item<float>());
+    }
+
+    return {y_seq, h_iter, new_usage};
 }
 
 std::vector<at::Tensor> unified_dispatch_io(
@@ -2013,20 +2074,34 @@ std::vector<at::Tensor> unified_dispatch_io(
     int64_t cmd
 ) {
     switch (cmd) {
-        case CMD_FUSED_CYCLE_ULTRA:
+        case CMD_FUSED_CYCLE_ULTRA: {
+            bool survival = (scalars.size(0) > 6 && scalars[6].item<float>() > 0.5f);
             return fused_cognitive_cycle_ultra(x, state, params[0], params[1], params[2], params[3], params[4], params[5], params[6], 
                 (int64_t)scalars[0].item<float>(), (int64_t)scalars[1].item<float>(),
                 scalars[2].item<float>(), scalars[3].item<float>(), scalars[4].item<float>(),
                 (params.size() > 7) ? params[7] : at::Tensor(),
                 (params.size() > 8) ? params[8] : at::Tensor(),
-                scalars[5].item<float>());
-        case CMD_FUSED_STEP:
+                scalars[5].item<float>(),
+                survival,
+                (survival && params.size() > 9) ? params[9] : at::Tensor(),
+                (survival && params.size() > 10) ? params[10] : at::Tensor(),
+                (survival && params.size() > 11) ? params[11] : at::Tensor(),
+                (survival && scalars.size(0) > 12) ? scalars.slice(0, 7, 13) : at::Tensor());
+        }
+        case CMD_FUSED_STEP: {
+            bool survival = (scalars.size(0) > 6 && scalars[6].item<float>() > 0.5f);
             return fused_cognitive_step(x, state, params[0], params[1], params[2], params[3], params[4], params[5], params[6], 
                 (int64_t)scalars[0].item<float>(), (int64_t)scalars[1].item<float>(),
                 scalars[2].item<float>(), scalars[3].item<float>(), scalars[4].item<float>(),
                 (params.size() > 7) ? params[7] : at::Tensor(),
                 (params.size() > 8) ? params[8] : at::Tensor(),
-                scalars[5].item<float>());
+                scalars[5].item<float>(),
+                survival,
+                (survival && params.size() > 9) ? params[9] : at::Tensor(),
+                (survival && params.size() > 10) ? params[10] : at::Tensor(),
+                (survival && params.size() > 11) ? params[11] : at::Tensor(),
+                (survival && scalars.size(0) > 12) ? scalars.slice(0, 7, 13) : at::Tensor());
+        }
         case CMD_FORWARD_STACK:
             return fused_cognitive_step(x, state, params[0], params[1], params[2], params[3], params[4], params[5], params[6], 
                 1, (int64_t)scalars[1].item<float>(),

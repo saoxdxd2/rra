@@ -22,7 +22,7 @@ class TestMemorySystem(unittest.TestCase):
         query = torch.randn(self.B, self.D)
         keys = torch.randn(self.TBL, self.RAM, self.D)
         values = torch.randn(self.TBL, self.RAM, self.O)
-        planes = torch.randn(self.TBL, self.D, self.BITS)
+        planes = torch.randn(self.TBL, self.BITS, self.D)
         valid = torch.ones(self.TBL, self.RAM, dtype=torch.bool)
         
         # Insert a specific key-value pair to verify "hit"
@@ -34,7 +34,7 @@ class TestMemorySystem(unittest.TestCase):
         # Calculate hash for query[0] on table 0
         hash_val = 0
         for bit in range(self.BITS):
-            dot = torch.dot(target_q, planes[target_tbl, :, bit])
+            dot = torch.dot(target_q, planes[target_tbl, bit, :])
             if dot > 0:
                 hash_val |= (1 << bit)
         
@@ -66,7 +66,7 @@ class TestMemorySystem(unittest.TestCase):
         query = torch.randn(B_large, self.D)
         keys = torch.randn(self.TBL, RAM_large, self.D)
         values = torch.randn(self.TBL, RAM_large, self.O)
-        planes = torch.randn(self.TBL, self.D, self.BITS)
+        planes = torch.randn(self.TBL, self.BITS, self.D)
         valid = torch.ones(self.TBL, RAM_large, dtype=torch.bool)
         
         # Warmup

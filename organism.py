@@ -17,35 +17,6 @@ _ACCEL = get_accelerator()
 cpp_loader = _ACCEL.loader
 
 
-def _cpp_ready(*tensors):
-    return _ACCEL.ready(None, *tensors)
-
-
-def _cpp_has(op_name, *tensors):
-    return _ACCEL.has(op_name, *tensors)
-
-
-def _cpp_try(op_name, *args, tensors=None):
-    return _ACCEL.call(op_name, *args, tensors=tensors)
-
-
-
-# ---------------------------
-# Hyperparameters & Constants
-# ---------------------------
-
-# --- COMPUTE WASTE RANKING ($O(N^n)$ Analysis) ---
-# 1. RAMTupleLayer.forward (Python): RANK 1 (CRITICAL WASTE)
-#    Why: Nested Python loop [M, K] with per-bit spiking logic.
-#    Solution: Already uses cpp_loader.dcls_ram_lookup as primary path.
-#
-# 2. CognitiveOrganism.forward (H-Cycle): RANK 2 (HIGH WASTE)
-#    Why: Triple nested loop [H_cycles, L_cycles, L].
-#    Target for Speedup: JIT compilation (torch.compile) or C++ layer-stacking.
-#
-# 3. parallel_scan_optimized: RANK 3 (MEDIUM WASTE)
-#    Why: Large memory footprints during cumsum.
-# --------------------------------------------------
 # ---------------------------
 # ---------------------------
 # NIS FIRMWARE AUTHORITY
@@ -112,7 +83,7 @@ class _LGH_BIOS:
 # ---------------------------
 def rms_norm(x, eps=Config.RMS_NORM_EPS):
     """RMSNorm via C++ kernel (fail-fast if unavailable)."""
-    return _cpp_try('rms_norm', x.contiguous(), eps, tensors=(x,))
+    return _ACCEL.call('rms_norm', x.contiguous(), eps, tensors=(x,))
 
 
 @dataclass
@@ -248,8 +219,7 @@ class Governor(nn.Module):
         self.config_scalars[4] = float(tps_pressure)
         
         # Unified command 4 = CMD_SURVIVAL_MASK
-        from accelerator import Accelerator
-        acc = Accelerator.get_instance()
+        acc = _ACCEL
         out = acc.call('unified_dispatch_io', self.usage, self.reliability, [], self.config_scalars, 4)
         return out[0] if isinstance(out, (list, tuple)) and len(out) > 0 else out
 
@@ -348,10 +318,10 @@ def init_state(L, R, D, C, device=DEVICE, scale=Config.INIT_SCALE):
 
 def parallel_scan_optimized(u, decay):
     """Pruned parallel scan; restricted to recursive updates if Phase 0."""
-    return _cpp_try('parallel_scan', u.contiguous(), decay.contiguous(), tensors=(u, decay))
+    return _ACCEL.call('parallel_scan', u.contiguous(), decay.contiguous(), tensors=(u, decay))
 
 def fused_rms_mean(x_seq):
-    return _cpp_try('fused_rms_mean', x_seq.contiguous(), tensors=(x_seq,))
+    return _ACCEL.call('fused_rms_mean', x_seq.contiguous(), tensors=(x_seq,))
 
 # ---------------------------
 # Virtual Lab
@@ -547,31 +517,47 @@ class VNNILinear(nn.Module):
     Path B: Feed-Forward Projection using INT8 VNNI (Ice Lake)
     Wraps cpp_loader.quantized_matmul for high throughput.
     """
-    def __init__(self, in_features, out_features, bias=True, device=DEVICE):
+    def __init__(self, in_features, out_features, bias=True, device=DEVICE, buffers=None):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
-        self.weight = nn.Parameter(torch.randn(out_features, in_features, device=device) * 0.02)
-        if bias:
-            self.bias = nn.Parameter(torch.zeros(out_features, device=device))
+        
+        if buffers is not None:
+            # Zero-Copy Views
+            self.weight_ref = buffers['halt_w']
+            self.bias_ref = buffers['halt_b']
         else:
-            self.register_parameter('bias', None)
+            self.weight = nn.Parameter(torch.randn(out_features, in_features, device=device) * 0.02)
+            if bias:
+                self.bias = nn.Parameter(torch.zeros(out_features, device=device))
+            else:
+                self.register_parameter('bias', None)
         
         # Cache for quantized weights to avoid redundant work
         self.register_buffer('w_q', None)
         self.register_buffer('scale_w', None)
         self._is_quantized = False
 
+    @property
+    def weight_param(self):
+        return self.weight_ref if hasattr(self, 'weight_ref') else self.weight
+
+    @property
+    def bias_param(self):
+        return self.bias_ref if hasattr(self, 'bias_ref') else self.bias
+
     def quantize(self):
         """Pre-quantize weights for high-throughput inference."""
         with torch.no_grad():
-            w_max = torch.max(torch.abs(self.weight), dim=1, keepdim=True).values.clamp(min=1e-6)
+            w = self.weight_param
+            w_max = torch.max(torch.abs(w), dim=1, keepdim=True).values.clamp(min=1e-6)
             self.scale_w = w_max / 127.0
-            self.w_q = torch.round(self.weight / self.scale_w).to(torch.int8)
+            self.w_q = torch.round(w / self.scale_w).to(torch.int8)
             self._is_quantized = True
 
     def forward(self, x):
-        if _cpp_ready(x) and not self.training: # Use VNNI for inference speedup
+        acc = _ACCEL
+        if acc.ready('quantized_matmul') and not self.training: # Use VNNI for inference speedup
             if not self._is_quantized:
                 self.quantize()
             
@@ -593,28 +579,43 @@ class VNNILinear(nn.Module):
         raise RuntimeError("VNNILinear: C++ kernels (quantized_matmul) not ready in inference mode.")
 
 class RAMTupleLayer(nn.Module):
-    def __init__(self, M, K, D_in, device=DEVICE):
+    def __init__(self, M, K, D_in, device=DEVICE, buffers=None):
         super().__init__()
         self.M, self.K, self.D_in = M, K, D_in
         self.device = device
         self.ram_int8_infer = bool(Config.RAM_INT8_INFER)
         
-        # FIX #2: Log-Normal Delay Initialization
-        # Biases toward recent past (t-1, t-2) with long tail for far past
-        log_delays = torch.randn(M, K, device=device) * Config.DELAY_INIT_STD
-        delays_raw = torch.exp(log_delays)
-        # Clamp to reasonable range
-        self.delays = nn.Parameter(torch.clamp(delays_raw, Config.DELAY_MIN, Config.DELAY_MAX))
-        
-        self.ram_tables = nn.Parameter(torch.randn(M, 1 << K, device=device) * Config.RAM_INIT_SCALE)
-        self.register_buffer('connections', torch.randint(0, D_in, (M, K), device=device))
+        if buffers is not None:
+            # External buffer view (Zero-Copy)
+            # buffers: {'delays': ..., 'tables': ..., 'conns': ...}
+            self.delays_ref = buffers['delays']
+            self.ram_tables_ref = buffers['tables']
+            self.connections = buffers['conns']
+        else:
+            # FIX #2: Log-Normal Delay Initialization
+            # Biases toward recent past (t-1, t-2) with long tail for far past
+            log_delays = torch.randn(M, K, device=device) * Config.DELAY_INIT_STD
+            delays_raw = torch.exp(log_delays)
+            # Clamp to reasonable range
+            self.delays = nn.Parameter(torch.clamp(delays_raw, Config.DELAY_MIN, Config.DELAY_MAX))
+            self.ram_tables = nn.Parameter(torch.randn(M, 1 << K, device=device) * Config.RAM_INIT_SCALE)
+            self.register_buffer('connections', torch.randint(0, D_in, (M, K), device=device))
+            
         self.register_buffer('ram_tables_q', torch.zeros(M, 1 << K, dtype=torch.int8, device=device))
         self.register_buffer('ram_scales', torch.ones(M, dtype=torch.float32, device=device))
         self._quantized_valid = False
 
+    @property
+    def delays_param(self):
+        return self.delays_ref if hasattr(self, 'delays_ref') else self.delays
+
+    @property
+    def ram_tables_param(self):
+        return self.ram_tables_ref if hasattr(self, 'ram_tables_ref') else self.ram_tables
+
     @torch.no_grad()
     def _refresh_quantized_tables(self):
-        tables = self.ram_tables.detach().float()
+        tables = self.ram_tables_param.detach().float()
         scales = tables.abs().amax(dim=1).clamp(min=1e-6) / 127.0
         q = torch.round(tables / scales.unsqueeze(1)).clamp(-127.0, 127.0).to(torch.int8)
         self.ram_scales.copy_(scales)
@@ -640,28 +641,11 @@ class BaseCognitiveModule(nn.Module):
             return x.to(self.device)
         return x.to(self.device, dtype=dtype)
 
-    @staticmethod
-    def _ensure_contig(x):
-        if isinstance(x, torch.Tensor):
-            return x if x.is_contiguous() else x.contiguous()
-        return x
-
-    @staticmethod
-    def _require_dim(x, expected, name):
-        if x.dim() != expected:
-            raise ValueError(f"{name} must have {expected} dims, got {tuple(x.shape)}")
-
-    @staticmethod
-    def _require_cpu(*tensors):
-        for idx, t in enumerate(tensors):
-            if isinstance(t, torch.Tensor) and t.device.type != 'cpu':
-                raise RuntimeError(f"Tensor at position {idx} must be on CPU for this path.")
-
 # BaseOrganismLayer removed; utilities moved to BaseCognitiveModule.
 
 
 class OrganismLevel(BaseCognitiveModule):
-    def __init__(self, R, D, C, device=DEVICE, cfg=Config):
+    def __init__(self, R, D, C, device=DEVICE, cfg=Config, buffers=None):
         super().__init__(device=device)
         self.R, self.D, self.C = R, D, C
         self.cfg = cfg
@@ -669,22 +653,32 @@ class OrganismLevel(BaseCognitiveModule):
         self.omega_ref = 0.0  # Synced from parent CognitiveOrganism
         self.h_decay_rate = self.cfg.BYPASS_H_DECAY  # Light memory decay during bypass
         
-        self.wsnn = RAMTupleLayer(M=D*C, K=8, D_in=D*C, device=device)
-        self.halt_head = VNNILinear(D * C, 1).to(device)
-        self.firing_rate_ema = torch.tensor(0.5, device=device)
+        if buffers is not None:
+            # Zero-Copy Path
+            self.wsnn = RAMTupleLayer(M=D*C, K=8, D_in=D*C, device=device, buffers=buffers['wsnn'])
+            self.halt_head = VNNILinear(D * C, 1, device=device, buffers=buffers['halt'])
+            self.raw_decay_ref = buffers['decay']
+        else:
+            self.wsnn = RAMTupleLayer(M=D*C, K=8, D_in=D*C, device=device)
+            self.halt_head = VNNILinear(D * C, 1, device=device)
+            # Decay Parameter: Learned scalar per block, initialized for stability
+            self.raw_decay = nn.Parameter(
+                (torch.randn(self.R, 1, device=device) * self.cfg.DECAY_INIT_SCALE) 
+                + self.cfg.DECAY_INIT_OFFSET
+            )
         
-        # Decay Parameter: Learned scalar per block, initialized for stability
-        self.raw_decay = nn.Parameter(
-            (torch.randn(self.R, 1, device=device) * self.cfg.DECAY_INIT_SCALE) 
-            + self.cfg.DECAY_INIT_OFFSET
-        )
+        self.firing_rate_ema = torch.tensor(0.5, device=device)
         
         # MES state for C++ optimizer (batched_ademamix_update)
         if self.cfg.MES_ENABLED:
             # Consolidated AdEMAMix state: [m_fast, m_slow, v_opt]
             # Shape: [3, R, K, D_in]
-            self.register_buffer('optimizer_state', torch.zeros(3, *self.wsnn.ram_tables.shape, device=device))
+            self.register_buffer('optimizer_state', torch.zeros(3, *self.wsnn.ram_tables_param.shape, device=device))
             self.opt_step = 1
+
+    @property
+    def raw_decay_param(self):
+        return self.raw_decay_ref if hasattr(self, 'raw_decay_ref') else self.raw_decay
 
                                     
 
@@ -734,7 +728,42 @@ class CognitiveOrganism(BaseCognitiveModule):
         self.governor = Governor(L=L, R=R, input_dim=self.d_s1 * self.C, device=self.device)
         
         # System 2: Slow/Reasoning Path (D_S2)
-        self.levels = nn.ModuleList([OrganismLevel(R, self.d_s2, C, device=device, cfg=Config) for _ in range(L)])
+        # --- ZERO-COPY PARAMETER ARCHITECTURE ---
+        # Allocate monolithic buffers for all layers to eliminate per-step stacking overhead.
+        M = self.d_s2 * self.C
+        K = 8
+        self.register_parameter('_stacked_delays', nn.Parameter(torch.empty(L, M, K, device=self.device)))
+        self.register_parameter('_stacked_tables', nn.Parameter(torch.empty(L, M, 256, device=self.device)))
+        self.register_buffer('_stacked_conns', torch.empty(L, M, K, dtype=torch.long, device=self.device))
+        self.register_parameter('_stacked_decays', nn.Parameter(torch.empty(L, R, 1, device=self.device)))
+        self.register_parameter('_stacked_halt_w', nn.Parameter(torch.empty(L, 1, M, device=self.device)))
+        self.register_parameter('_stacked_halt_b', nn.Parameter(torch.empty(L, 1, device=self.device)))
+        
+        # Initialize monolithic buffers
+        with torch.no_grad():
+            self._stacked_delays.copy_(torch.exp(torch.randn(L, M, K, device=self.device) * Config.DELAY_INIT_STD).clamp(Config.DELAY_MIN, Config.DELAY_MAX))
+            self._stacked_tables.copy_(torch.randn(L, M, 256, device=self.device) * Config.RAM_INIT_SCALE)
+            self._stacked_conns.copy_(torch.randint(0, self.d_s1 * self.C, (L, M, K), device=self.device))
+            self._stacked_decays.copy_((torch.randn(L, R, 1, device=self.device) * Config.DECAY_INIT_SCALE) + Config.DECAY_INIT_OFFSET)
+            self._stacked_halt_w.copy_(torch.randn(L, 1, M, device=self.device) * 0.02)
+            self._stacked_halt_b.copy_(torch.zeros(L, 1, device=self.device))
+
+        # Instantiate levels using narrowed views
+        self.levels = nn.ModuleList()
+        for i in range(L):
+            level_buffers = {
+                'wsnn': {
+                    'delays': self._stacked_delays[i],
+                    'tables': self._stacked_tables[i],
+                    'conns': self._stacked_conns[i],
+                },
+                'halt': {
+                    'halt_w': self._stacked_halt_w[i],
+                    'halt_b': self._stacked_halt_b[i],
+                },
+                'decay': self._stacked_decays[i]
+            }
+            self.levels.append(OrganismLevel(R, self.d_s2, C, device=device, cfg=Config, buffers=level_buffers))
         self.hpc_enabled = bool(Config.HPC_ENABLED)
         self._hpc_dim = self.d_s2 * C
         if self.hpc_enabled and self.L > 1:
@@ -1073,37 +1102,16 @@ class CognitiveOrganism(BaseCognitiveModule):
             self.register_buffer('_lgh_synaptic_trace', torch.empty(0, dtype=torch.float32, device=self.device))
             self.register_buffer('_lgh_morton_order', torch.empty(0, dtype=torch.long, device=self.device))
     
-    def _sync_stacked_params(self):
-        """
-        Cache and synchronize parameters for C++ forward_stack kernel.
-        Returns a dict of stacked Tensors for all levels.
-        """
-        step = int(self.step_counter.item())
-        if self._stacked_params is not None and not self._params_dirty:
-            return self._stacked_params
-        
-        # Stack parameters from all levels
-        delays = torch.stack([level.wsnn.delays for level in self.levels])       # [L, M, K]
-        tables = torch.stack([level.wsnn.ram_tables for level in self.levels])   # [L, M, 2^K]
-        conns = torch.stack([level.wsnn.connections for level in self.levels])   # [L, M, K]
-        decays_raw = torch.stack([level.raw_decay.view(self.R, -1) for level in self.levels])  # [L, R, D*C]
-        # Stability: recurrent decay must stay in (0, 1) for bounded state dynamics.
-        decays = torch.sigmoid(decays_raw)
-        decays = torch.nan_to_num(decays, nan=0.9, posinf=0.999, neginf=1e-4).clamp(1e-4, 0.999)
-        halt_w = torch.stack([level.halt_head.weight.view(-1) for level in self.levels])  # [L, D*C]
-        halt_b = torch.cat([level.halt_head.bias for level in self.levels])              # [L]
-        
-        self._stacked_params = {
-            'delays': delays.contiguous(),
-            'tables': tables.contiguous(),
-            'conns': conns.contiguous(),
-            'decays': decays.contiguous(),
-            'halt_w': halt_w.contiguous(),
-            'halt_b': halt_b.contiguous(),
+    def _get_fused_params(self):
+        """Zero-copy view preparation of monolithic buffers for C++ kernels."""
+        return {
+            'delays': self._stacked_delays,
+            'tables': self._stacked_tables,
+            'conns': self._stacked_conns,
+            'decays': torch.sigmoid(self._stacked_decays).clamp(1e-4, 0.999),
+            'halt_w': self._stacked_halt_w.view(self.L, -1), # [L, M]
+            'halt_b': self._stacked_halt_b.view(self.L), # [L]
         }
-        self._stacked_params_step = step
-        self._params_dirty = False
-        return self._stacked_params
 
     def _cpp_io_call(self, op_name, x_input, state, params=None, scalars=None):
         params = [] if params is None else list(params)
@@ -1115,7 +1123,7 @@ class CognitiveOrganism(BaseCognitiveModule):
             scalar_tensor = torch.as_tensor(scalars, dtype=torch.float32, device=x_input.device).contiguous()
         io_tensors = [x_input, state, scalar_tensor]
         io_tensors.extend([p for p in params if isinstance(p, torch.Tensor)])
-        return _cpp_try(
+        return _ACCEL.call(
             op_name,
             x_input,
             state,
@@ -1133,7 +1141,7 @@ class CognitiveOrganism(BaseCognitiveModule):
         
         acc = _ACCEL
         
-        # IO Parameters: Base parameters + Zero-Copy output views
+        # IO Parameters: Monolithic buffers + Zero-Copy output views
         io_params = [
             p_stack['delays'], p_stack['tables'], p_stack['conns'],
             p_stack['decays'], p_stack['halt_w'], p_stack['halt_b'],
@@ -1163,30 +1171,47 @@ class CognitiveOrganism(BaseCognitiveModule):
         return y_seq, h_next, p_halt
 
     def _batched_mes_optimizer_step(self):
-        """Apply MES optimizer updates across all levels using required C++ batched kernel."""
+        """Apply MES optimizer updates across all layers using monolithic buffers."""
         with torch.no_grad():
-            params_list = [l.wsnn.ram_tables for l in self.levels]
+            # Use views into monolithic buffer
+            params_list = [self._stacked_tables[i] for i in range(self.L)]
             grads_list = []
-            for level in self.levels:
-                grad = level.wsnn.ram_tables.grad
-                if grad is None:
-                    zero_buf = getattr(level, '_zero_grad_ram', None)
-                    if zero_buf is None or zero_buf.shape != level.wsnn.ram_tables.shape:
-                        zero_buf = torch.zeros_like(level.wsnn.ram_tables)
-                        level.register_buffer('_zero_grad_ram', zero_buf)
-                    grads_list.append(zero_buf)
-                else:
-                    grads_list.append(grad)
+            
+            # Gradients are still on the monolithic buffer
+            full_grad = self._stacked_tables.grad
+            if full_grad is None:
+                # Fallback to per-level gradients if monolithic gradient is missing
+                # (Should not happen if optimizer is correctly configured)
+                for level in self.levels:
+                    grad = level.wsnn.ram_tables_param.grad
+                    if grad is None:
+                        zero_buf = getattr(level, '_zero_grad_ram', None)
+                        if zero_buf is None or zero_buf.shape != level.wsnn.ram_tables_param.shape:
+                            zero_buf = torch.zeros_like(level.wsnn.ram_tables_param)
+                            level.register_buffer('_zero_grad_ram', zero_buf)
+                        grads_list.append(zero_buf)
+                    else:
+                        grads_list.append(grad)
+            else:
+                grads_list = [full_grad[i] for i in range(self.L)]
+
             m_fast_list = [l.optimizer_state[0] for l in self.levels]
             m_slow_list = [l.optimizer_state[1] for l in self.levels]
             v_list = [l.optimizer_state[2] for l in self.levels]
             global_step = int(self.levels[0].opt_step)
-            cpp_loader.batched_ademamix_update(
+            
+            _ACCEL.call(
+                'batched_ademamix_update',
                 params_list, grads_list, m_fast_list, m_slow_list, v_list,
-                Config.LEARNING_RATE, 0.9, 0.9999, 0.999,
-                0.99,
-                1e-8,
-                global_step
+                self.suggested_lr,
+                float(getattr(Config, 'ADEMAMIX_BETA1_FAST', 0.9)),
+                float(getattr(Config, 'ADEMAMIX_BETA1_SLOW', 0.9999)),
+                float(getattr(Config, 'ADEMAMIX_BETA2', 0.999)),
+                0.99, # alpha mixing
+                float(getattr(Config, 'EPSILON', 1e-8)),
+                float(getattr(Config, 'WEIGHT_DECAY', 0.0)),
+                float(getattr(Config, 'METABOLIC_TAX_RATE', 0.0001)),
+                int(global_step)
             )
             for level in self.levels:
                 level.opt_step += 1
@@ -1643,26 +1668,28 @@ class CognitiveOrganism(BaseCognitiveModule):
 
         raise ValueError(f"Unsupported last dimension for x: {x.size(-1)} (expected 8 or {self.d_s1 * self.C}).")
 
-    def _run_unified_cycle(self, p_brain, H, gate, B, T, h_cycles, l_cycles, dyn_threshold):
+    def _run_unified_cycle(self, p_brain, H, gate, B, T, h_cycles, l_cycles, dyn_threshold, metabolic_pressure=0.0, tps_pressure=0.0):
+        acc = _ACCEL
         if not (
-            _cpp_has('unified_dispatch_io')
+            acc.has('unified_dispatch_io')
             and bool(Config.USE_FUSED_COGNITIVE_CYCLE)
         ):
-            return False, None, None, None
+            return False, None, None, None, None
 
-        p_stack = self._sync_stacked_params()
+        p_stack = self._get_fused_params()
         gate_cpp = gate.reshape(self.L, self.R) if gate.dim() > 2 else gate
         p_brain_c = p_brain.float().contiguous()
         H_c = H.contiguous()
         gate_c = gate_cpp.float().contiguous()
         
-        acc = _ACCEL
-        
         # Sequence-aware workspace views (Zero-Copy)
         h_o = self._lgh_h_view[:B].view(B, self.L, self.R, self.d_s2, self.C)
         y_o = self._lgh_y_view[:B, :T].reshape(B, T, self.R, self.d_s2, self.C)
         
-        # params: [mask, delays, tables, conns, decays, hw, hb, h_out, y_out]
+        # Unified Metabolic Fusion
+        survival_enabled = self._should_update_survival()
+        
+        # params: [mask, delays, tables, conns, decays, hw, hb, h_out, y_out, usage, reliability]
         io_params = [
             gate_c, 
             p_stack['delays'], p_stack['tables'], p_stack['conns'],
@@ -1670,18 +1697,31 @@ class CognitiveOrganism(BaseCognitiveModule):
             h_o, y_o
         ]
         
-        # scalars: [h_cycles, l_cycles, lif_decay, lif_threshold, halt_threshold, tax_rate]
+        if survival_enabled:
+            io_params += [self.governor.usage, self.governor.reliability]
+        
+        # scalars: [h_cycles, l_cycles, lif_decay, lif_threshold, halt_threshold, tax_rate, survival, ...]
         scalars = torch.tensor([
             float(h_cycles), float(l_cycles),
             float(Config.LIF_DECAY), float(Config.LIF_THRESHOLD), float(dyn_threshold),
-            float(getattr(Config, 'METABOLIC_TAX_RATE', 0.01))
+            float(getattr(Config, 'METABOLIC_TAX_RATE', 0.01)),
+            1.0 if survival_enabled else 0.0,
+            float(metabolic_pressure), float(tps_pressure),
+            float(getattr(Config, 'MIN_KEEP_RATIO', 0.1)),
+            float(self.governor.config_scalars[0]), # gamma
+            float(self.governor.config_scalars[1]), # importance
+            float(self.governor.config_scalars[2])  # surprise
         ], device=H.device)
 
         # Unified command 6 = CMD_FUSED_STEP (with L-R parallelization)
         # Using CMD_FUSED_CYCLE_ULTRA (5) for sequence-wide fusion if T > 1
         cmd = 5 if T > 1 else 6
-        y_seq, h_next = acc.call('unified_dispatch_io', p_brain_c, H_c, io_params, scalars, cmd)
-        return True, y_seq, h_next, torch.zeros(B, 1, 1, device=H.device)
+        output = acc.call('unified_dispatch_io', p_brain_c, H_c, io_params, scalars, cmd)
+        
+        y_seq, h_next = output[0], output[1]
+        new_usage = output[2] if len(output) > 2 else None
+        
+        return True, y_seq, h_next, torch.zeros(B, 1, 1, device=H.device), new_usage
 
     def _lgh_morton_manifold(self):
         if (not bool(Config.LGH_ENABLED)) or (self.lgh_manifold_morton is None):
@@ -2052,13 +2092,17 @@ class CognitiveOrganism(BaseCognitiveModule):
             halting_probability = torch.zeros(B, 1, 1, dtype=torch.float32, device=self.device)
             h_cycles_used = 0.0
         else:
-            unified_ok, z_L_unified, H_next_unified, halting_probability_unified = self._run_unified_cycle(
-                p_brain, H, gate, B, T, h_cycles_cfg, l_cycles_cfg, dyn_threshold
+            unified_ok, z_L_unified, H_next_unified, halting_probability_unified, new_usage = self._run_unified_cycle(
+                p_brain, H, gate, B, T, h_cycles_cfg, l_cycles_cfg, dyn_threshold,
+                metabolic_pressure=lambda_sparsity, tps_pressure=tps_pressure
             )
             if unified_ok:
                 z_L = z_L_unified
                 H_next = H_next_unified
                 halting_probability = halting_probability_unified
+                if new_usage is not None:
+                    self.governor.usage.copy_(new_usage)
+                    should_update_survival = False # Prevent redundant update below
             else:
                 cos_sin = self.rope(T, self.device)
                 z_L, H_next, halting_probability = self._step_inner(
@@ -2163,9 +2207,10 @@ class CognitiveOrganism(BaseCognitiveModule):
         """
         Reasoning Core: Integrated C++ Stack Fusion (no Python fallback).
         """
+        acc = _ACCEL
         if not bool(Config.USE_FORWARD_STACK):
             raise RuntimeError("USE_FORWARD_STACK must be enabled; Python reasoning fallback is removed.")
-        if not _cpp_has('forward_stack_io', z_L, z_H):
+        if not acc.has('forward_stack_io'):
             raise RuntimeError("Missing required C++ op 'forward_stack_io'.")
         if not (
             (not torch.is_grad_enabled())
@@ -2175,7 +2220,7 @@ class CognitiveOrganism(BaseCognitiveModule):
             )
         ):
             raise RuntimeError("forward_stack_io path is required; incompatible grad mode for this configuration.")
-        p_stack = self._sync_stacked_params()
+        p_stack = self._get_fused_params()
         if dyn_threshold is None:
             dyn_threshold = self._compute_dyn_halt_threshold()
         use_l_cycles = int(Config.L_CYCLES) if l_cycles is None else max(1, int(l_cycles))

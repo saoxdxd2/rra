@@ -22,7 +22,7 @@ class LSHReflex(nn.Module):
         dev = torch.device(device)
         self.register_buffer(
             'planes',
-            (torch.randn(num_tables, input_dim, hash_bits, device=dev) / (input_dim ** 0.5)).contiguous()
+            (torch.randn(num_tables, hash_bits, input_dim, device=dev) / (input_dim ** 0.5)).contiguous()
         )
         self.register_buffer(
             'bit_powers',
@@ -31,8 +31,8 @@ class LSHReflex(nn.Module):
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Projects input into hash space using precomputed planes."""
-        # Create Once, Reuse Forever: Planes and bit_powers are buffers
-        projection = torch.einsum('bd,tdh->bth', x, self.planes)
+        # Optimized Layout: [TBL, Bits, D] for C++ AVX-512 fusion
+        projection = torch.einsum('bd,thd->bth', x, self.planes)
         bits = (projection > 0).to(dtype=torch.long)
         return (bits * self.bit_powers).sum(dim=-1)
 

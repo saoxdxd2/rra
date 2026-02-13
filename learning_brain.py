@@ -43,7 +43,7 @@ class LearningBrain(nn.Module):
         return F.binary_cross_entropy_with_logits(out, targets)
 
 
-    def calculate_unified_loss(self, L_task: torch.Tensor, L_stability: torch.Tensor, omega: float, thermal_penalty: float = 0.0) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    def calculate_unified_loss(self, L_task: torch.Tensor, L_stability: torch.Tensor, omega: float, L_teacher: Optional[torch.Tensor] = None, thermal_penalty: float = 0.0) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """Combines task and stability losses into a single modulated objective."""
         lambda_stability = Config.SURVIVAL_WEIGHT * (1.0 - omega * 0.8)
         
@@ -51,10 +51,18 @@ class LearningBrain(nn.Module):
         if thermal_penalty > 0:
             lambda_stability *= (1.0 + thermal_penalty)
 
-        L_total = L_task + lambda_stability * L_stability
+        # Distillation balance: If teacher exists, blend it with direct task loss
+        if L_teacher is not None:
+            # We favor teacher when omega is low (early training)
+            L_task_eff = (1.0 - omega) * L_teacher + omega * L_task
+        else:
+            L_task_eff = L_task
+
+        L_total = L_task_eff + lambda_stability * L_stability
         
         return L_total, {
             'L_task': L_task.item() if hasattr(L_task, 'item') else L_task,
+            'L_teacher': L_teacher.item() if L_teacher is not None else 0.0,
             'L_stability': L_stability.item() if hasattr(L_stability, 'item') else L_stability,
             'omega': omega,
             'lambda_stability': lambda_stability,
@@ -78,11 +86,12 @@ class LearningBrain(nn.Module):
 
     def calculate_metabolic_losses(self, H, H_prev=None):
         """Calculates metabolic energy, cost, and surprise losses via C++ kernel."""
-        from organism import _cpp_try
+        from accelerator import get_accelerator
+        acc = get_accelerator()
         H_c = H.contiguous()
         H_prev_t = H_prev.contiguous() if H_prev is not None else torch.empty(0, device=H.device, dtype=H_c.dtype)
         
-        return _cpp_try(
+        return acc.call(
             'survival_losses_io',
             H_c,
             H_prev_t,

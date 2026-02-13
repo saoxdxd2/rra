@@ -38,10 +38,11 @@ def run_benchmarks():
     # 2. Neural Cache Lookup Fast Benchmark
     # Represents System 1 reflex path latency
     B, D_in, D_out = 64, 256, 8
+    hash_bits = 8
     query = torch.randn(B, D_in, device=device)
     keys = torch.randn(4, 1024, D_in, device=device)
     values = torch.randn(4, 1024, D_out, device=device)
-    planes = torch.randn(4, D_in, 8, device=device)
+    planes = torch.randn(4, hash_bits, D_in, device=device)
     valid = torch.ones(4, 1024, device=device).bool()
     
     t_avg = benchmark_kernel("neural_cache_lookup_fast", cpp.neural_cache_lookup_fast, (query, keys, values, planes, valid, 0.8, True))
