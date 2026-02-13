@@ -65,6 +65,52 @@ D = Config.WORKING_DIM
 C = Config.C
 DEVICE = getattr(Config, 'DEVICE', torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
 
+class _LGH_BIOS:
+    """Architectural bridge for LGH spatial logic, utilizing C++ Authority mapping."""
+    def __init__(self, L, R, order, depth=5):
+        self.L = L
+        self.R = R
+        self.depth = depth
+        self.size_original = L * R
+        self.size = L * R * depth
+        self.order = order # Morton -> Topological mapping
+        
+    def morton_to_original(self, indices):
+        return self.order[indices]
+    
+    def focus_distance(self, original_indices, focus_point):
+        # original_indices are row-major: l * (R*Depth) + r * Depth + d
+        # But wait, make_morton_order in C++ uses: l * (R * Depth) + r * Depth + d
+        l = torch.div(original_indices, self.R * self.depth, rounding_mode='floor')
+        rem = torch.remainder(original_indices, self.R * self.depth)
+        r = torch.div(rem, self.depth, rounding_mode='floor')
+        d = torch.remainder(rem, self.depth)
+        
+        # Normalize to [0, 1]
+        ln = l.float() / max(1, self.L - 1)
+        rn = r.float() / max(1, self.R - 1)
+        dn = d.float() / max(1, self.depth - 1)
+        
+        fx, fy, fz = focus_point
+        dx = ln - fx
+        dy = rn - fy
+        dz = dn - fz
+        return torch.sqrt(dx*dx + dy*dy + dz*dz)
+
+    def temporal_fold_morton(self, morton_indices, delta_t, temporal_bins, fold_alpha=0.25):
+        # Simplification: shift by delta_t in the Morton index space (or temporal dimension)
+        if temporal_bins <= 1: return morton_indices
+        shift = int(delta_t) % temporal_bins
+        return (morton_indices + shift * self.size) % (self.size * temporal_bins)
+
+    def curve_segment_morton(self, start, length, wrap=True, **kwargs):
+        indices = torch.arange(start, start + length, device=self.order.device)
+        if wrap:
+            indices = torch.remainder(indices, self.size)
+        else:
+            indices = indices.clamp(0, self.size - 1)
+        return indices
+
 # ---------------------------
 # Modern Layers (Recurrent Cognitive Architecture)
 # ---------------------------
@@ -1107,7 +1153,10 @@ class CognitiveOrganism(BaseCognitiveModule):
             self.register_buffer('_lgh_prefetch_curve_indices', curve_orig.to(dtype=torch.long))
             self.register_buffer('_lgh_mdna_mask', torch.ones(self.L, self.R, dtype=torch.float32, device=self.device))
             self.register_buffer('_lgh_synaptic_trace', torch.zeros(n, dtype=torch.float32, device=self.device))
-            self.register_buffer('_lgh_morton_order', self._lgh_morton.order.clone().to(dtype=torch.long))
+            
+            # Anchor legacy logic to new BIOS bridge
+            self._lgh_morton = _LGH_BIOS(self.L, self.R, self._lgh_order, depth=self.lgh_cfg.morton_depth)
+            self.register_buffer('_lgh_morton_order', self._lgh_order.clone().to(dtype=torch.long))
         else:
             self.lgh_manifold_morton = None
             self.register_buffer('_lgh_curve_indices', torch.empty(0, dtype=torch.long, device=self.device))

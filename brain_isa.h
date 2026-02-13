@@ -116,6 +116,9 @@ namespace NIS {
     static constexpr float LGH_THERMAL_FREQ_MIN_GHZ= 2.0f;
     static constexpr float LGH_THERMAL_EMA_DECAY   = 0.99f;
     static constexpr float LGH_THERMAL_PENALTY_WEIGHT = 0.5f;
+    static constexpr float LGH_THERMAL_SAMPLE_EVERY_S = 2.0f;
+    static constexpr float LGH_SIMD_CYCLE_PENALTY_WEIGHT = 0.15f;
+    static constexpr float LGH_SIMD_STARVATION_THRESHOLD = 1200.0f;
     static constexpr int64_t LGH_ALIGN_MULTIPLE     = 64;
     static constexpr int64_t LGH_TEMPORAL_BINS      = 16;
     static constexpr float LGH_TEMPORAL_FOLD_ALPHA  = 0.25f;
@@ -219,7 +222,14 @@ namespace NIS {
     static constexpr int64_t CONSOLIDATE_EVERY    = 1000;
     static constexpr int64_t PHENOTYPE_UPDATE_EVERY = 100;
     static constexpr float OMEGA_STEP             = 0.01f;
+    static constexpr int64_t OMEGA_STEP_UPDATE_EVERY = 250;
+    static constexpr int64_t GENOME_STEP_UPDATE_EVERY = 5000;
     static constexpr const char* MERGE_POLICY     = "weighted";
+
+    static constexpr float DYNAMIC_ENERGY_SCALE   = 0.1f;
+    static constexpr float REFLEX_DROPOUT_RATE    = 0.1f;
+    static constexpr int64_t GLOBAL_PULSE_EVERY   = 250;
+    static constexpr float GLOBAL_PULSE_WEIGHT    = 0.25f;
 
     // Hardware Morton Jump (PDEP)
     inline uint64_t morton_jump_4d(uint32_t x, uint32_t y, uint32_t z, uint32_t t) {
