@@ -108,6 +108,22 @@ namespace NIS {
     static constexpr float LGH_TRACE_GAIN      = 0.20f;
     static constexpr float LGH_FOCUS_STRENGTH  = 0.35f;
     static constexpr float LGH_FOCUS_SHARPNESS = 2.0f;
+    static constexpr bool  LGH_REPLACE_FORWARD_STACK = false;
+    static constexpr bool  LGH_CURVE_WRAP          = true;
+    static constexpr float LGH_MASK_MIN_KEEP       = 0.1f;
+    static constexpr float LGH_MASK_MAX_KEEP       = 0.9f;
+    static constexpr int64_t LGH_PREFETCH_DISTANCE = 4;
+    static constexpr float LGH_THERMAL_FREQ_MIN_GHZ= 2.0f;
+    static constexpr float LGH_THERMAL_EMA_DECAY   = 0.99f;
+    static constexpr float LGH_THERMAL_PENALTY_WEIGHT = 0.5f;
+    static constexpr int64_t LGH_ALIGN_MULTIPLE     = 64;
+    static constexpr int64_t LGH_TEMPORAL_BINS      = 16;
+    static constexpr float LGH_TEMPORAL_FOLD_ALPHA  = 0.25f;
+    static constexpr int64_t LGH_WAVE_RADIUS        = 1;
+    static constexpr float LGH_WAVE_DECAY           = 0.65f;
+    static constexpr float LGH_LOW_ENTROPY_FOLD_THRESHOLD = 0.015f;
+    static constexpr float LGH_INT4_UNCERTAINTY_THRESHOLD = 0.05f;
+    static constexpr float LGH_FP32_UNCERTAINTY_THRESHOLD = 0.18f;
 
     /**
      * HPC Metadata (Cognitive Monitor)
@@ -121,6 +137,24 @@ namespace NIS {
     static constexpr float   HPC_FOLD_ALPHA          = 0.95f;
     static constexpr float   HPC_SURPRISE_THRESHOLD  = 0.20f;
     static constexpr float   HPC_TEMPORAL_THRESHOLD  = 0.08f;
+    
+    static constexpr float   HPC_CYCLE_MIN_SCALE    = 0.5f;
+    static constexpr float   HPC_CYCLE_MAX_SCALE    = 2.0f;
+    static constexpr int64_t HPC_H_CYCLES_MAX       = 4;
+    static constexpr int64_t HPC_L_CYCLES_MAX       = 16;
+    static constexpr int64_t HPC_MONITOR_EVERY      = 10;
+    static constexpr float   HPC_LOCAL_LOSS_WEIGHT  = 0.1f;
+    static constexpr bool    HPC_SURPRISE_GATE      = true;
+    static constexpr float   HPC_SURPRISE_MIN_SCALE = 0.1f;
+    static constexpr bool    HPC_SURPRISE_SKIP_ENABLED = true;
+    static constexpr float   HPC_SURPRISE_SKIP_SCALE = 0.01f;
+    static constexpr bool    HPC_TEMPORAL_GATE_ENABLED = true;
+    static constexpr float   HPC_TEMPORAL_GATE_THRESHOLD = 0.15f;
+    static constexpr float   HPC_TEMPORAL_GATE_MIN_SCALE = 0.1f;
+    static constexpr bool    HPC_TEMPORAL_GATE_SKIP_ENABLED = true;
+    static constexpr float   HPC_TEMPORAL_GATE_SKIP_SCALE  = 0.01f;
+    static constexpr int64_t HPC_TEMPORAL_GATE_WINDOW      = 8;
+    static constexpr float   HPC_SURPRISE_LOSS_WEIGHT      = 0.1f;
 
     /**
      * SIMD & Alignment Physics
@@ -175,6 +209,17 @@ namespace NIS {
     
     static constexpr float PHASE_0_KEEP_RATIO     = 0.5f;
     static constexpr float DISSONANCE_CONFIDENCE_THRESHOLD = 0.5f;
+
+    static constexpr int64_t AUDIT_PERIOD_STEPS   = 100;
+    static constexpr float AUDIT_RANDOM_PROB      = 0.01f;
+    static constexpr float IMPORTANCE_STD_FACTOR  = 2.0f;
+    static constexpr float IMPORTANCE_EMA_DECAY   = 0.95f;
+    static constexpr bool  MES_SUPER_KERNEL       = true;
+    static constexpr int64_t MES_SKIP_STEP        = 1;
+    static constexpr int64_t CONSOLIDATE_EVERY    = 1000;
+    static constexpr int64_t PHENOTYPE_UPDATE_EVERY = 100;
+    static constexpr float OMEGA_STEP             = 0.01f;
+    static constexpr const char* MERGE_POLICY     = "weighted";
 
     // Hardware Morton Jump (PDEP)
     inline uint64_t morton_jump_4d(uint32_t x, uint32_t y, uint32_t z, uint32_t t) {
