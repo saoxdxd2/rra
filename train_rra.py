@@ -701,7 +701,7 @@ class RRATrainer:
                     self._perf_prev = dict(snap)
             except Exception:
                 self._perf_prev = {}
-        if hasattr(self.model, 'genome') and hasattr(self.model.governor, 'policy'):
+        if hasattr(self.model.governor, 'policy'):
             try:
                 self.model.governor.policy.config.simd_penalty_weight = float(self.cfg.simd_cycle_penalty_weight)
                 self.model.governor.policy.config.simd_starvation_threshold = float(self.cfg.simd_starvation_threshold)
@@ -1767,38 +1767,25 @@ class RRATrainer:
             cache.prune_lru(fraction=self.cfg.ram_prune_fraction)
 
     def _runtime_toggle_state(self):
+        """Snapshot current runtime toggles from the authoritative Config layer."""
         return {
-            'mes_enabled': bool(self.cfg.mes_enabled),
-            'cache_enabled': bool(getattr(self.model, 'cache_enabled', False)),
-            'episodic_enabled': bool(getattr(self.model, 'episodic_enabled', True)),
-            'pruning_enabled': bool(getattr(self.model, 'pruning_enabled', True)),
-            'lgh_enabled': bool(getattr(self.model, 'cfg_lgh_enabled', False)),
+            'mes_enabled': bool(Config.MES_ENABLED),
+            'cache_enabled': bool(Config.NEURAL_CACHE_ENABLED),
+            'lgh_enabled': bool(Config.LGH_ENABLED),
         }
 
     def _apply_runtime_toggles(self, toggles):
+        """Write runtime toggles directly to the authoritative Config layer."""
         if toggles is None:
             return
-        clean = {
-            'mes_enabled': bool(toggles.get('mes_enabled', self.cfg.mes_enabled)),
-            'cache_enabled': bool(toggles.get('cache_enabled', getattr(self.model, 'cache_enabled', False))),
-            'episodic_enabled': bool(toggles.get('episodic_enabled', getattr(self.model, 'episodic_enabled', True))),
-            'pruning_enabled': bool(toggles.get('pruning_enabled', getattr(self.model, 'pruning_enabled', True))),
-            'lgh_enabled': bool(toggles.get('lgh_enabled', getattr(self.model, 'cfg_lgh_enabled', False))),
-        }
-        self.cfg.mes_enabled = clean['mes_enabled']
-        if hasattr(self.model, 'set_runtime_toggles'):
-            self.model.set_runtime_toggles(
-                mes_enabled=clean['mes_enabled'],
-                cache_enabled=clean['cache_enabled'],
-                episodic_enabled=clean['episodic_enabled'],
-                pruning_enabled=clean['pruning_enabled'],
-                lgh_enabled=clean['lgh_enabled'],
-            )
-        else:
-            if hasattr(self.model, 'cache_enabled'):
-                self.model.cache_enabled = clean['cache_enabled']
-            if hasattr(self.model, 'mes_cfg'):
-                self.model.mes_cfg.enabled = clean['mes_enabled']
+        # Apply to Config (BIOS authority) — the model reads these directly.
+        if 'mes_enabled' in toggles:
+            Config.MES_ENABLED = bool(toggles['mes_enabled'])
+            self.cfg.mes_enabled = bool(toggles['mes_enabled'])
+        if 'cache_enabled' in toggles:
+            Config.NEURAL_CACHE_ENABLED = bool(toggles['cache_enabled'])
+        if 'lgh_enabled' in toggles:
+            Config.LGH_ENABLED = bool(toggles['lgh_enabled'])
 
     def _perf_reset(self):
         if cpp_loader is None:
@@ -1909,8 +1896,6 @@ class RRATrainer:
             ("baseline", {}),
             ("no_lgh", {'lgh_enabled': False}),
             ("no_cache", {'cache_enabled': False}),
-            ("no_episodic", {'episodic_enabled': False}),
-            ("no_pruning", {'pruning_enabled': False}),
             ("no_mes", {'mes_enabled': False}),
         ]
         snapshot = self._snapshot_for_ablation()
@@ -2047,13 +2032,11 @@ class RRATrainer:
     def cleanup_old_checkpoints(self, checkpoint_dir, keep_best=True):
         """
         Deletes all epoch-specific checkpoints except the most recent one.
-        Always keeps 'best_model.pt', 'genome_best.pt', and 'latest.pt'.
+        Always keeps 'best_model.pt', 'bios_best.pt', and 'latest.pt'.
         """
         try:
             files = [f for f in os.listdir(checkpoint_dir) if f.endswith('.pt')]
-            protected_files = {'latest.pt'}
-            if keep_best:
-                protected_files.update({'best_model.pt', 'genome_best.pt'})
+            protected_files = {'best_model.pt', 'bios_best.pt', 'latest.pt'}
             
             # Identify epoch files: rra_epoch_X.pt
             epoch_files = []
