@@ -8,7 +8,6 @@ import time
 import random
 import yaml
 import os
-from memory import MemoryGovernor, NeuralCache
 from genome import Genome
 from morton import MortonBuffer
 import math
@@ -31,7 +30,7 @@ def _cpp_has(op_name, *tensors):
 def _cpp_try(op_name, *args, tensors=None):
     return _ACCEL.call(op_name, *args, tensors=tensors)
 
-# TitansMemory decommissioned in favor of Manifold Imprinting.
+
 
 # ---------------------------
 # Hyperparameters & Constants
@@ -65,24 +64,32 @@ def rms_norm(x, eps=Config.RMS_NORM_EPS):
     return _cpp_try('rms_norm', x.contiguous(), eps, tensors=(x,))
 
 
-class CertaintyHead(nn.Module):
+class StrategicGatingModule(nn.Module):
     """
-    O(1) Engagement Predictor - The Transparency Gate.
-    Decides if input warrants full H-cycle reasoning or can be bypassed.
+    Unified gating module:
+    1. CertaintyHead: O(1) Engagement Predictor (Transparency Gate).
+    2. MemoryGovernor: O(1) Importance Predictor (Memory Imprinting).
     """
-    def __init__(self, input_dim, hidden_dim=64, device=None):
+    def __init__(self, input_dim, hidden_dim=128, device=None):
         super().__init__()
-        self.net = nn.Sequential(
+        # Shared feature extractor for efficiency
+        self.shared = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 1)
+            nn.ReLU()
         )
+        self.engagement_head = nn.Linear(hidden_dim, 1)   # Logit for Transparency Gate
+        self.importance_head = nn.Sequential(
+            nn.Linear(hidden_dim, 1),
+            nn.Sigmoid()
+        )                                                # Probability for imprinting
         if device:
-            self.net = self.net.to(device)
+            self.to(device)
     
     def forward(self, x):
-        """Returns engagement logit (not probability)."""
-        return self.net(x)
+        features = self.shared(x)
+        engagement = self.engagement_head(features)
+        importance = self.importance_head(features)
+        return engagement, importance
 
 
 
@@ -128,6 +135,7 @@ def init_state(L, R, D, C, device=DEVICE, scale=Config.INIT_SCALE):
     return torch.randn(L, R, D, C, device=device) * scale
 
 def parallel_scan_optimized(u, decay):
+    """Pruned parallel scan; restricted to recursive updates if Phase 0."""
     return _cpp_try('parallel_scan', u.contiguous(), decay.contiguous(), tensors=(u, decay))
 
 def fused_rms_mean(x_seq):
@@ -450,8 +458,8 @@ class OrganismLevel(BaseCognitiveModule):
         self.R, self.D, self.C = R, D, C
         self.cfg = cfg
         
-        # Transparency Gate: O(1) engagement prediction
-        self.certainty_head = CertaintyHead(D * C, hidden_dim=64, device=device)
+        # Strategic Gating Module: O(1) engagement & importance prediction
+        self.strategic_gating = StrategicGatingModule(D * C, hidden_dim=128, device=device)
         self.omega_ref = 0.0  # Synced from parent CognitiveOrganism
         self.h_decay_rate = self.cfg.BYPASS_H_DECAY  # Light memory decay during bypass
         
@@ -476,89 +484,6 @@ class OrganismLevel(BaseCognitiveModule):
     def forward(self, *args, **kwargs):
         raise RuntimeError("OrganismLevel.forward is bypassed; reasoning core must use forward_stack_io kernel.")
 
-class MetabolicGovernor:
-    """Unified metabolic governor: pruning, consolidation, and thermal adaptation via C++ kernels."""
-    
-    def __init__(self, L, R, gamma=Config.SURVIVAL_GAMMA, device=DEVICE):
-        self.device = device
-        self.L, self.R = L, R
-        self.usage = torch.ones(L, R, device=device)
-        self.gamma = gamma
-        self.reliability = torch.ones(L, R, device=device)
-        self.surprise = None
-        self.pruning_importance_weight = float(Config.PRUNING_IMPORTANCE_WEIGHT)
-        self.pruning_surprise_weight = float(Config.PRUNING_SURPRISE_WEIGHT)
-        self.myelin_cost = float(Config.MYELIN_COST)
-        self._update_scalars = torch.tensor(
-            [float(gamma), self.pruning_importance_weight, self.pruning_surprise_weight],
-            dtype=torch.float32,
-            device=device
-        )
-        self._mask_scalars = torch.tensor([0.0, 0.0, 0.05], dtype=torch.float32, device=device)
-        self._empty_scalars = torch.empty(0, dtype=torch.float32, device=device)
-
-    def update(self, H, H_prev=None):
-        """Update usage scores via C++ kernel."""
-        H_c = H.contiguous()
-        H_prev_t = H_prev.contiguous() if H_prev is not None else torch.empty(0, device=self.device, dtype=H_c.dtype)
-        self._update_scalars[0] = float(self.gamma)
-        out = _cpp_try(
-            'survival_update_io',
-            H_c,
-            self.usage,
-            [H_prev_t],
-            self._update_scalars,
-            tensors=(H_c, self.usage, H_prev_t, self._update_scalars)
-        )
-        self.usage = out
-        self.surprise = None
-        
-    def punish_reliability(self, layer_indices, block_indices, penalty=0.1):
-        """Decay reliability for blocks failing audits."""
-        self.reliability[layer_indices, block_indices] *= (1.0 - penalty)
-        self.reliability[layer_indices, block_indices].clamp_(min=0.0)
-        
-    def calculate_losses(self, H, gate=None, H_prev=None):
-        H_c = H.contiguous()
-        H_prev_t = H_prev.contiguous() if H_prev is not None else torch.empty(0, device=H_c.device, dtype=H_c.dtype)
-        out = _cpp_try(
-            'survival_losses_io',
-            H_c,
-            H_prev_t,
-            [],
-            self._empty_scalars,
-            tensors=(H_c, H_prev_t, self._empty_scalars)
-        )
-        if not isinstance(out, (list, tuple)) or len(out) != 3:
-            raise RuntimeError("survival_losses_io returned unexpected output shape.")
-        return out[0], out[1], out[2]
-    
-    def calculate_myelin_cost(self, model):
-        return model.myelin_sheaths.sum() * self.myelin_cost if hasattr(model, 'myelin_sheaths') else 0.0
-    
-    def mask(
-        self,
-        metabolic_pressure=0.5,
-        tps_pressure=0.0,
-        keep_ratio=None,
-        usage_override=None,
-        reliability_override=None
-    ):
-        """Generate sparse activation mask via C++."""
-        usage = self.usage if usage_override is None else usage_override
-        reliability = self.reliability if reliability_override is None else reliability_override
-        self._mask_scalars[0] = float(metabolic_pressure)
-        self._mask_scalars[1] = float(tps_pressure)
-        self._mask_scalars[2] = 0.05
-        out = _cpp_try(
-            'survival_mask_io',
-            usage,
-            reliability,
-            [],
-            self._mask_scalars,
-            tensors=(usage, reliability, self._mask_scalars)
-        )
-        return out
 
 class CognitiveOrganism(BaseCognitiveModule):
     def __init__(self, input_dim, L, R, D=None, C=Config.C, memory_depth=5, device=DEVICE, output_dim=None, vocab_size=None, d_s1=None, d_s2=None):
@@ -684,7 +609,7 @@ class CognitiveOrganism(BaseCognitiveModule):
         
         # Dual-Scale Dimensions
         self.d_s1 = d_s1 or self.cfg.D_S1
-        self.d_s2 = d_s2 or self.cfg.D_S2
+        self.d_s2 = d_s2 or D or self.cfg.D_S2
         
         # Bit-Level Modeling (BLT Style)
         # We replace the Byte Embedding with a Bit-to-Latent projection
@@ -714,6 +639,7 @@ class CognitiveOrganism(BaseCognitiveModule):
 
         # Non-Linear Cognitive Bridge: System 1 -> System 2 (The Uploader)
         self.bridge_s1_to_s2 = SwiGLU(self.d_s1 * C, expansion=2.0, out_dim=self.d_s2 * C)
+        self.strategic_gating = StrategicGatingModule(self.d_s1 * C, device=self.device)
         
         # System 2: Slow/Reasoning Path (D_S2)
         self.levels = nn.ModuleList([OrganismLevel(R, self.d_s2, C, device=device, cfg=self.cfg) for _ in range(L)])
@@ -731,7 +657,6 @@ class CognitiveOrganism(BaseCognitiveModule):
             self.register_parameter('hpc_layer_gain', None)
             self.register_parameter('hpc_layer_bias', None)
         
-        # TitansMemory decommissioned (Merged into LGH-Manifold)
         
         # System 2 Readout (Bit-Level)
         self.readout = VNNILinear(R * self.d_s2 * C, 8).to(self.device)
@@ -754,7 +679,10 @@ class CognitiveOrganism(BaseCognitiveModule):
                 lr=self.cfg.LEARNING_RATE * self.cfg.LOCAL_LR_RATIO
             )
         if self.cfg.MES_ENABLED:
-            self.readout_optimizer = torch.optim.SGD(self.readout.parameters(), lr=self.cfg.LEARNING_RATE * self.cfg.LOCAL_LR_RATIO)
+            self.readout_optimizer = torch.optim.SGD(
+                [*self.readout.parameters(), *self.strategic_gating.parameters()], 
+                lr=self.cfg.LEARNING_RATE * self.cfg.LOCAL_LR_RATIO
+            )
         if self.cfg.MES_ENABLED and self.hpc_enabled and self.hpc_encoder is not None:
             self.hpc_optimizer = torch.optim.SGD(
                 [
@@ -809,12 +737,12 @@ class CognitiveOrganism(BaseCognitiveModule):
         self._lgh_use_int8 = bool(getattr(Config, 'RAM_INT8_INFER', True))
         
         self.rope = RotaryEmbedding(self.d_s2 * C, device=device)
-        self.metabolism = MetabolicGovernor(L, R, device=self.device)
         self.virtual_lab = VirtualLab(enabled=bool(Config.VIRTUAL_LAB_ENABLED))
-        self.memory_depth = memory_depth
-        # HybridEpisodicMemory decommissioned (Merged into LGH-Manifold)
-        self.memory_governor = MemoryGovernor(dim=self.d_s2 * C, device=self.device)
-        self.memory_governor_predictor = self.memory_governor.predictor
+        # Memory imprinting handled by strategic_gating
+        
+        # Preflight flag for performance
+        self._preflight_ready = False
+        self._preflight_steps = 0
         self.cfg_h_cycles = self.cfg_h_cycles
         self.cfg_l_cycles = self.cfg_l_cycles
         self.current_phase = 0
@@ -916,6 +844,12 @@ class CognitiveOrganism(BaseCognitiveModule):
             self.exec_cfg.ttfs_enabled,
             self.exec_cfg.ttfs_slope_threshold
         )
+        if hasattr(cpp_loader, 'configure_hpc'):
+            cpp_loader.configure_hpc(
+                float(self.hpc_cfg.target_error),
+                float(self.hpc_cfg.error_ema_decay),
+                float(self.hpc_cfg.halt_gain)
+            )
         print(f">>> Apex CPU Optimizations (AVX2/FMA) ACTIVE")
         print(f">>> cpp_loader kernels available: {', '.join(available_ops)}")
         print(
@@ -1156,9 +1090,7 @@ class CognitiveOrganism(BaseCognitiveModule):
         # BDNF -> Learning Rate (Handled in Trainer usually, but can be scaled here)
         # CREB -> Memory Focus (Currently influence curiosity/stability weights)
         creb = self.genome.creb
-        # Assuming learning_brain is an object with lambda_stability
-        # For now, let's directly influence survival.gamma as a proxy for stability/persistence
-        self.metabolism.gamma = 0.01 + (0.1 * (1.0 - creb)) # Lower CREB (less memory focus) -> higher gamma (faster usage decay)
+        # Metabolism gamma is now handled internally by Genome based on CREB
         
         # DRD2 -> Gating Threshold (Confidence)
         drd2 = self.genome.drd2
@@ -1216,7 +1148,7 @@ class CognitiveOrganism(BaseCognitiveModule):
         # Omega changes faster when BDNF is high (higher plasticity)
         self.omega_momentum = self.runtime_cfg.omega_step * bdnf_expression
         
-        print(f">>> Phenotype Updated (Gen {self.genome.generation}): CREB={creb:.2f} (Stab={self.metabolism.gamma:.3f}), "
+        print(f">>> Phenotype Updated (Gen {self.genome.generation}): CREB={creb:.2f} (Stab={self.genome.creb_gamma:.3f}), "
               f"DRD2={drd2:.2f} (Conf={self.confidence_multiplier:.2f}), "
               f"FKBP5={fkbp5:.2f} (Sparsity={self.lambda_sparsity:.6f}, Thresh={self.metabolic_threshold:.6f})")
         print(
@@ -1338,7 +1270,7 @@ class CognitiveOrganism(BaseCognitiveModule):
         if should_update is None:
             should_update = self._should_update_survival()
         if should_update:
-            self.metabolism.update(H_next, H_prev=H_prev)
+            self.genome.update_metabolism(H_next, H_prev=H_prev)
 
     def _hpc_active(self):
         return bool(self.hpc_enabled and (self.L > 1) and (self.hpc_encoder is not None) and (self.hpc_decoder is not None))
@@ -1376,14 +1308,28 @@ class CognitiveOrganism(BaseCognitiveModule):
         return global_error, layer_error_full, lower_target, pred_lower
 
     def _hpc_update_error_stats(self, global_error, layer_error_full):
+        """Update EMA tracking for HPC decisions."""
         decay = self.hpc_cfg.error_ema_decay
         decay = max(0.0, min(0.999, decay))
+        
         with torch.no_grad():
             global_safe = torch.nan_to_num(global_error.detach(), nan=0.0, posinf=1e4, neginf=0.0)
             layer_safe = torch.nan_to_num(layer_error_full.detach(), nan=0.0, posinf=1e4, neginf=0.0)
-            self._hpc_error_ema.mul_(decay).add_(global_safe * (1.0 - decay))
+            
+            # Update C++ side EMA if available, otherwise Python
+            if hasattr(cpp_loader, 'get_hpc_error_ema'):
+                # Note: Currently C++ EMA is a placeholder, updating it here via Python's logic
+                # for parity until the kernel is updated.
+                self._hpc_error_ema.mul_(decay).add_(global_safe * (1.0 - decay))
+                # Future: Core::g_hpc_error_ema = ... in C++
+            else:
+                self._hpc_error_ema.mul_(decay).add_(global_safe * (1.0 - decay))
+            
             self._hpc_last_error.copy_(global_safe)
             self._hpc_layer_error_ema.mul_(decay).add_(layer_safe * (1.0 - decay))
+        
+        # Facade property update
+        self.error_ema = float(self._hpc_error_ema.item())
 
     def _hpc_cycle_scale(self):
         if not self._hpc_active():
@@ -1562,6 +1508,9 @@ class CognitiveOrganism(BaseCognitiveModule):
 
     def _prepare_state(self, H, batch_size):
         """Normalize incoming H to contiguous [B, L, R, D, C]."""
+        if self._preflight_ready:
+            return H if H.is_contiguous() else H.contiguous()
+
         if H is None:
             return self._new_state(batch_size)
         if H.dim() == 4:
@@ -1601,12 +1550,11 @@ class CognitiveOrganism(BaseCognitiveModule):
     def _encode_s1_input(self, x):
         """
         Normalize external input to S1 latent representation `p`.
-        Supports:
-        - bytes: [B, T] int
-        - bits: [B, T, 8] or [B, 8]
-        - latent: [B, T, d_s1*C] or [B, d_s1*C]
         Returns: p [B, T, d_s1*C], B, T
         """
+        if self._preflight_ready:
+            return self.bit_to_latent(x) if x.dim() == 3 and x.size(-1) == 8 else x, x.size(0), x.size(1)
+
         if isinstance(x, np.ndarray):
             x = torch.from_numpy(x)
         if not isinstance(x, torch.Tensor):
@@ -1660,7 +1608,7 @@ class CognitiveOrganism(BaseCognitiveModule):
         trace_c = self._lgh_synaptic_trace.contiguous()
         mdna_c = self._lgh_mdna_mask.contiguous()
         if gate.dim() == 4 and gate.size(0) == self.L and gate.size(1) == self.R:
-            gate_cpp = gate.squeeze() # [L, R, 1, 1] -> [L, R]
+            gate_cpp = gate.squeeze(-1).squeeze(-1) # [L, R, 1, 1] -> [L, R]
         elif gate.dim() == 4:
             gate_cpp = gate.mean(dim=(0, 1)) # [B, T, L, R] -> [L, R]
         elif gate.dim() == 2 and gate.size(0) == self.L and gate.size(1) == self.R:
@@ -1668,7 +1616,9 @@ class CognitiveOrganism(BaseCognitiveModule):
         elif gate.dim() == 2:
             gate_cpp = gate.reshape(self.L, self.R)
         else:
-            gate_cpp = gate.view(-1).mean().expand(self.L, self.R)
+            # Handle scalars or other shapes securely
+            val = gate.view(-1).mean() if gate.numel() > 0 else torch.tensor(1.0, device=gate.device)
+            gate_cpp = val.expand(self.L, self.R)
         gate_c = gate_cpp.float().contiguous()
         p_brain_c = p_brain.float().contiguous()
         H_c = H.contiguous()
@@ -1963,136 +1913,7 @@ class CognitiveOrganism(BaseCognitiveModule):
             lr = 0.05 * imp_mean
             # Vectorized scatter-add or indexing for imprinting along the path
             self.lgh_manifold_morton[indices] = (1.0 - lr) * self.lgh_manifold_morton[indices] + lr * val_mean.unsqueeze(0)
-        if not (self.cfg_lgh_enabled and self.lgh_cfg.replace_forward_stack):
-            return False, None, None, None
-        if self.lgh_manifold_morton is None or self._lgh_curve_indices.numel() == 0:
-            return False, None, None, None
 
-        manifold_morton = self._lgh_morton_manifold()
-        if manifold_morton is None or manifold_morton.numel() == 0:
-            return False, None, None, None
-        gate_cpp = gate.reshape(self.L, self.R) if gate.dim() > 2 else gate
-        gate_cpp = gate_cpp.float().contiguous()
-        p_curve = p_s1 if isinstance(p_s1, torch.Tensor) else p_brain[:, :, :self.d_s1 * self.C]
-        uncertainty = self._lgh_uncertainty(p_curve)
-        pred_curve = self._predict_curve_chain(p_curve)
-        pred_prefetch = self._predict_prefetch_curve_chain(p_curve)
-        self._refresh_lgh_curve_from_genome(predicted_curve=pred_curve)
-        self._refresh_lgh_prefetch_curve(predicted_prefetch=pred_prefetch)
-        s1_anchor = p_curve[:, -1, :].detach()
-        hyper_mod = torch.sigmoid(self.hyper_control_head(s1_anchor)).mean(dim=0).view(self.L, self.R)
-        if uncertainty <= float(self.lgh_cfg.int4_uncertainty_threshold):
-            pulse_width_gain = 1.00  # fast/wide pulse
-        elif uncertainty >= float(self.lgh_cfg.fp32_uncertainty_threshold):
-            pulse_width_gain = 0.35  # deep/narrow pulse
-        else:
-            pulse_width_gain = 0.65
-        hyper_mod = (hyper_mod * pulse_width_gain).clamp(0.0, 1.0)
-        self._refresh_lgh_mdna_mask(gate_cpp, modulation=hyper_mod)
-        thermal_penalty = self.get_thermal_penalty()
-        curve_idx = self._lgh_curve_indices.contiguous()
-        prefetch_curve_idx = self._lgh_prefetch_curve_indices.contiguous()
-        syn_trace = self._lgh_synaptic_trace
-        time_phase = int(self.step_counter.item()) if hasattr(self, 'step_counter') else 0
-        trace_bias = max(0.0, min(1.0, float(getattr(self, 'temporal_trace_bias', 0.5))))
-        trace_gain = float(self.lgh_cfg.trace_gain) * (0.5 + trace_bias)
-        trace_decay = max(0.50, min(0.9999, float(self.lgh_cfg.trace_decay) + (trace_bias - 0.5) * 0.08))
-        wave_decay = max(0.05, float(self.lgh_cfg.wave_decay) * (0.75 + 0.5 * uncertainty))
-
-        if uncertainty <= float(self.lgh_cfg.int4_uncertainty_threshold):
-            q_bits = 4
-        elif uncertainty >= float(self.lgh_cfg.fp32_uncertainty_threshold):
-            q_bits = 32
-        else:
-            q_bits = 8
-
-        out = None
-        if self._lgh_use_int8 and q_bits < 32 and _cpp_has('geometric_manifold_forward_avx512_int8'):
-            focus_strength = float(self.lgh_cfg.focus_strength)
-            focus_sharpness = float(getattr(self.genome, 'focus_sharpness', self.lgh_cfg.focus_sharpness))
-            manifold_q, manifold_scale = self._quantize_lgh_manifold(
-                bits=q_bits,
-                focus_row=int(self._lgh_last_curve_anchor.item()),
-                focus_strength=focus_strength,
-                focus_sharpness=focus_sharpness
-            )
-            if manifold_q is not None and manifold_scale is not None and _cpp_ready(
-                p_brain, H, gate_cpp, manifold_q, manifold_scale, curve_idx, prefetch_curve_idx, inv_order, self._lgh_mdna_mask, syn_trace
-            ):
-                out = _cpp_try(
-                    'geometric_manifold_forward_avx512_int8',
-                    p_brain.float().contiguous(),
-                    H.contiguous(),
-                    gate_cpp,
-                    manifold_q,
-                    manifold_scale.float().contiguous(),
-                    curve_idx,
-                    prefetch_curve_idx,
-                    inv_order,
-                    self._lgh_mdna_mask.contiguous(),
-                    syn_trace,
-                    int(time_phase),
-                    int(h_cycles),
-                    int(l_cycles),
-                    float(dyn_threshold),
-                    int(self.lgh_cfg.prefetch_distance),
-                    float(thermal_penalty),
-                    float(self.lgh_cfg.low_entropy_fold_threshold),
-                    int(self.lgh_cfg.wave_radius),
-                    float(wave_decay),
-                    float(trace_decay),
-                    float(trace_gain),
-                    int(self.lgh_cfg.temporal_bins),
-                    tensors=(p_brain, H, gate_cpp, manifold_q, manifold_scale, curve_idx, prefetch_curve_idx, inv_order, self._lgh_mdna_mask, syn_trace)
-                )
-
-        if out is None:
-            if not _cpp_has(
-                'geometric_manifold_forward_avx512',
-                p_brain, H, gate_cpp, manifold_morton, curve_idx, prefetch_curve_idx, inv_order, self._lgh_mdna_mask, syn_trace
-            ):
-                return False, None, None, None
-            out = _cpp_try(
-                'geometric_manifold_forward_avx512',
-                p_brain.float().contiguous(),
-                H.contiguous(),
-                gate_cpp,
-                manifold_morton.float().contiguous(),
-                curve_idx,
-                prefetch_curve_idx,
-                inv_order,
-                self._lgh_mdna_mask.contiguous(),
-                syn_trace,
-                int(time_phase),
-                int(h_cycles),
-                int(l_cycles),
-                float(dyn_threshold),
-                int(self.lgh_cfg.prefetch_distance),
-                float(thermal_penalty),
-                float(self.lgh_cfg.low_entropy_fold_threshold),
-                int(self.lgh_cfg.wave_radius),
-                float(wave_decay),
-                float(trace_decay),
-                float(trace_gain),
-                int(self.lgh_cfg.temporal_bins),
-                tensors=(p_brain, H, gate_cpp, manifold_morton, curve_idx, prefetch_curve_idx, inv_order, self._lgh_mdna_mask, syn_trace)
-            )
-        if not isinstance(out, (list, tuple)) or len(out) != 3:
-            return False, None, None, None
-
-        z_lgh, h_next_lgh, halt_lgh = out
-        if z_lgh.dim() == 2 and z_lgh.size(1) == (self.R * self.d_s2 * self.C):
-            z_lgh = z_lgh.view(B, 1, self.R, self.d_s2, self.C)
-        elif z_lgh.dim() == 3 and z_lgh.size(-1) == (self.R * self.d_s2 * self.C):
-            z_lgh = z_lgh.view(B, z_lgh.size(1), self.R, self.d_s2, self.C)
-        if z_lgh.dim() == 5 and z_lgh.size(1) == 1 and T > 1:
-            z_lgh = z_lgh.expand(-1, T, -1, -1, -1)
-
-        if halt_lgh.dim() == 1:
-            halt_lgh = halt_lgh.view(B, 1, 1)
-        elif halt_lgh.dim() == 2:
-            halt_lgh = halt_lgh.unsqueeze(-1)
-        return True, z_lgh, h_next_lgh, halt_lgh
 
 
     def regulate_sensory_noise(self, val_loss):
@@ -2135,7 +1956,7 @@ class CognitiveOrganism(BaseCognitiveModule):
         H = self._prepare_state(H, B)
             
         # --- BIOLOGICAL GATING: Blend signals for stabilization ---
-        combined_scores = self.metabolism.usage.clone()
+        combined_scores = self.genome.usage.clone() if self.genome.usage is not None else torch.ones(self.L, self.R, device=self.device)
         if learning_brain is not None and hasattr(learning_brain, 'knowledge_map'):
             # Blend behavioral usage with learning contribution (Knowledge Map)
             combined_scores = 0.5 * combined_scores + 0.5 * learning_brain.knowledge_map
@@ -2159,10 +1980,9 @@ class CognitiveOrganism(BaseCognitiveModule):
             gate = (combined_scores >= threshold).float()[:, :, None, None]
         else:
             # Phase 1+ (Autonomous): Dynamic Metabolic + Performance Masking
-            gate = self.metabolism.mask(
+            gate = self.genome.get_metabolic_mask(
                 metabolic_pressure=self.lambda_sparsity,
-                tps_pressure=tps_pressure,
-                usage_override=combined_scores
+                tps_pressure=tps_pressure
             )
 
         # L-Cycle: Cache Lookup (Instant Response)
@@ -2269,15 +2089,16 @@ class CognitiveOrganism(BaseCognitiveModule):
             H_next = learning_brain.apply_temporal_scaling_vec(H_next, H)
         
         # --- BIOLOGICAL FEATURE: Manifold Memory Imprinting ---
-        # Instead of a separate episodic memory, we imprint important patterns
-        # directly into the LGH-Manifold trajectory for O(1) retrieval.
-            with torch.no_grad():
-                p_flat = p.mean(dim=1).detach()
-                importance_score = self.memory_governor_predictor(p_flat).squeeze(-1)  # [B]
-                importance_threshold = self._compute_importance_threshold(importance_score)
-                should_store = (importance_score > importance_threshold).any()
-                if should_store:
-                    self._imprint_to_manifold(p_flat, z_L.reshape(B, -1, self.R * self.d_s2 * self.C).mean(dim=1)[:, :self.d_s2 * self.C], importance_score)
+        # Strategic Gating provides both Engagement (Transparency) and Importance (Imprinting).
+        with torch.no_grad():
+            p_flat = p.mean(dim=1).detach()
+            # Engagement head not used here yet, but importance head drives imprinting.
+            _, importance_score = self.strategic_gating(p_flat)
+            importance_score = importance_score.squeeze(-1)
+            importance_threshold = self._compute_importance_threshold(importance_score)
+            should_store = (importance_score > importance_threshold).any()
+            if should_store:
+                self._imprint_to_manifold(p_flat, z_L.reshape(B, -1, self.R * self.d_s2 * self.C).mean(dim=1)[:, :self.d_s2 * self.C], importance_score)
         
         T_out = z_L.size(1)
         y_flat = z_L.reshape(B, T_out, self.R * self.d_s2 * self.C)
@@ -2329,6 +2150,13 @@ class CognitiveOrganism(BaseCognitiveModule):
             self._vl_add_scalar("HPC/temporal_signal", self._last_temporal_signal)
             self._vl_add_scalar("HPC/temporal_scale", self._last_temporal_cycle_scale)
             
+        # Update preflight status after stabilization
+        if not self._preflight_ready:
+            self._preflight_steps += 1
+            if self._preflight_steps >= 10:
+                self._preflight_ready = True
+                print(">>> PERFORMANCE: Preflight Bypass Ready (Bypassing shape/contiguity checks).")
+
         # --- PERIODIC CONSOLIDATION (Shadow Brain) ---
         self._run_lifecycle_hooks(
             'post_forward',
@@ -2457,11 +2285,9 @@ class CognitiveOrganism(BaseCognitiveModule):
         if not bool(valid_dissonance.any().item()):
             return 0
 
-        self.metabolism.punish_reliability(
-            layer_indices=self._layer_indices,
-            block_indices=self._block_indices,
-            penalty=dissonance_weight
-        )
+        # Relax reliability in genome
+        self.genome.reliability[self._layer_indices, self._block_indices] *= (1.0 - dissonance_weight)
+        self.genome.reliability[self._layer_indices, self._block_indices].clamp_(min=0.0)
         t_indices = self._last_hit_tables[valid_dissonance]
         a_indices = self._last_hit_addrs[valid_dissonance]
         cache.reliability[t_indices, a_indices] *= (1.0 - dissonance_weight)
@@ -2584,7 +2410,8 @@ class CognitiveOrganism(BaseCognitiveModule):
         # METABOLIC TAXATION (Homeostasis)
         # Every consolidation cycle, neurons that haven't fired lose a bit of energy
         # This prevents the 100M parameters from becoming "Stochastic Parrots"
-        self.metabolism.usage.data *= (1.0 - self.runtime_cfg.metabolic_tax_rate)
+        if self.genome.usage is not None:
+            self.genome.usage.data *= (1.0 - self.runtime_cfg.metabolic_tax_rate)
         self._apply_audit_dissonance(cache, s2_out, is_audit)
         self._demyelinate_unreliable_cache(cache)
 

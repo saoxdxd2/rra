@@ -242,6 +242,12 @@ class Genome: # Renamed from GenomeEngine to maintain compat with organism.py
         self.policy = EvolutionPolicy(MutationConfig())
         self.logger = EventLogger()
         
+        # Metabolic Governance (Merged from MetabolicGovernor)
+        self.usage = None        # Initialized on first tick or level count
+        self.reliability = None  # Initialized on first tick
+        self._survival_scalars = torch.tensor([0.95, 1.0, 1.0], dtype=torch.float32) # gamma, imp_w, surp_w
+        self._mask_scalars = torch.tensor([0.5, 0.0, 0.05], dtype=torch.float32) # metabolic, tps, noise
+        
         # Execution State
         self.patience_counter = 0
         self.patience_threshold = 5 
@@ -392,6 +398,79 @@ class Genome: # Renamed from GenomeEngine to maintain compat with organism.py
                     gene.apply_mutation('allele_2', d)
 
         self.state.generation += 1
+
+    # --- Metabolic Engine (Merged Logic) ---
+
+    def _ensure_metabolic_buffers(self, L, R, device):
+        if self.usage is None or self.usage.shape != (L, R):
+            self.usage = torch.ones(L, R, device=device)
+            self.reliability = torch.ones(L, R, device=device)
+            self._survival_scalars = self._survival_scalars.to(device)
+            self._mask_scalars = self._mask_scalars.to(device)
+
+    def update_metabolism(self, H, H_prev=None):
+        """Update usage scores via C++ kernel."""
+        L, R = H.shape[1], H.shape[2]
+        self._ensure_metabolic_buffers(L, R, H.device)
+        
+        H_c = H.contiguous()
+        H_prev_t = H_prev.contiguous() if H_prev is not None else torch.empty(0, device=H.device, dtype=H_c.dtype)
+        
+        # Use survival_update_io op from cpp_loader
+        from organism import _cpp_try
+        self._survival_scalars[0] = float(self.creb_gamma) # Scaled by CREB
+        
+        out = _cpp_try(
+            'survival_update_io',
+            H_c,
+            self.usage,
+            [H_prev_t],
+            self._survival_scalars,
+            tensors=(H_c, self.usage, H_prev_t, self._survival_scalars)
+        )
+        self.usage = out
+
+    @property
+    def creb_gamma(self):
+        # Lower CREB (less memory focus) -> higher gamma (faster usage decay)
+        return 0.01 + (0.1 * (1.0 - self.creb))
+
+    def get_metabolic_mask(self, metabolic_pressure, tps_pressure):
+        """Generate sparse activation mask via C++."""
+        if self.usage is None:
+            return torch.ones(1, 1, 1, 1) # Fallback if not initialized
+            
+        from organism import _cpp_try
+        self._mask_scalars[0] = float(metabolic_pressure)
+        self._mask_scalars[1] = float(tps_pressure)
+        
+        out = _cpp_try(
+            'survival_mask_io',
+            self.usage,
+            self.reliability,
+            [],
+            self._mask_scalars,
+            tensors=(self.usage, self.reliability, self._mask_scalars)
+        )
+        return out
+
+    def calculate_metabolic_losses(self, H, H_prev=None):
+        if self.usage is None:
+            return torch.tensor(0.0), torch.tensor(0.0), torch.tensor(0.0)
+            
+        from organism import _cpp_try
+        H_c = H.contiguous()
+        H_prev_t = H_prev.contiguous() if H_prev is not None else torch.empty(0, device=H.device, dtype=H_c.dtype)
+        
+        out = _cpp_try(
+            'survival_losses_io',
+            H_c,
+            H_prev_t,
+            [],
+            torch.empty(0, device=H.device),
+            tensors=(H_c, H_prev_t)
+        )
+        return out # (energy, cost, surprise)
 
     def evolutionary_step(self, model, performance_metrics):
         """

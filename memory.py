@@ -313,15 +313,3 @@ class NeuralCache(nn.Module):
         _, indices = torch.topk(scores.view(-1), k=num_to_prune)
         self.valid.view(-1)[indices] = False
 
-class MemoryGovernor(nn.Module):
-    def __init__(self, dim, device='cpu'):
-        super().__init__()
-        self.predictor = nn.Sequential(
-            nn.Linear(dim, 128),
-            nn.ReLU(),
-            nn.Linear(128, 1),
-            nn.Sigmoid()
-        ).to(device)
-
-    def forward(self, x):
-        return self.predictor(x)

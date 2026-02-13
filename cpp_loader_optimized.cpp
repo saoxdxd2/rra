@@ -30,6 +30,10 @@ namespace py = pybind11;
 // CORE UTILITIES (Internal)
 // =========================================================================
 namespace Core {
+    static float g_hpc_target_error = 0.05f;
+    static float g_hpc_error_ema_decay = 0.95f;
+    static float g_hpc_halt_gain = 0.35f;
+    static float g_hpc_error_ema = 0.05f;
     static bool g_hpc_temporal_folding = true;
     static float g_hpc_fold_alpha = 0.25f;
     static int g_event_mode = 2; // 0=dense, 1=event-only, 2=auto
@@ -3278,8 +3282,14 @@ std::vector<at::Tensor> geometric_manifold_forward_avx512_int8(
     return {out_5d, h_next, halt_probs};
 }
 
-void configure_hpc(bool temporal_folding, float fold_alpha) {
-    Core::set_hpc_temporal_folding(temporal_folding, fold_alpha);
+void configure_hpc(float target_error, float ema_decay, float halt_gain) {
+    Core::g_hpc_target_error = target_error;
+    Core::g_hpc_error_ema_decay = ema_decay;
+    Core::g_hpc_halt_gain = halt_gain;
+}
+
+float get_hpc_error_ema() {
+    return Core::g_hpc_error_ema;
 }
 
 void configure_runtime(
@@ -3332,6 +3342,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("survival_mask_io", &survival_mask_io);
     m.def("survival_losses_io", &survival_losses_io);
     m.def("configure_hpc", &configure_hpc);
+    m.def("get_hpc_error_ema", &get_hpc_error_ema);
     m.def("configure_runtime", &configure_runtime);
     m.def("set_perf_counters_enabled", &set_perf_counters_enabled);
     m.def("reset_perf_counters", &reset_perf_counters);

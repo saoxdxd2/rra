@@ -32,6 +32,15 @@ def adaptive_gradient_clip(model, clip_factor=0.1, eps=1e-3):
         if g_norm > max_g:
             p.grad.detach().data.mul_(max_g / (g_norm + eps))
 
+def sign_gradients(model):
+    """
+    Reduces gradients to signs immediately to save cache bandwidth.
+    Aligns with int8 plan for ram_tables.
+    """
+    for p in model.parameters():
+        if p.grad is not None:
+            p.grad.detach().copy_(p.grad.sign())
+
 class AdEMAMix(optim.Optimizer):
     """
     AdEMAMix Optimizer with C++ Kernel Acceleration.
@@ -46,6 +55,7 @@ class AdEMAMix(optim.Optimizer):
         # We store alpha in defaults for non-step-specified usage.
         defaults = dict(lr=lr, beta1_fast=beta1_fast, beta1_slow=beta1_slow, beta2=beta2, eps=eps, weight_decay=weight_decay, alpha=alpha, sign_sgd=sign_sgd)
         super().__init__(params, defaults)
+        self.sign_sgd = sign_sgd
 
     @torch.no_grad()
     def step(self, closure=None, omega=None):
