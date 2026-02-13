@@ -839,16 +839,6 @@ class CognitiveOrganism(BaseCognitiveModule):
         self.register_buffer('_last_surprise_cycle_scale', torch.tensor(1.0, dtype=torch.float32, device=self.device))
         self.register_buffer('_last_temporal_signal', torch.tensor(1.0, dtype=torch.float32, device=self.device))
         self.register_buffer('_last_temporal_cycle_scale', torch.tensor(1.0, dtype=torch.float32, device=self.device))
-        self._lifecycle_hooks = {}
-
-    def _imprint_to_manifold(self, p, z, importance):
-        """Placeholder for Manifold Imprinting (titans-style FAST learning)."""
-        pass
-
-    def _compute_importance_threshold(self, score):
-        # Adaptive threshold based on EMA
-        self.importance_threshold_ema = 0.95 * self.importance_threshold_ema + 0.05 * score.mean().item()
-        return self.importance_threshold_ema
         self.register_buffer('_last_temporal_cycle_scale', torch.tensor(1.0, dtype=torch.float32, device=self.device))
         self.episodic_enabled = True
         self.cfg_pruning_enabled = True
@@ -956,6 +946,15 @@ class CognitiveOrganism(BaseCognitiveModule):
         if not self.exec_cfg.use_forward_stack:
             raise RuntimeError("USE_FORWARD_STACK must be enabled; no Python reasoning fallback path exists.")
         print(">>> LGH-Manifold Consolidated Memory Active.")
+
+    def _imprint_to_manifold(self, p, z, importance):
+        """Placeholder for Manifold Imprinting (titans-style FAST learning)."""
+        pass
+
+    def _compute_importance_threshold(self, score):
+        # Adaptive threshold based on EMA
+        self.importance_threshold_ema = 0.95 * self.importance_threshold_ema + 0.05 * score.mean().item()
+        return self.importance_threshold_ema
 
     def _init_manifold(self):
         self._lgh_shape3d = (self.L, self.R, self.lgh_cfg.morton_depth)
