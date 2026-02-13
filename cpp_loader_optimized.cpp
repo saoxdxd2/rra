@@ -2648,36 +2648,51 @@ std::vector<at::Tensor> geometric_manifold_forward_avx512(
 
     // Curve prototype in Morton space with prefetching.
     if (S > 0) {
+        float contrib_count = 0.0f;
         for (int64_t s = 0; s < S; s++) {
-            const int64_t row = lgh_map_curve_row(idx_ptr[s], inv_ptr, N);
-            const float* row_ptr = m_ptr + row * M;
+            const int64_t dt = time_phase + s;
+            const int64_t row_base = lgh_map_curve_row(idx_ptr[s], inv_ptr, N);
+            const int64_t row = lgh_temporal_fold_row(row_base, dt, N, t_bins, Core::g_hpc_fold_alpha);
             if (S_prefetch > 0) {
-                const int64_t p_row = lgh_map_curve_row(pidx_ptr[s % S_prefetch], inv_ptr, N);
+                const int64_t p_base = lgh_map_curve_row(pidx_ptr[s % S_prefetch], inv_ptr, N);
+                const int64_t p_row = lgh_temporal_fold_row(p_base, dt + prefetch_d, N, t_bins, Core::g_hpc_fold_alpha);
                 const float* p_ptr_prefetch = m_ptr + p_row * M;
                 _mm_prefetch(reinterpret_cast<const char*>(p_ptr_prefetch), _MM_HINT_T0);
             }
             if (s + prefetch_d < S) {
-                const int64_t next_row = lgh_map_curve_row(idx_ptr[s + prefetch_d], inv_ptr, N);
+                const int64_t next_base = lgh_map_curve_row(idx_ptr[s + prefetch_d], inv_ptr, N);
+                const int64_t next_row = lgh_temporal_fold_row(next_base, dt + prefetch_d, N, t_bins, Core::g_hpc_fold_alpha);
                 const float* next_ptr = m_ptr + next_row * M;
                 _mm_prefetch(reinterpret_cast<const char*>(next_ptr), _MM_HINT_T0);
             }
+            for (int64_t off = -wave_r; off <= wave_r; off++) {
+                const int64_t w_row = lgh_wrap_row(row + off, N);
+                const float phase = 0.5f + 0.5f * std::cos(0.35f * static_cast<float>(dt + off));
+                const float ripple = std::exp(-std::abs(static_cast<float>(off)) * wave_decay_f);
+                const float trace_v = trace_ptr[w_row];
+                const float coeff = ripple * phase * (1.0f + trace_gain_f * trace_v);
+                const float* row_ptr = m_ptr + w_row * M;
 #ifdef __AVX512F
-            int64_t m = 0;
-            for (; m + 16 <= M; m += 16) {
-                __m512 a = _mm512_loadu_ps(proto_ptr + m);
-                __m512 b = _mm512_loadu_ps(row_ptr + m);
-                _mm512_storeu_ps(proto_ptr + m, _mm512_add_ps(a, b));
-            }
-            for (; m < M; m++) {
-                proto_ptr[m] += row_ptr[m];
-            }
+                int64_t m = 0;
+                const __m512 coeff_v = _mm512_set1_ps(coeff);
+                for (; m + 16 <= M; m += 16) {
+                    __m512 a = _mm512_loadu_ps(proto_ptr + m);
+                    __m512 b = _mm512_loadu_ps(row_ptr + m);
+                    _mm512_storeu_ps(proto_ptr + m, _mm512_fmadd_ps(b, coeff_v, a));
+                }
+                for (; m < M; m++) {
+                    proto_ptr[m] += coeff * row_ptr[m];
+                }
 #else
-            for (int64_t m = 0; m < M; m++) {
-                proto_ptr[m] += row_ptr[m];
-            }
+                for (int64_t m = 0; m < M; m++) {
+                    proto_ptr[m] += coeff * row_ptr[m];
+                }
 #endif
+                trace_ptr[w_row] = (trace_decay_f * trace_v) + ((1.0f - trace_decay_f) * std::min(1.0f, std::abs(coeff)));
+                contrib_count += std::max(0.001f, ripple * phase);
+            }
         }
-        const float inv_s = 1.0f / static_cast<float>(S);
+        const float inv_s = 1.0f / std::max(1e-6f, contrib_count);
 #ifdef __AVX512F
         int64_t m = 0;
         __m512 inv = _mm512_set1_ps(inv_s);
