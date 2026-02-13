@@ -629,6 +629,12 @@ class CognitiveOrganism(BaseCognitiveModule):
             morton_depth=max(1, int(Config.LGH_MORTON_DEPTH)),
             prefetch_distance=max(1, int(Config.LGH_PREFETCH_DISTANCE)),
             align_multiple=max(1, int(getattr(Config, 'LGH_ALIGN_MULTIPLE', 64))),
+            temporal_bins=max(1, int(getattr(Config, 'LGH_TEMPORAL_BINS', 16))),
+            temporal_fold_alpha=float(getattr(Config, 'LGH_TEMPORAL_FOLD_ALPHA', 0.25)),
+            wave_radius=max(0, int(getattr(Config, 'LGH_WAVE_RADIUS', 1))),
+            wave_decay=float(getattr(Config, 'LGH_WAVE_DECAY', 0.65)),
+            trace_decay=float(getattr(Config, 'LGH_TRACE_DECAY', 0.90)),
+            trace_gain=float(getattr(Config, 'LGH_TRACE_GAIN', 0.20)),
             low_entropy_fold_threshold=float(getattr(Config, 'LGH_LOW_ENTROPY_FOLD_THRESHOLD', 0.015)),
             focus_strength=float(getattr(Config, 'LGH_FOCUS_STRENGTH', 0.35)),
             focus_sharpness=float(getattr(Config, 'LGH_FOCUS_SHARPNESS', 2.0)),
@@ -1005,15 +1011,24 @@ class CognitiveOrganism(BaseCognitiveModule):
             device=self.device,
             align_multiple=self.lgh_cfg.align_multiple
         )
+        self._lgh_morton.set_temporal_bins(self.lgh_cfg.temporal_bins)
         if self.cfg_lgh_enabled:
             n = int(self._lgh_morton.size)
             m = int(self.d_s2 * self.C)
             self.lgh_manifold_morton = nn.Parameter(torch.randn(n, m, device=self.device) * 0.01)
             curve_len = min(self.lgh_cfg.curve_length, int(self._lgh_morton.size_original))
-            curve_orig = self._lgh_morton.curve_segment_original(0, curve_len, wrap=self.lgh_cfg.curve_wrap)
+            curve_orig = self._lgh_morton.curve_segment_original(
+                0,
+                curve_len,
+                wrap=self.lgh_cfg.curve_wrap,
+                delta_t=0,
+                temporal_bins=self.lgh_cfg.temporal_bins,
+                fold_alpha=self.lgh_cfg.temporal_fold_alpha
+            )
             self.register_buffer('_lgh_curve_indices', curve_orig.to(dtype=torch.long))
             self.register_buffer('_lgh_prefetch_curve_indices', curve_orig.to(dtype=torch.long))
             self.register_buffer('_lgh_mdna_mask', torch.ones(self.L, self.R, dtype=torch.float32, device=self.device))
+            self.register_buffer('_lgh_synaptic_trace', torch.zeros(n, dtype=torch.float32, device=self.device))
             self.register_buffer('_lgh_morton_order', self._lgh_morton.order.clone().to(dtype=torch.long))
             self.register_buffer('_lgh_inverse_order', self._lgh_morton.inverse_order.clone().to(dtype=torch.long))
         else:
@@ -1021,6 +1036,7 @@ class CognitiveOrganism(BaseCognitiveModule):
             self.register_buffer('_lgh_curve_indices', torch.empty(0, dtype=torch.long, device=self.device))
             self.register_buffer('_lgh_prefetch_curve_indices', torch.empty(0, dtype=torch.long, device=self.device))
             self.register_buffer('_lgh_mdna_mask', torch.empty(0, dtype=torch.float32, device=self.device))
+            self.register_buffer('_lgh_synaptic_trace', torch.empty(0, dtype=torch.float32, device=self.device))
             self.register_buffer('_lgh_morton_order', torch.empty(0, dtype=torch.long, device=self.device))
             self.register_buffer('_lgh_inverse_order', torch.empty(0, dtype=torch.long, device=self.device))
     
@@ -1823,7 +1839,10 @@ class CognitiveOrganism(BaseCognitiveModule):
             wrap=self.lgh_cfg.curve_wrap,
             focus_point=self._lgh_focus_point(),
             focus_strength=focus_strength,
-            focus_sharpness=focus_sharpness
+            focus_sharpness=focus_sharpness,
+            delta_t=int(self.step_counter.item()) if hasattr(self, 'step_counter') else 0,
+            temporal_bins=self.lgh_cfg.temporal_bins,
+            fold_alpha=self.lgh_cfg.temporal_fold_alpha
         )
         self._lgh_curve_indices.copy_(new_curve.to(self._lgh_curve_indices.device, dtype=torch.long))
 

@@ -22,6 +22,12 @@ model:
   lgh_morton_depth: 1 # Z-depth for Morton buffer (LxRxdepth).
   lgh_prefetch_distance: 2 # Prefetch distance (segments ahead) for LGH kernel.
   lgh_align_multiple: 64 # Pad manifold rows to hardware-aligned multiples (cacheline friendly).
+  lgh_temporal_bins: 16 # Folded temporal bins for 4D spatiotemporal manifold behavior.
+  lgh_temporal_fold_alpha: 0.25 # Strength of temporal fold shift in Morton space.
+  lgh_wave_radius: 1 # Wave propagation radius in Morton-neighbor rows.
+  lgh_wave_decay: 0.65 # Exponential decay factor for wave propagation strength.
+  lgh_trace_decay: 0.90 # Synaptic trace decay per kernel step.
+  lgh_trace_gain: 0.20 # Synaptic trace gain injected into manifold pulses.
   lgh_low_entropy_fold_threshold: 0.015 # Skip LGH pulse when temporal delta falls below this threshold.
   lgh_focus_strength: 0.35 # Strength of foveated manifold focus (core vs periphery density).
   lgh_focus_sharpness: 2.0 # Sharpness of foveated focus falloff.

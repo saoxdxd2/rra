@@ -14,6 +14,25 @@ def morton3d_code(x: torch.Tensor, y: torch.Tensor, z: torch.Tensor) -> torch.Te
     return _split_by_3bits(x) | (_split_by_3bits(y) << 1) | (_split_by_3bits(z) << 2)
 
 
+def morton4d_code(x: torch.Tensor, y: torch.Tensor, z: torch.Tensor, t: torch.Tensor, bits: int = 16) -> torch.Tensor:
+    """
+    Generic 4D Morton encoder for spatiotemporal indexing.
+    Interleaves bits as x0,y0,z0,t0,x1,y1,z1,t1,...
+    """
+    x = x.to(dtype=torch.long)
+    y = y.to(dtype=torch.long)
+    z = z.to(dtype=torch.long)
+    t = t.to(dtype=torch.long)
+    code = torch.zeros_like(x, dtype=torch.long)
+    for b in range(max(1, int(bits))):
+        shift = 4 * b
+        code |= ((x >> b) & 1) << shift
+        code |= ((y >> b) & 1) << (shift + 1)
+        code |= ((z >> b) & 1) << (shift + 2)
+        code |= ((t >> b) & 1) << (shift + 3)
+    return code
+
+
 class MortonBuffer:
     """
     Morton/Z-order index buffer for mapping 3D topology to linear memory.
@@ -37,6 +56,7 @@ class MortonBuffer:
             device=self.device
         )
         self._coords_original_norm = self._coords_original / norm
+        self.temporal_bins = 16
         codes = morton3d_code(gx.reshape(-1), gy.reshape(-1), gz.reshape(-1))
 
         self.order = torch.argsort(codes)
@@ -133,6 +153,48 @@ class MortonBuffer:
         dist = torch.linalg.norm(coords - focus.view(1, 3), dim=-1)
         return dist
 
+    def set_temporal_bins(self, bins: int):
+        self.temporal_bins = max(1, int(bins))
+
+    def temporal_fold_morton(
+        self,
+        morton_indices: torch.Tensor,
+        delta_t: int,
+        temporal_bins: int = None,
+        fold_alpha: float = 0.25
+    ) -> torch.Tensor:
+        """
+        Fold a 4D temporal phase into 3D Morton rows using rotating-mask semantics.
+        """
+        if temporal_bins is None:
+            temporal_bins = self.temporal_bins
+        bins = max(1, int(temporal_bins))
+        idx = morton_indices.to(dtype=torch.long, device=self.device).clamp(0, max(0, self.size_original - 1))
+        if bins <= 1 or self.size_original <= 1:
+            return idx
+        dt = int(delta_t) % bins
+        amp = max(0.0, min(1.0, float(fold_alpha)))
+        span = max(1, int(round((self.size_original - 1) * amp)))
+        shift = (dt * span) % self.size_original
+        return (idx + shift) % self.size_original
+
+    def encode4d_from_original(
+        self,
+        original_indices: torch.Tensor,
+        delta_t: int,
+        temporal_bins: int = None
+    ) -> torch.Tensor:
+        """
+        Expands 3D topology indices with a temporal coordinate into a 4D Morton code.
+        """
+        if temporal_bins is None:
+            temporal_bins = self.temporal_bins
+        bins = max(1, int(temporal_bins))
+        original_indices = original_indices.to(dtype=torch.long, device=self.device).clamp(0, max(0, self.size_original - 1))
+        coords = self._coords_original[original_indices].to(dtype=torch.long)
+        t = torch.full((original_indices.numel(),), int(delta_t) % bins, dtype=torch.long, device=self.device)
+        return morton4d_code(coords[:, 0], coords[:, 1], coords[:, 2], t)
+
     def curve_segment_original(
         self,
         start: int,
@@ -140,13 +202,22 @@ class MortonBuffer:
         wrap=True,
         focus_point=None,
         focus_strength: float = 0.0,
-        focus_sharpness: float = 1.0
+        focus_sharpness: float = 1.0,
+        delta_t: int = 0,
+        temporal_bins: int = None,
+        fold_alpha: float = 0.25
     ) -> torch.Tensor:
         """
         Returns a curve segment encoded in original (topology) row indices.
         Kernel can map them back to Morton rows using inverse_order.
         """
         morton_idx = self.curve_segment(start, length, wrap=wrap)
+        morton_idx = self.temporal_fold_morton(
+            morton_idx,
+            delta_t=delta_t,
+            temporal_bins=temporal_bins,
+            fold_alpha=fold_alpha
+        )
         original = self.morton_to_original(morton_idx)
         fs = max(0.0, min(1.0, float(focus_strength)))
         if fs > 0.0 and focus_point is not None and original.numel() > 1:
