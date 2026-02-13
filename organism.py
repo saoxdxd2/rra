@@ -1046,6 +1046,23 @@ class CognitiveOrganism(BaseCognitiveModule):
         self.focus_z = self.governor.focus_z
         self.focus_sharpness = self.governor.focus_sharpness
         
+        # Sync flattened attributes
+        self.cfg_lif_decay = float(Config.LIF_DECAY)
+        self.cfg_lif_threshold = float(Config.LIF_THRESHOLD)
+        self.cfg_halt_threshold = float(Config.HALT_THRESHOLD)
+        self.cfg_mes_enabled = bool(Config.MES_ENABLED)
+        
+        # Sync LGH flattened params
+        if hasattr(self, 'lgh_cfg'):
+            self.cfg_lgh_prefetch_distance = int(self.lgh_cfg.prefetch_distance)
+            self.cfg_lgh_low_entropy_fold_threshold = float(self.lgh_cfg.low_entropy_fold_threshold)
+            self.cfg_lgh_wave_radius = int(self.lgh_cfg.wave_radius)
+            self.cfg_lgh_wave_decay = float(self.lgh_cfg.wave_decay)
+            self.cfg_lgh_trace_decay = float(self.lgh_cfg.trace_decay)
+            self.cfg_lgh_trace_gain = float(self.lgh_cfg.trace_gain)
+            self.cfg_lgh_temporal_bins = int(self.lgh_cfg.temporal_bins)
+            self.cfg_thermal_penalty = float(getattr(self.exec_cfg, 'thermal_penalty', 0.0))
+        
         # Sync to levels
         for level in self.levels:
             level.h_decay_rate = 0.01 + (0.1 * (1.0 - self.governor.creb))
