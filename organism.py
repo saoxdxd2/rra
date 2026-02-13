@@ -412,9 +412,8 @@ class RAMTupleLayer(nn.Module):
         self.ram_tables_q.copy_(q)
         self._quantized_valid = True
 
-    def forward(self, *args, **kwargs):
-        """RAMTupleLayer.forward is bypassed; reasoning core must use forward_stack_io kernel."""
-        raise RuntimeError("RAMTupleLayer.forward is bypassed; use forward_stack_io.")
+                                    
+
 
 # Spiking logic is handled by C++ kernels (fused_lif_ram_lookup / forward_stack_io).
 
@@ -481,8 +480,8 @@ class OrganismLevel(BaseCognitiveModule):
             self.register_buffer('_zero_grad_ram', torch.zeros_like(self.wsnn.ram_tables))
             self.opt_step = 1
 
-    def forward(self, *args, **kwargs):
-        raise RuntimeError("OrganismLevel.forward is bypassed; reasoning core must use forward_stack_io kernel.")
+                                    
+
 
 
 class CognitiveOrganism(BaseCognitiveModule):
@@ -2031,8 +2030,7 @@ class CognitiveOrganism(BaseCognitiveModule):
         z_L = p_expanded
         
         
-        # L2-Cycle: Titans Working Memory (Merged into LGH-Manifold)
-        p_titans = p_brain.mean(dim=1)
+
         # Contextualization is now handled implicitly by the LGH-Manifold traverser.
 
         # === DISTRIBUTED COGNITIVE CYCLE ===

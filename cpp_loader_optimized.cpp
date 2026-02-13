@@ -182,8 +182,7 @@ namespace Perf {
     static std::atomic<uint64_t> g_dcls_lookup_calls{0};
     static std::atomic<uint64_t> g_dcls_lookup_int8_calls{0};
     static std::atomic<uint64_t> g_fused_lif_calls{0};
-    static std::atomic<uint64_t> g_titans_forward_calls{0};
-    static std::atomic<uint64_t> g_titans_update_calls{0};
+
     static std::atomic<uint64_t> g_cache_lookup_calls{0};
     static std::atomic<uint64_t> g_ademamix_calls{0};
     static std::atomic<uint64_t> g_batched_ademamix_calls{0};
@@ -233,8 +232,7 @@ namespace Perf {
         g_dcls_lookup_calls.store(0ULL, std::memory_order_relaxed);
         g_dcls_lookup_int8_calls.store(0ULL, std::memory_order_relaxed);
         g_fused_lif_calls.store(0ULL, std::memory_order_relaxed);
-        g_titans_forward_calls.store(0ULL, std::memory_order_relaxed);
-        g_titans_update_calls.store(0ULL, std::memory_order_relaxed);
+
         g_cache_lookup_calls.store(0ULL, std::memory_order_relaxed);
         g_ademamix_calls.store(0ULL, std::memory_order_relaxed);
         g_batched_ademamix_calls.store(0ULL, std::memory_order_relaxed);
@@ -263,8 +261,7 @@ namespace Perf {
         out["dcls_lookup_calls"] = py::int_(g_dcls_lookup_calls.load(std::memory_order_relaxed));
         out["dcls_lookup_int8_calls"] = py::int_(g_dcls_lookup_int8_calls.load(std::memory_order_relaxed));
         out["fused_lif_calls"] = py::int_(g_fused_lif_calls.load(std::memory_order_relaxed));
-        out["titans_forward_calls"] = py::int_(g_titans_forward_calls.load(std::memory_order_relaxed));
-        out["titans_update_calls"] = py::int_(g_titans_update_calls.load(std::memory_order_relaxed));
+
         out["cache_lookup_calls"] = py::int_(g_cache_lookup_calls.load(std::memory_order_relaxed));
         out["ademamix_calls"] = py::int_(g_ademamix_calls.load(std::memory_order_relaxed));
         out["batched_ademamix_calls"] = py::int_(g_batched_ademamix_calls.load(std::memory_order_relaxed));
@@ -999,7 +996,7 @@ std::vector<torch::Tensor> fused_lif_ram_lookup(
     return {spikes, v_next};
 }
 
-// titans_memory_forward / titans_memory_update REMOVED (decommissioned in favor of Manifold Imprinting).
+
 
 
 
@@ -3334,7 +3331,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("dcls_ram_lookup_int8", &dcls_ram_lookup_int8);
     m.def("fused_lif_ram_lookup", &fused_lif_ram_lookup);
     m.def("dcls_backward", &dcls_backward);
-    // titans_memory_forward / titans_memory_update REMOVED (Manifold Imprinting)
+
     m.def("neural_cache_lookup_fast", &neural_cache_lookup_fast);
     m.def("forward_stack_io", &forward_stack_io);
     m.def("mes_super_step_io", &mes_super_step_io);
