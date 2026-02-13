@@ -75,12 +75,7 @@ if not hasattr(Config, 'DEVICE'):
         else:
             Config.DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-L = Config.L
-R = Config.R
-D = Config.WORKING_DIM
-C = Config.C
-DEVICE = Config.DEVICE
-
+# Authority synced from BIOS (brain_isa.h)
 L = Config.L
 R = Config.R
 D = Config.WORKING_DIM
