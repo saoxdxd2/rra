@@ -27,47 +27,11 @@ namespace Config {
 }
 
 /**
- * NIS_Config: Unified configuration authority.
- * Values are populated from brain_isa.h (static) and config.yaml (dynamic).
+ * NIS Firmware constants are now the authoritative config.
+ * init_nis_config is deprecated as we shift to Total Neural Unification via brain_isa.h.
  */
-struct NIS_Config {
-    static int64_t L;
-    static int64_t R;
-    static int64_t WORKING_DIM;
-    static int64_t C;
-    static int64_t MEMORY_DEPTH;
-    static int64_t BATCH_SIZE;
-    static int64_t SEQ_LEN;
-    static float LEARNING_RATE;
-    static float HALT_THRESHOLD;
-};
-
-// Initialize with brain_isa.h defaults
-int64_t NIS_Config::L = NIS_L;
-int64_t NIS_Config::R = NIS_R;
-int64_t NIS_Config::WORKING_DIM = NIS_WORKING_DIM;
-int64_t NIS_Config::C = NIS_C;
-int64_t NIS_Config::MEMORY_DEPTH = NIS_MEMORY_DEPTH;
-int64_t NIS_Config::BATCH_SIZE = 64;
-int64_t NIS_Config::SEQ_LEN = 512;
-float NIS_Config::LEARNING_RATE = 1e-4f;
-float NIS_Config::HALT_THRESHOLD = NIS_HALT_THRESHOLD;
-
 void init_nis_config(py::dict yaml_cfg) {
-    if (yaml_cfg.contains("model")) {
-        py::dict model = yaml_cfg["model"];
-        if (model.contains("L")) NIS_Config::L = model["L"].cast<int64_t>();
-        if (model.contains("R")) NIS_Config::R = model["R"].cast<int64_t>();
-        if (model.contains("working_dim")) NIS_Config::WORKING_DIM = model["working_dim"].cast<int64_t>();
-        if (model.contains("C")) NIS_Config::C = model["C"].cast<int64_t>();
-        if (model.contains("memory_depth")) NIS_Config::MEMORY_DEPTH = model["memory_depth"].cast<int64_t>();
-    }
-    if (yaml_cfg.contains("training")) {
-        py::dict train = yaml_cfg["training"];
-        if (train.contains("batch_size")) NIS_Config::BATCH_SIZE = train["batch_size"].cast<int64_t>();
-        if (train.contains("seq_len")) NIS_Config::SEQ_LEN = train["seq_len"].cast<int64_t>();
-        if (train.contains("lr")) NIS_Config::LEARNING_RATE = train["lr"].cast<float>();
-    }
+    // Deprecated: Hardware constants are now fixed in brain_isa.h
 }
 namespace py = pybind11;
 
@@ -3451,16 +3415,83 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("geometric_manifold_forward_avx512_int8", &geometric_manifold_forward_avx512_int8);
     m.def("fused_cognitive_cycle", &_fused_cognitive_cycle_impl);
 
-    // NIS ISA Constants
-    m.attr("NIS_OP_ADD") = NIS_OP_ADD;
-    m.attr("NIS_OP_SCALE") = NIS_OP_SCALE;
-    m.attr("NIS_OP_GATE") = NIS_OP_GATE;
-    m.attr("NIS_OP_REFLECT") = NIS_OP_REFLECT;
-    m.attr("NIS_OP_JMP") = NIS_OP_JMP;
+    // --- NIS FIRMWARE (Total Neural Unification) ---
+    m.attr("L") = NIS_L;
+    m.attr("R") = NIS_R;
+    m.attr("WORKING_DIM") = NIS_WORKING_DIM;
+    m.attr("C") = NIS_C;
+    m.attr("MEMORY_DEPTH") = NIS_MEMORY_DEPTH;
+    m.attr("H_CYCLES") = NIS_H_CYCLES;
+    m.attr("L_CYCLES") = NIS_L_CYCLES;
+    m.attr("RMS_NORM_EPS") = NIS_RMS_NORM_EPS;
+    m.attr("ROPE_THETA") = NIS_ROPE_THETA;
+    m.attr("HALT_THRESHOLD") = NIS_HALT_THRESHOLD;
 
-    m.attr("NIS_L") = NIS_L;
-    m.attr("NIS_R") = NIS_R;
-    m.attr("NIS_WORKING_DIM") = NIS_WORKING_DIM;
-    m.attr("NIS_C") = NIS_C;
-    m.attr("NIS_MEMORY_DEPTH") = NIS_MEMORY_DEPTH;
+    m.attr("BATCH_SIZE") = NIS_BATCH_SIZE;
+    m.attr("SEQ_LEN") = NIS_SEQ_LEN;
+    m.attr("LEARNING_RATE") = NIS_LEARNING_RATE;
+    m.attr("EPOCHS") = NIS_EPOCHS;
+    m.attr("SEED") = NIS_SEED;
+
+    m.attr("ADEMAMIX_BETA1_FAST") = NIS_ADEMAMIX_BETA1_FAST;
+    m.attr("ADEMAMIX_BETA1_SLOW") = NIS_ADEMAMIX_BETA1_SLOW;
+    m.attr("ADEMAMIX_BETA2") = NIS_ADEMAMIX_BETA2;
+    m.attr("WEIGHT_DECAY") = NIS_WEIGHT_DECAY;
+    m.attr("AGC_CLIP_FACTOR") = NIS_AGC_CLIP_FACTOR;
+
+    m.attr("INIT_SCALE") = NIS_INIT_SCALE;
+    m.attr("DECAY_INIT_OFFSET") = NIS_DECAY_INIT_OFFSET;
+    m.attr("DECAY_INIT_SCALE") = NIS_DECAY_INIT_SCALE;
+    m.attr("DELAY_INIT_STD") = NIS_DELAY_INIT_STD;
+    m.attr("DELAY_MIN") = NIS_DELAY_MIN;
+    m.attr("DELAY_MAX") = NIS_DELAY_MAX;
+    m.attr("RAM_INIT_SCALE") = NIS_RAM_INIT_SCALE;
+    m.attr("DELREC_INIT_MAX") = NIS_DELREC_INIT_MAX;
+
+    m.attr("LIF_DECAY") = NIS_LIF_DECAY;
+    m.attr("LIF_THRESHOLD") = NIS_LIF_THRESHOLD;
+    m.attr("H_CYCLE_THRESHOLD") = NIS_H_CYCLE_THRESHOLD;
+
+    m.attr("GLOBAL_BACKPROP") = NIS_GLOBAL_BACKPROP;
+    m.attr("LOCAL_LR_RATIO") = NIS_LOCAL_LR_RATIO;
+    m.attr("MES_LOCAL_L1") = NIS_MES_LOCAL_L1;
+    m.attr("SURPRISE_REWIRE_THRESHOLD") = NIS_SURPRISE_REWIRE_THRESHOLD;
+    m.attr("DISSONANCE_PENALTY") = NIS_DISSONANCE_PENALTY;
+    m.attr("METABOLIC_TAX_RATE") = NIS_METABOLIC_TAX_RATE;
+
+    m.attr("SURVIVAL_GAMMA") = NIS_SURVIVAL_GAMMA;
+    m.attr("SURVIVAL_UPDATE_EVERY") = NIS_SURVIVAL_UPDATE_EVERY;
+    m.attr("TARGET_SPARSITY") = NIS_TARGET_SPARSITY;
+    m.attr("LAMBDA_COST") = NIS_LAMBDA_COST;
+    m.attr("LAMBDA_STABILITY") = NIS_LAMBDA_STABILITY;
+    m.attr("LAMBDA_ENERGY") = NIS_LAMBDA_ENERGY;
+
+    m.attr("PARAM_COST_SCALE") = NIS_PARAM_COST_SCALE;
+    m.attr("MEMORY_COST_SCALE") = NIS_MEMORY_COST_SCALE;
+    m.attr("FAST_PATH_COST") = NIS_FAST_PATH_COST;
+
+    m.attr("BYPASS_H_DECAY") = NIS_BYPASS_H_DECAY;
+    m.attr("CURIOSITY_EXPLORE_PROB") = NIS_CURIOSITY_EXPLORE_PROB;
+    m.attr("ENGAGEMENT_THRESHOLD_MIN") = NIS_ENGAGEMENT_THRESHOLD_MIN;
+    m.attr("ENGAGEMENT_THRESHOLD_MAX") = NIS_ENGAGEMENT_THRESHOLD_MAX;
+    m.attr("EFFICIENCY_BONUS_CAP") = NIS_EFFICIENCY_BONUS_CAP;
+
+    m.attr("CACHE_HASH_BITS") = NIS_CACHE_HASH_BITS;
+    m.attr("LGH_CURVE_LENGTH") = NIS_LGH_CURVE_LENGTH;
+    m.attr("LGH_TRACE_DECAY") = NIS_LGH_TRACE_DECAY;
+    m.attr("LGH_TRACE_GAIN") = NIS_LGH_TRACE_GAIN;
+    m.attr("LGH_FOCUS_STRENGTH") = NIS_LGH_FOCUS_STRENGTH;
+    m.attr("LGH_FOCUS_SHARPNESS") = NIS_LGH_FOCUS_SHARPNESS;
+
+    m.attr("HPC_HIDDEN") = NIS_HPC_HIDDEN;
+    m.attr("HPC_TARGET_ERROR") = NIS_HPC_TARGET_ERROR;
+    m.attr("HPC_HALT_GAIN") = NIS_HPC_HALT_GAIN;
+    m.attr("HPC_SURPRISE_THRESHOLD") = NIS_HPC_SURPRISE_THRESHOLD;
+    m.attr("HPC_TEMPORAL_THRESHOLD") = NIS_HPC_TEMPORAL_THRESHOLD;
+
+    m.attr("OP_ADD") = NIS_OP_ADD;
+    m.attr("OP_SCALE") = NIS_OP_SCALE;
+    m.attr("OP_GATE") = NIS_OP_GATE;
+    m.attr("OP_REFLECT") = NIS_OP_REFLECT;
+    m.attr("OP_JMP") = NIS_OP_JMP;
 }
