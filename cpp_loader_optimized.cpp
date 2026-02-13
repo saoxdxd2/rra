@@ -1831,10 +1831,10 @@ std::vector<at::Tensor> forward_stack_io(
         x_input, H_state,
         params[0], params[1], params[2], params[3], params[4], params[5],
         0, // dummy_0
-        NIS_LIF_DECAY,
-        NIS_LIF_THRESHOLD,
-        NIS_HALT_THRESHOLD,
-        NIS_L_CYCLES
+        NIS::LIF_DECAY,
+        NIS::LIF_THRESHOLD,
+        NIS::HALT_THRESHOLD,
+        NIS::L_CYCLES
     );
 }
 
@@ -2032,7 +2032,7 @@ std::vector<at::Tensor> _fused_cognitive_cycle_impl(
     (void)hb_ptr;
     (void)hp_ptr;
     
-    int total_steps = (int)(NIS_H_CYCLES * NIS_L_CYCLES);
+    int total_steps = (int)(NIS::H_CYCLES * NIS::L_CYCLES);
 
     // Precompute RAM slots once per [B, L, M] to avoid repeated address recomputation
     // inside every cognitive step.
@@ -2091,20 +2091,20 @@ std::vector<at::Tensor> _fused_cognitive_cycle_impl(
                 
                 float max_delta = 0.0f;
                 
-                for (int l = 0; l < NIS_L; l++) {
+                for (int l = 0; l < NIS::L; l++) {
                     const auto& active_rs = active_regions[static_cast<size_t>(l)];
                     if (active_rs.empty()) {
                         continue;
                     }
-                    const int64_t layer_offset = batch_offset + static_cast<int64_t>(l) * static_cast<int64_t>(NIS_R) * static_cast<int64_t>(M);
+                    const int64_t layer_offset = batch_offset + static_cast<int64_t>(l) * static_cast<int64_t>(NIS::R) * static_cast<int64_t>(M);
                 
                     // 1. Average State (Across R)
                     for (int m = 0; m < M; m++) {
                         float sum = 0.0f;
-                        for (int r = 0; r < NIS_R; r++) {
+                        for (int r = 0; r < NIS::R; r++) {
                             sum += h_ptr[layer_offset + r * M + m];
                         }
-                        h_avg[m] = sum / (float)NIS_R;
+                        h_avg[m] = sum / (float)NIS::R;
                     }
                     
                     // 2. LIF Activation (BIOS Hard-Wired)
@@ -2113,16 +2113,16 @@ std::vector<at::Tensor> _fused_cognitive_cycle_impl(
                         const int32_t slot = ram_slot_cache[static_cast<size_t>(addr_idx)];
                         float u_ff = t_ptr[l * M * ram_size + m * ram_size + slot];
                         float v_curr = h_avg[m];
-                        float v_next = NIS_LIF_DECAY * v_curr + u_ff;
+                        float v_next = NIS::LIF_DECAY * v_curr + u_ff;
                         
-                        s_spikes[m] = (v_next > NIS_LIF_THRESHOLD) ? 1.0f : 0.0f;
+                        s_spikes[m] = (v_next > NIS::LIF_THRESHOLD) ? 1.0f : 0.0f;
                     }
                     
                     // 3. Update State (Decay + Spike Injection)
                     for (size_t ri = 0; ri < active_rs.size(); ri++) {
                         int r = active_rs[ri];
                         const int64_t state_base = layer_offset + static_cast<int64_t>(r) * static_cast<int64_t>(M);
-                        const int64_t decay_base = static_cast<int64_t>(l) * static_cast<int64_t>(NIS_R) * static_cast<int64_t>(M) + static_cast<int64_t>(r) * static_cast<int64_t>(M); 
+                        const int64_t decay_base = static_cast<int64_t>(l) * static_cast<int64_t>(NIS::R) * static_cast<int64_t>(M) + static_cast<int64_t>(r) * static_cast<int64_t>(M); 
                         
                         for (int m = 0; m < M; m++) {
                             float s = s_spikes[m];
@@ -2191,21 +2191,21 @@ inline void nis_execute_instruction(
     __m512& signal,
     __m512& state,
     uint8_t opcode,
-    float scale_const = NIS_SCALE_CONSTANT
+    float scale_const = NIS::SCALE_CONSTANT
 ) {
     switch(opcode) {
-        case NIS_OP_ADD:
+        case NIS::OP_ADD:
             signal = _mm512_add_ps(signal, state);
             break;
-        case NIS_OP_SCALE:
+        case NIS::OP_SCALE:
             signal = _mm512_mul_ps(signal, _mm512_set1_ps(scale_const));
             break;
-        case NIS_OP_GATE: {
+        case NIS::OP_GATE: {
             __mmask16 mask = _mm512_cmp_ps_mask(signal, _mm512_setzero_ps(), _CMP_GT_OS);
             signal = _mm512_mask_blend_ps(mask, _mm512_setzero_ps(), signal);
             break;
         }
-        case NIS_OP_REFLECT: {
+        case NIS::OP_REFLECT: {
             // Shadow Brain Reflection: bitwise inversion/negation
             signal = _mm512_sub_ps(_mm512_setzero_ps(), signal);
             break;
@@ -2227,10 +2227,10 @@ std::vector<at::Tensor> forward_stack(
 ) {
     const int64_t B = x.size(0);
     const int64_t T = x.size(1);
-    const int64_t D = NIS_WORKING_DIM;
-    const int64_t L = NIS_L;
-    const int64_t R = NIS_R;
-    const int64_t C = NIS_C;
+    const int64_t D = NIS::WORKING_DIM;
+    const int64_t L = NIS::L;
+    const int64_t R = NIS::R;
+    const int64_t C = NIS::C;
 
     auto x_c = ensure_contig(x);
     auto h_c = ensure_contig(H);
@@ -2247,12 +2247,12 @@ std::vector<at::Tensor> forward_stack(
 
             for (int64_t s = 0; s < steps; s++) {
                 // Interpretation Step: First 16 floats of each reasoning window = Opcodes
-                for (int64_t i = 0; i < D * C; i += NIS_SIMD_WIDTH) {
+                for (int64_t i = 0; i < D * C; i += NIS::SIMD_WIDTH) {
                     __m512 signal = _mm512_loadu_ps(x_bt + i);
                     __m512 state = _mm512_loadu_ps(h_bt + i);
 
                     // Decode Opcode from MSB of the signal token (simplification)
-                    uint8_t opcode = static_cast<uint8_t>(x_bt[i] > 0.5f ? NIS_OP_ADD : NIS_OP_SCALE);
+                    uint8_t opcode = static_cast<uint8_t>(x_bt[i] > 0.5f ? NIS::OP_ADD : NIS::OP_SCALE);
                     
                     nis_execute_instruction(signal, state, opcode);
                     
@@ -3366,6 +3366,55 @@ py::dict get_perf_counters() {
 }
 
 // -------------------------------------------------------------------------
+// KERNEL: Morton Curve Generation (Firmware Authority)
+// -------------------------------------------------------------------------
+torch::Tensor make_morton_order(int64_t L, int64_t R, int64_t Depth, int64_t align_multiple) {
+    int64_t N = L * R * Depth;
+    std::vector<std::pair<uint64_t, int64_t>> map;
+    map.reserve(N);
+
+    // Iterate through all coordinates
+    for (int64_t l = 0; l < L; l++) {
+        for (int64_t r = 0; r < R; r++) {
+            for (int64_t d = 0; d < Depth; d++) {
+                // Compute 4D Morton code (with t=0) using firmware intrinsic
+                // Casting to uint32_t for PDEP
+                uint64_t code = NIS::morton_jump_4d((uint32_t)l, (uint32_t)r, (uint32_t)d, 0);
+                // Calculate original index assuming row-major (L, R, Depth)
+                int64_t original_idx = l * (R * Depth) + r * Depth + d;
+                map.push_back({code, original_idx});
+            }
+        }
+    }
+
+    // Sort by Morton code
+    std::sort(map.begin(), map.end(), [](const std::pair<uint64_t, int64_t>& a, const std::pair<uint64_t, int64_t>& b) {
+        return a.first < b.first;
+    });
+
+    // Extract sorted indices
+    std::vector<int64_t> result;
+    result.reserve(std::max(N, N + align_multiple));
+    for (const auto& p : map) {
+        result.push_back(p.second);
+    }
+
+    // Alignment padding (if needed)
+    if (align_multiple > 1) {
+        int64_t remainder = N % align_multiple;
+        if (remainder != 0) {
+            int64_t pad = align_multiple - remainder;
+            for (int64_t i = 0; i < pad; i++) {
+                result.push_back(result[i % N]); 
+            }
+        }
+    }
+
+    auto opts = torch::TensorOptions().dtype(torch::kLong).device(torch::kCPU);
+    return torch::from_blob(result.data(), {(int64_t)result.size()}, opts).clone();
+}
+
+// -------------------------------------------------------------------------
 // PYBIND DEFINITIONS
 // -------------------------------------------------------------------------
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -3402,96 +3451,98 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("fused_cognitive_cycle", &_fused_cognitive_cycle_impl);
 
     // --- NIS FIRMWARE (Total Neural Unification) ---
-    m.attr("L") = NIS_L;
-    m.attr("R") = NIS_R;
-    m.attr("WORKING_DIM") = NIS_WORKING_DIM;
-    m.attr("C") = NIS_C;
-    m.attr("MEMORY_DEPTH") = NIS_MEMORY_DEPTH;
-    m.attr("H_CYCLES") = NIS_H_CYCLES;
-    m.attr("L_CYCLES") = NIS_L_CYCLES;
-    m.attr("RMS_NORM_EPS") = NIS_RMS_NORM_EPS;
-    m.attr("ROPE_THETA") = NIS_ROPE_THETA;
-    m.attr("HALT_THRESHOLD") = NIS_HALT_THRESHOLD;
+    m.attr("L") = NIS::L;
+    m.attr("R") = NIS::R;
+    m.attr("WORKING_DIM") = NIS::WORKING_DIM;
+    m.attr("C") = NIS::C;
+    m.attr("MEMORY_DEPTH") = NIS::MEMORY_DEPTH;
+    m.attr("H_CYCLES") = NIS::H_CYCLES;
+    m.attr("L_CYCLES") = NIS::L_CYCLES;
+    m.attr("RMS_NORM_EPS") = NIS::RMS_NORM_EPS;
+    m.attr("ROPE_THETA") = NIS::ROPE_THETA;
+    m.attr("HALT_THRESHOLD") = NIS::HALT_THRESHOLD;
 
-    m.attr("BATCH_SIZE") = NIS_BATCH_SIZE;
-    m.attr("SEQ_LEN") = NIS_SEQ_LEN;
-    m.attr("LEARNING_RATE") = NIS_LEARNING_RATE;
-    m.attr("EPOCHS") = NIS_EPOCHS;
-    m.attr("SEED") = NIS_SEED;
+    m.attr("BATCH_SIZE") = NIS::BATCH_SIZE;
+    m.attr("SEQ_LEN") = NIS::SEQ_LEN;
+    m.attr("LEARNING_RATE") = NIS::LEARNING_RATE;
+    m.attr("EPOCHS") = NIS::EPOCHS;
+    m.attr("SEED") = NIS::SEED;
 
-    m.attr("ADEMAMIX_BETA1_FAST") = NIS_ADEMAMIX_BETA1_FAST;
-    m.attr("ADEMAMIX_BETA1_SLOW") = NIS_ADEMAMIX_BETA1_SLOW;
-    m.attr("ADEMAMIX_BETA2") = NIS_ADEMAMIX_BETA2;
-    m.attr("WEIGHT_DECAY") = NIS_WEIGHT_DECAY;
-    m.attr("AGC_CLIP_FACTOR") = NIS_AGC_CLIP_FACTOR;
+    m.attr("ADEMAMIX_BETA1_FAST") = NIS::ADEMAMIX_BETA1_FAST;
+    m.attr("ADEMAMIX_BETA1_SLOW") = NIS::ADEMAMIX_BETA1_SLOW;
+    m.attr("ADEMAMIX_BETA2") = NIS::ADEMAMIX_BETA2;
+    m.attr("WEIGHT_DECAY") = NIS::WEIGHT_DECAY;
+    m.attr("AGC_CLIP_FACTOR") = NIS::AGC_CLIP_FACTOR;
 
-    m.attr("INIT_SCALE") = NIS_INIT_SCALE;
-    m.attr("DECAY_INIT_OFFSET") = NIS_DECAY_INIT_OFFSET;
-    m.attr("DECAY_INIT_SCALE") = NIS_DECAY_INIT_SCALE;
-    m.attr("DELAY_INIT_STD") = NIS_DELAY_INIT_STD;
-    m.attr("DELAY_MIN") = NIS_DELAY_MIN;
-    m.attr("DELAY_MAX") = NIS_DELAY_MAX;
-    m.attr("RAM_INIT_SCALE") = NIS_RAM_INIT_SCALE;
-    m.attr("DELREC_INIT_MAX") = NIS_DELREC_INIT_MAX;
+    m.attr("INIT_SCALE") = NIS::INIT_SCALE;
+    m.attr("DECAY_INIT_OFFSET") = NIS::DECAY_INIT_OFFSET;
+    m.attr("DECAY_INIT_SCALE") = NIS::DECAY_INIT_SCALE;
+    m.attr("DELAY_INIT_STD") = NIS::DELAY_INIT_STD;
+    m.attr("DELAY_MIN") = NIS::DELAY_MIN;
+    m.attr("DELAY_MAX") = NIS::DELAY_MAX;
+    m.attr("RAM_INIT_SCALE") = NIS::RAM_INIT_SCALE;
+    m.attr("DELREC_INIT_MAX") = NIS::DELREC_INIT_MAX;
 
-    m.attr("LIF_DECAY") = NIS_LIF_DECAY;
-    m.attr("LIF_THRESHOLD") = NIS_LIF_THRESHOLD;
-    m.attr("H_CYCLE_THRESHOLD") = NIS_H_CYCLE_THRESHOLD;
+    m.attr("LIF_DECAY") = NIS::LIF_DECAY;
+    m.attr("LIF_THRESHOLD") = NIS::LIF_THRESHOLD;
+    m.attr("H_CYCLE_THRESHOLD") = NIS::H_CYCLE_THRESHOLD;
 
-    m.attr("GLOBAL_BACKPROP") = NIS_GLOBAL_BACKPROP;
-    m.attr("LOCAL_LR_RATIO") = NIS_LOCAL_LR_RATIO;
-    m.attr("MES_LOCAL_L1") = NIS_MES_LOCAL_L1;
-    m.attr("SURPRISE_REWIRE_THRESHOLD") = NIS_SURPRISE_REWIRE_THRESHOLD;
-    m.attr("DISSONANCE_PENALTY") = NIS_DISSONANCE_PENALTY;
-    m.attr("METABOLIC_TAX_RATE") = NIS_METABOLIC_TAX_RATE;
+    m.attr("GLOBAL_BACKPROP") = NIS::GLOBAL_BACKPROP;
+    m.attr("LOCAL_LR_RATIO") = NIS::LOCAL_LR_RATIO;
+    m.attr("MES_LOCAL_L1") = NIS::MES_LOCAL_L1;
+    m.attr("SURPRISE_REWIRE_THRESHOLD") = NIS::SURPRISE_REWIRE_THRESHOLD;
+    m.attr("DISSONANCE_PENALTY") = NIS::DISSONANCE_PENALTY;
+    m.attr("METABOLIC_TAX_RATE") = NIS::METABOLIC_TAX_RATE;
 
-    m.attr("SURVIVAL_GAMMA") = NIS_SURVIVAL_GAMMA;
-    m.attr("SURVIVAL_UPDATE_EVERY") = NIS_SURVIVAL_UPDATE_EVERY;
-    m.attr("TARGET_SPARSITY") = NIS_TARGET_SPARSITY;
-    m.attr("LAMBDA_COST") = NIS_LAMBDA_COST;
-    m.attr("LAMBDA_STABILITY") = NIS_LAMBDA_STABILITY;
-    m.attr("LAMBDA_ENERGY") = NIS_LAMBDA_ENERGY;
+    m.attr("SURVIVAL_GAMMA") = NIS::SURVIVAL_GAMMA;
+    m.attr("SURVIVAL_UPDATE_EVERY") = NIS::SURVIVAL_UPDATE_EVERY;
+    m.attr("TARGET_SPARSITY") = NIS::TARGET_SPARSITY;
+    m.attr("LAMBDA_COST") = NIS::LAMBDA_COST;
+    m.attr("LAMBDA_STABILITY") = NIS::LAMBDA_STABILITY;
+    m.attr("LAMBDA_ENERGY") = NIS::LAMBDA_ENERGY;
 
-    m.attr("PARAM_COST_SCALE") = NIS_PARAM_COST_SCALE;
-    m.attr("MEMORY_COST_SCALE") = NIS_MEMORY_COST_SCALE;
-    m.attr("FAST_PATH_COST") = NIS_FAST_PATH_COST;
+    m.attr("PARAM_COST_SCALE") = NIS::PARAM_COST_SCALE;
+    m.attr("MEMORY_COST_SCALE") = NIS::MEMORY_COST_SCALE;
+    m.attr("FAST_PATH_COST") = NIS::FAST_PATH_COST;
 
-    m.attr("BYPASS_H_DECAY") = NIS_BYPASS_H_DECAY;
-    m.attr("CURIOSITY_EXPLORE_PROB") = NIS_CURIOSITY_EXPLORE_PROB;
-    m.attr("ENGAGEMENT_THRESHOLD_MIN") = NIS_ENGAGEMENT_THRESHOLD_MIN;
-    m.attr("ENGAGEMENT_THRESHOLD_MAX") = NIS_ENGAGEMENT_THRESHOLD_MAX;
-    m.attr("EFFICIENCY_BONUS_CAP") = NIS_EFFICIENCY_BONUS_CAP;
+    m.attr("BYPASS_H_DECAY") = NIS::BYPASS_H_DECAY;
+    m.attr("CURIOSITY_EXPLORE_PROB") = NIS::CURIOSITY_EXPLORE_PROB;
+    m.attr("ENGAGEMENT_THRESHOLD_MIN") = NIS::ENGAGEMENT_THRESHOLD_MIN;
+    m.attr("ENGAGEMENT_THRESHOLD_MAX") = NIS::ENGAGEMENT_THRESHOLD_MAX;
+    m.attr("EFFICIENCY_BONUS_CAP") = NIS::EFFICIENCY_BONUS_CAP;
 
-    m.attr("TRAIN_SAMPLES_PER_EPOCH") = NIS_TRAIN_SAMPLES_PER_EPOCH;
-    m.attr("VAL_SAMPLES_PER_EPOCH") = NIS_VAL_SAMPLES_PER_EPOCH;
-    m.attr("DREAM_REPLAY_BATCHES") = NIS_DREAM_REPLAY_BATCHES;
-    m.attr("MES_ENABLED") = (bool)NIS_MES_ENABLED;
-    m.attr("COHERENCE_WEIGHT") = NIS_COHERENCE_WEIGHT;
-    m.attr("AGC_CLIP_FACTOR") = NIS_AGC_CLIP_FACTOR;
+    m.attr("TRAIN_SAMPLES_PER_EPOCH") = NIS::TRAIN_SAMPLES_PER_EPOCH;
+    m.attr("VAL_SAMPLES_PER_EPOCH") = NIS::VAL_SAMPLES_PER_EPOCH;
+    m.attr("DREAM_REPLAY_BATCHES") = NIS::DREAM_REPLAY_BATCHES;
+    m.attr("MES_ENABLED") = (bool)NIS::MES_ENABLED;
+    m.attr("COHERENCE_WEIGHT") = NIS::COHERENCE_WEIGHT;
+    m.attr("AGC_CLIP_FACTOR") = NIS::AGC_CLIP_FACTOR;
 
-    m.attr("CPP_OMP_THREADS") = NIS_CPP_OMP_THREADS;
-    m.attr("TORCH_NUM_THREADS") = NIS_TORCH_NUM_THREADS;
-    m.attr("TORCH_INTEROP_THREADS") = NIS_TORCH_INTEROP_THREADS;
+    m.attr("CPP_OMP_THREADS") = NIS::CPP_OMP_THREADS;
+    m.attr("TORCH_NUM_THREADS") = NIS::TORCH_NUM_THREADS;
+    m.attr("TORCH_INTEROP_THREADS") = NIS::TORCH_INTEROP_THREADS;
 
-    m.attr("TRAIN_LOSS_EMA_DECAY") = NIS_TRAIN_LOSS_EMA_DECAY;
-    m.attr("SPARSITY_LOG_EVERY") = NIS_SPARSITY_LOG_EVERY;
-    m.attr("KNOWLEDGE_GAMMA") = NIS_KNOWLEDGE_GAMMA;
-    m.attr("IMPORTANCE_EVERY") = NIS_IMPORTANCE_EVERY;
-    m.attr("IMPORTANCE_RATIO") = NIS_IMPORTANCE_RATIO;
-    m.attr("GATE_UPDATE_EVERY") = NIS_GATE_UPDATE_EVERY;
-    m.attr("RAM_PRUNE_FRACTION") = NIS_RAM_PRUNE_FRACTION;
-    m.attr("RAM_CRITICAL_THRESHOLD") = NIS_RAM_CRITICAL_THRESHOLD;
-    m.attr("SLEEP_INTERVAL_STEPS") = NIS_SLEEP_INTERVAL_STEPS;
-    m.attr("WARM_UP_STEPS") = NIS_WARM_UP_STEPS;
+    m.attr("TRAIN_LOSS_EMA_DECAY") = NIS::TRAIN_LOSS_EMA_DECAY;
+    m.attr("SPARSITY_LOG_EVERY") = NIS::SPARSITY_LOG_EVERY;
+    m.attr("KNOWLEDGE_GAMMA") = NIS::KNOWLEDGE_GAMMA;
+    m.attr("IMPORTANCE_EVERY") = NIS::IMPORTANCE_EVERY;
+    m.attr("IMPORTANCE_RATIO") = NIS::IMPORTANCE_RATIO;
+    m.attr("GATE_UPDATE_EVERY") = NIS::GATE_UPDATE_EVERY;
+    m.attr("RAM_PRUNE_FRACTION") = NIS::RAM_PRUNE_FRACTION;
+    m.attr("RAM_CRITICAL_THRESHOLD") = NIS::RAM_CRITICAL_THRESHOLD;
+    m.attr("SLEEP_INTERVAL_STEPS") = NIS::SLEEP_INTERVAL_STEPS;
+    m.attr("WARM_UP_STEPS") = NIS::WARM_UP_STEPS;
 
-    m.attr("SPARSITY_THRESHOLD") = NIS_SPARSITY_THRESHOLD;
-    m.attr("MAX_LOG_ENTRIES") = NIS_MAX_LOG_ENTRIES;
-    m.attr("EPSILON") = NIS_EPSILON;
-    m.attr("OP_ADD") = NIS_OP_ADD;
-    m.attr("OP_SCALE") = NIS_OP_SCALE;
-    m.attr("OP_GATE") = NIS_OP_GATE;
-    m.attr("OP_REFLECT") = NIS_OP_REFLECT;
-    m.attr("OP_JMP") = NIS_OP_JMP;
+    m.attr("SPARSITY_THRESHOLD") = NIS::SPARSITY_THRESHOLD;
+    m.attr("MAX_LOG_ENTRIES") = NIS::MAX_LOG_ENTRIES;
+    m.attr("EPSILON") = NIS::EPSILON;
+    m.attr("OP_ADD") = NIS::OP_ADD;
+    m.attr("OP_SCALE") = NIS::OP_SCALE;
+    m.attr("OP_GATE") = NIS::OP_GATE;
+    m.attr("OP_REFLECT") = NIS::OP_REFLECT;
+    m.attr("OP_JMP") = NIS::OP_JMP;
 
-    m.attr("STRICT_CPU_ONLY") = (bool)NIS_STRICT_CPU_ONLY;
+    m.def("make_morton_order", &make_morton_order);
+
+    m.attr("STRICT_CPU_ONLY") = (bool)NIS::STRICT_CPU_ONLY;
 }

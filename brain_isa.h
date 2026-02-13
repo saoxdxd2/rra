@@ -1,153 +1,168 @@
 #ifndef BRAIN_ISA_H
 #define BRAIN_ISA_H
 
-/**
- * Neural Instruction Set (NIS) Opcodes
- * Maps 8-bit tokens to AVX-512/ASM operations
- */
-#define NIS_OP_NOP     0x00
-#define NIS_OP_ADD     0x01  // vaddps
-#define NIS_OP_SCALE   0x02  // vmulps
-#define NIS_OP_GATE    0x03  // vblendvps
-#define NIS_OP_REFLECT 0x04  // subps (sign inversion)
-#define NIS_OP_JMP     0x05  // Morton spatial jump
+#include <cstdint>
+#include <immintrin.h> // For _pdep_u64
 
-/**
- * Structural Dimensions (Fixed Bio-Wiring)
- */
-#define NIS_L           32
-#define NIS_R           8
-#define NIS_WORKING_DIM 512
-#define NIS_C           4
-#define NIS_MEMORY_DEPTH 5
+namespace NIS {
 
-/**
- * Cognitive Cycle Constraints
- */
-#define NIS_H_CYCLES    2
-#define NIS_L_CYCLES    4
-#define NIS_RMS_NORM_EPS 1e-5f
-#define NIS_ROPE_THETA   10000.0f
-#define NIS_HALT_THRESHOLD 0.9f
+    /**
+     * Neural Instruction Set (NIS) Opcodes
+     * Maps 8-bit tokens to AVX-512/ASM operations
+     */
+    static constexpr uint8_t OP_NOP     = 0x00;
+    static constexpr uint8_t OP_ADD     = 0x01;  // vaddps
+    static constexpr uint8_t OP_SCALE   = 0x02;  // vmulps
+    static constexpr uint8_t OP_GATE    = 0x03;  // vblendvps
+    static constexpr uint8_t OP_REFLECT = 0x04;  // subps (sign inversion)
+    static constexpr uint8_t OP_JMP     = 0x05;  // Morton spatial jump
 
-/**
- * Optimizer & Training (Static Firmware Defaults)
- */
-#define NIS_BATCH_SIZE     64
-#define NIS_SEQ_LEN        512
-#define NIS_LEARNING_RATE  1e-4f
-#define NIS_EPOCHS         10
-#define NIS_SEED           1337
+    /**
+     * Structural Dimensions (Fixed Bio-Wiring)
+     */
+    static constexpr int64_t L           = 32;
+    static constexpr int64_t R           = 8;
+    static constexpr int64_t WORKING_DIM = 512;
+    static constexpr int64_t C           = 4;
+    static constexpr int64_t MEMORY_DEPTH = 5;
 
-#define NIS_ADEMAMIX_BETA1_FAST 0.9f
-#define NIS_ADEMAMIX_BETA1_SLOW 0.9999f
-#define NIS_ADEMAMIX_BETA2      0.999f
-#define NIS_WEIGHT_DECAY        0.0f
-#define NIS_AGC_CLIP_FACTOR     0.1f
+    /**
+     * Cognitive Cycle Constraints
+     */
+    static constexpr int64_t H_CYCLES    = 2;
+    static constexpr int64_t L_CYCLES    = 4;
+    static constexpr float RMS_NORM_EPS  = 1e-5f;
+    static constexpr float ROPE_THETA    = 10000.0f;
+    static constexpr float HALT_THRESHOLD = 0.9f;
 
-/**
- * Initialization (Biological Primitives)
- */
-#define NIS_INIT_SCALE          0.05f
-#define NIS_DECAY_INIT_OFFSET   2.0f
-#define NIS_DECAY_INIT_SCALE    0.1f
-#define NIS_DELAY_INIT_STD      0.5f
-#define NIS_DELAY_MIN           0.1f
-#define NIS_DELAY_MAX           20.0f
-#define NIS_RAM_INIT_SCALE      0.1f
-#define NIS_DELREC_INIT_MAX     5.0f
+    /**
+     * Optimizer & Training (Static Firmware Defaults)
+     */
+    static constexpr int64_t BATCH_SIZE     = 64;
+    static constexpr int64_t SEQ_LEN        = 512;
+    static constexpr float LEARNING_RATE  = 1e-4f;
+    static constexpr int64_t EPOCHS         = 10;
+    static constexpr int64_t SEED           = 1337;
 
-/**
- * Neuron Physics (LIF)
- */
-#define NIS_LIF_DECAY           0.9f
-#define NIS_LIF_THRESHOLD       1.0f
-#define NIS_H_CYCLE_THRESHOLD   2
+    static constexpr float ADEMAMIX_BETA1_FAST = 0.9f;
+    static constexpr float ADEMAMIX_BETA1_SLOW = 0.9999f;
+    static constexpr float ADEMAMIX_BETA2      = 0.999f;
+    static constexpr float WEIGHT_DECAY        = 0.0f;
+    
+    /**
+     * Initialization (Biological Primitives)
+     */
+    static constexpr float INIT_SCALE          = 0.05f;
+    static constexpr float DECAY_INIT_OFFSET   = 2.0f;
+    static constexpr float DECAY_INIT_SCALE    = 0.1f;
+    static constexpr float DELAY_INIT_STD      = 0.5f;
+    static constexpr float DELAY_MIN           = 0.1f;
+    static constexpr float DELAY_MAX           = 20.0f;
+    static constexpr float RAM_INIT_SCALE      = 0.1f;
+    static constexpr float DELREC_INIT_MAX     = 5.0f;
 
-/**
- * Metabolic Governance & Survival
- */
-#define NIS_GLOBAL_BACKPROP     0 // boolean
-#define NIS_LOCAL_LR_RATIO      0.5f
-#define NIS_MES_LOCAL_L1        0.01f
-#define NIS_SURPRISE_REWIRE_THRESHOLD 0.8f
-#define NIS_DISSONANCE_PENALTY  0.1f
-#define NIS_METABOLIC_TAX_RATE  0.01f
+    /**
+     * Neuron Physics (LIF)
+     */
+    static constexpr float LIF_DECAY           = 0.9f;
+    static constexpr float LIF_THRESHOLD       = 1.0f;
+    static constexpr int64_t H_CYCLE_THRESHOLD   = 2;
 
-#define NIS_SURVIVAL_GAMMA      0.01f
-#define NIS_SURVIVAL_UPDATE_EVERY 50
-#define NIS_TARGET_SPARSITY     0.9f
-#define NIS_LAMBDA_COST         0.01f
-#define NIS_LAMBDA_STABILITY    0.01f
-#define NIS_LAMBDA_ENERGY       0.01f
+    /**
+     * Metabolic Governance & Survival
+     */
+    static constexpr bool GLOBAL_BACKPROP     = false;
+    static constexpr float LOCAL_LR_RATIO      = 0.5f;
+    static constexpr float MES_LOCAL_L1        = 0.01f;
+    static constexpr float SURPRISE_REWIRE_THRESHOLD = 0.8f;
+    static constexpr float DISSONANCE_PENALTY  = 0.1f;
+    static constexpr float METABOLIC_TAX_RATE  = 0.01f;
 
-#define NIS_PARAM_COST_SCALE    1e-6f
-#define NIS_MEMORY_COST_SCALE   1e-4f
-#define NIS_FAST_PATH_COST      0.001f
+    static constexpr float SURVIVAL_GAMMA      = 0.01f;
+    static constexpr int64_t SURVIVAL_UPDATE_EVERY = 50;
+    static constexpr float TARGET_SPARSITY     = 0.9f;
+    static constexpr float LAMBDA_COST         = 0.01f;
+    static constexpr float LAMBDA_STABILITY    = 0.01f;
+    static constexpr float LAMBDA_ENERGY       = 0.01f;
 
-/**
- * Engagement & Transparency
- */
-#define NIS_BYPASS_H_DECAY      0.99f
-#define NIS_CURIOSITY_EXPLORE_PROB 0.05f
-#define NIS_ENGAGEMENT_THRESHOLD_MIN 0.05f
-#define NIS_ENGAGEMENT_THRESHOLD_MAX 0.95f
-#define NIS_EFFICIENCY_BONUS_CAP     0.05f
+    static constexpr float PARAM_COST_SCALE    = 1e-6f;
+    static constexpr float MEMORY_COST_SCALE   = 1e-4f;
+    static constexpr float FAST_PATH_COST      = 0.001f;
 
-/**
- * Cache & LGH Metadata
- */
-#define NIS_CACHE_HASH_BITS     20
-#define NIS_LGH_CURVE_LENGTH    96
-#define NIS_LGH_TRACE_DECAY     0.90f
-#define NIS_LGH_TRACE_GAIN      0.20f
-#define NIS_LGH_FOCUS_STRENGTH  0.35f
-#define NIS_LGH_FOCUS_SHARPNESS 2.0f
+    /**
+     * Engagement & Transparency
+     */
+    static constexpr float BYPASS_H_DECAY      = 0.99f;
+    static constexpr float CURIOSITY_EXPLORE_PROB = 0.05f;
+    static constexpr float ENGAGEMENT_THRESHOLD_MIN = 0.05f;
+    static constexpr float ENGAGEMENT_THRESHOLD_MAX = 0.95f;
+    static constexpr float EFFICIENCY_BONUS_CAP     = 0.05f;
 
-/**
- * HPC Metadata
- */
-#define NIS_HPC_HIDDEN          256
-#define NIS_HPC_TARGET_ERROR    0.05f
-#define NIS_HPC_HALT_GAIN       0.35f
-#define NIS_HPC_SURPRISE_THRESHOLD 0.20f
-#define NIS_HPC_TEMPORAL_THRESHOLD 0.08f
+    /**
+     * Cache & LGH Metadata
+     */
+    static constexpr int64_t CACHE_HASH_BITS     = 20;
+    static constexpr int64_t LGH_CURVE_LENGTH    = 96;
+    static constexpr float LGH_TRACE_DECAY     = 0.90f;
+    static constexpr float LGH_TRACE_GAIN      = 0.20f;
+    static constexpr float LGH_FOCUS_STRENGTH  = 0.35f;
+    static constexpr float LGH_FOCUS_SHARPNESS = 2.0f;
 
-/**
- * SIMD & Alignment Physics
- */
-#define NIS_SIMD_WIDTH 16 // 512 bits
-#define NIS_ALIGNMENT  64
+    /**
+     * HPC Metadata
+     */
+    static constexpr int64_t HPC_HIDDEN          = 256;
+    static constexpr float HPC_TARGET_ERROR    = 0.05f;
+    static constexpr float HPC_HALT_GAIN       = 0.35f;
+    static constexpr float HPC_SURPRISE_THRESHOLD = 0.20f;
+    static constexpr float HPC_TEMPORAL_THRESHOLD = 0.08f;
 
-/**
- * Metadata & Runtime Strategy (Bio-BIOS)
- */
-#define NIS_TRAIN_SAMPLES_PER_EPOCH 40000
-#define NIS_VAL_SAMPLES_PER_EPOCH   4000
-#define NIS_DREAM_REPLAY_BATCHES    2
-#define NIS_MES_ENABLED             1
-#define NIS_COHERENCE_WEIGHT        0.01f
-#define NIS_AGC_CLIP_FACTOR         0.1f
+    /**
+     * SIMD & Alignment Physics
+     */
+    static constexpr int64_t SIMD_WIDTH = 16; // 512 bits
+    static constexpr int64_t ALIGNMENT  = 64;
 
-#define NIS_CPP_OMP_THREADS         8
-#define NIS_TORCH_NUM_THREADS       2
-#define NIS_TORCH_INTEROP_THREADS   1
+    /**
+     * Metadata & Runtime Strategy (Bio-BIOS)
+     */
+    static constexpr int64_t TRAIN_SAMPLES_PER_EPOCH = 40000;
+    static constexpr int64_t VAL_SAMPLES_PER_EPOCH   = 4000;
+    static constexpr int64_t DREAM_REPLAY_BATCHES    = 2;
+    static constexpr bool MES_ENABLED             = true;
+    static constexpr float COHERENCE_WEIGHT        = 0.01f;
+    static constexpr float AGC_CLIP_FACTOR         = 0.1f;
 
-#define NIS_TRAIN_LOSS_EMA_DECAY    0.98f
-#define NIS_SPARSITY_LOG_EVERY      50
-#define NIS_KNOWLEDGE_GAMMA         0.01f
-#define NIS_IMPORTANCE_EVERY        200
-#define NIS_IMPORTANCE_RATIO        0.3f
-#define NIS_GATE_UPDATE_EVERY       50
-#define NIS_RAM_PRUNE_FRACTION      0.2f
-#define NIS_RAM_CRITICAL_THRESHOLD  0.95f
-#define NIS_SLEEP_INTERVAL_STEPS    1000
+    static constexpr int64_t CPP_OMP_THREADS         = 8;
+    static constexpr int64_t TORCH_NUM_THREADS       = 2;
+    static constexpr int64_t TORCH_INTEROP_THREADS   = 1;
 
-#define NIS_SPARSITY_THRESHOLD      0.5f
-#define NIS_MAX_LOG_ENTRIES         1000
-#define NIS_EPSILON                 1e-8f
-#define NIS_WARM_UP_STEPS           2000.0f
-#define NIS_SCALE_CONSTANT          0.1f
-#define NIS_STRICT_CPU_ONLY         0
+    static constexpr float TRAIN_LOSS_EMA_DECAY    = 0.98f;
+    static constexpr int64_t SPARSITY_LOG_EVERY      = 50;
+    static constexpr float KNOWLEDGE_GAMMA         = 0.01f;
+    static constexpr int64_t IMPORTANCE_EVERY        = 200;
+    static constexpr float IMPORTANCE_RATIO        = 0.3f;
+    static constexpr int64_t GATE_UPDATE_EVERY       = 50;
+    static constexpr float RAM_PRUNE_FRACTION      = 0.2f;
+    static constexpr float RAM_CRITICAL_THRESHOLD  = 0.95f;
+    static constexpr int64_t SLEEP_INTERVAL_STEPS    = 1000;
+
+    static constexpr float SPARSITY_THRESHOLD      = 0.5f;
+    static constexpr int64_t MAX_LOG_ENTRIES         = 1000;
+    static constexpr float EPSILON                 = 1e-8f;
+    static constexpr float WARM_UP_STEPS           = 2000.0f;
+    static constexpr float SCALE_CONSTANT          = 0.1f;
+    static constexpr bool STRICT_CPU_ONLY         = false;
+
+    // Hardware Morton Jump (PDEP)
+    inline uint64_t morton_jump_4d(uint32_t x, uint32_t y, uint32_t z, uint32_t t) {
+        // Parallel Bits Deposit (PDEP) interleaves bits in 1 clock cycle
+        // Requires AVX2/BMI2 support (Haswell+)
+        return _pdep_u64(x, 0x1111111111111111ULL) | 
+               _pdep_u64(y, 0x2222222222222222ULL) | 
+               _pdep_u64(z, 0x4444444444444444ULL) | 
+               _pdep_u64(t, 0x8888888888888888ULL);
+    }
+}
 
 #endif // BRAIN_ISA_H
