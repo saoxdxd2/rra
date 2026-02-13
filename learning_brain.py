@@ -62,9 +62,14 @@ class LearningBrain(nn.Module):
             reduction='mean'
         )
 
-    def calculate_unified_loss(self, L_task: torch.Tensor, L_teacher: torch.Tensor, L_stability: torch.Tensor, omega: float) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    def calculate_unified_loss(self, L_task: torch.Tensor, L_teacher: torch.Tensor, L_stability: torch.Tensor, omega: float, thermal_penalty: float = 0.0) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """Combines task, teacher, and stability losses into a single modulated objective."""
         lambda_stability = Config.SURVIVAL_WEIGHT * (1.0 - omega * 0.8)
+        
+        # Phase 4: Thermal Feedback - If throttled, increase sensitivity to stability/energy
+        if thermal_penalty > 0:
+            lambda_stability *= (1.0 + thermal_penalty)
+
         L_total = (1.0 - omega) * L_teacher + omega * L_task + lambda_stability * L_stability
         
         return L_total, {
@@ -73,6 +78,7 @@ class LearningBrain(nn.Module):
             'L_stability': L_stability.item() if hasattr(L_stability, 'item') else L_stability,
             'omega': omega,
             'lambda_stability': lambda_stability,
+            'thermal_penalty': thermal_penalty,
         }
 
     def get_usefulness_mask(self, threshold=0.1):
@@ -90,7 +96,7 @@ class LearningBrain(nn.Module):
         rate = self.update_rates[level_idx]
         return (1.0 - rate) * H_old + rate * H_new
 
-    def forward_step(self, model, inp, targets, H, L_teacher=None):
+    def forward_step(self, model, inp, targets, H, L_teacher=None, thermal_penalty: float = 0.0):
         out, H_next, cost_step, gate = model(inp, H, learning_brain=self)
         
         loss_task = self.calculate_task_loss(out, targets)
@@ -103,6 +109,11 @@ class LearningBrain(nn.Module):
         self._step += 1
         
         dynamic_energy_weight = Config.DYNAMIC_ENERGY_SCALE * (1.0 - confusion_ratio) * warmup_factor
+        
+        # Phase 4: Doubled energy loss during thermal throttling
+        if thermal_penalty > 0:
+            dynamic_energy_weight *= (1.0 + thermal_penalty)
+
         loss_stability, loss_energy, loss_coherence = model.metabolism.calculate_losses(H_next, gate=gate, H_prev=H)
         loss_myelin = model.metabolism.calculate_myelin_cost(model)
         
@@ -113,7 +124,8 @@ class LearningBrain(nn.Module):
             L_task=loss_task, 
             L_teacher=L_teacher, 
             L_stability=combined_stability, 
-            omega=omega
+            omega=omega,
+            thermal_penalty=thermal_penalty
         )
         
         total_loss = total_loss + (dynamic_energy_weight * (cost_step + loss_energy))
@@ -152,7 +164,7 @@ class LearningBrain(nn.Module):
         
         return total_loss, H_next, metrics
 
-    def learning_step(self, model, inp, targets, H, optimizer, L_teacher=None, loss_contribution_tracker=None, gate_optimizer=None, omega=None):
+    def learning_step(self, model, inp, targets, H, optimizer, L_teacher=None, loss_contribution_tracker=None, gate_optimizer=None, omega=None, thermal_penalty: float = 0.0):
         step = int(self._step)
         importance_needed = (loss_contribution_tracker is not None and (step % int(self.importance_every) == 0))
         hook_handle = None
@@ -166,7 +178,7 @@ class LearningBrain(nn.Module):
             hook_handle = H.register_hook(save_grad_hook)
 
         optimizer.zero_grad()
-        total_loss, H_next, metrics = self.forward_step(model, inp, targets, H, L_teacher=L_teacher)
+        total_loss, H_next, metrics = self.forward_step(model, inp, targets, H, L_teacher=L_teacher, thermal_penalty=thermal_penalty)
         if not torch.isfinite(total_loss):
             optimizer.zero_grad(set_to_none=True)
             return {'loss_task': float('nan'), 'total_loss': float('nan'), 'H_next': H_next.detach()}
