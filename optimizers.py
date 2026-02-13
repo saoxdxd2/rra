@@ -71,52 +71,31 @@ class AdEMAMix(optim.Optimizer):
                 loss = closure()
 
         for group in self.param_groups:
-            # Determine alpha/omega for this step
-            current_alpha = omega if omega is not None else group['alpha']
+            current_alpha = float(omega if omega is not None else group['alpha'])
+            lr, bf, bs, b2, eps, wd = group['lr'], group['beta1_fast'], group['beta1_slow'], group['beta2'], group['eps'], group['weight_decay']
+            
+            p_b, g_b, mf_b, ms_b, v_b = [], [], [], [], []
+            last_step = 0
             
             for p in group['params']:
                 if p.grad is None: continue
-                
-                grad = p.grad
-                if grad.is_sparse:
-                    raise RuntimeError('AdEMAMix does not support sparse gradients')
-
-                # --- SIGN-SGD (Better than Elite Salt) ---
-                # Reduce precision to signs to save RAM bus bandwidth and align with int8 plan.
-                if group.get('sign_sgd', False):
-                    grad = grad.sign()
-
+                grad = p.grad.detach()
+                if group.get('sign_sgd', False): grad = grad.sign()
                 state = self.state[p]
-
-                # State initialization
                 if len(state) == 0:
                     state['step'] = 0
-                    state['m_fast'] = torch.zeros_like(p, memory_format=torch.preserve_format)
-                    state['m_slow'] = torch.zeros_like(p, memory_format=torch.preserve_format)
-                    state['v'] = torch.zeros_like(p, memory_format=torch.preserve_format)
-
-                m_fast = state['m_fast']
-                m_slow = state['m_slow']
-                v = state['v']
+                    state['m_fast'] = torch.zeros_like(p)
+                    state['m_slow'] = torch.zeros_like(p)
+                    state['v'] = torch.zeros_like(p)
+                p_b.append(p)
+                g_b.append(grad.contiguous())
+                mf_b.append(state['m_fast'])
+                ms_b.append(state['m_slow'])
+                v_b.append(state['v'])
                 state['step'] += 1
-                
-                lr = group['lr']
-                beta1_fast = group['beta1_fast']
-                beta1_slow = group['beta1_slow']
-                beta2 = group['beta2']
-                eps = group['eps']
-                wd = group['weight_decay']
-                 
-                _require_cpp_ademamix(p, grad, m_fast, m_slow, v)
-                if not (p.is_contiguous() and m_fast.is_contiguous() and m_slow.is_contiguous() and v.is_contiguous()):
-                    raise RuntimeError("AdEMAMix expects contiguous parameter/state tensors.")
-                grad_c = grad.contiguous()
-                ACCEL.call(
-                    'ademamix_update',
-                    p, grad_c, m_fast, m_slow, v,
-                    lr, beta1_fast, beta1_slow, beta2,
-                    current_alpha, eps, wd, state['step'],
-                    tensors=(p, grad_c, m_fast, m_slow, v)
-                )
+                last_step = state['step']
+
+            if p_b:
+                ACCEL.call('batched_ademamix_update', p_b, g_b, mf_b, ms_b, v_b, lr, bf, bs, b2, current_alpha, eps, last_step, tensors=tuple(p_b + g_b + mf_b + ms_b + v_b))
 
         return loss

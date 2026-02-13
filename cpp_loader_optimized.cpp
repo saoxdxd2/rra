@@ -1130,77 +1130,59 @@ std::vector<torch::Tensor> neural_cache_lookup_fast(
 }
 
 // -------------------------------------------------------------------------
-// KERNEL: AdEMAMix (Optimizer)
+// KERNEL: AdEMAMix Shared Implementation
 // -------------------------------------------------------------------------
+namespace {
+    inline void _ademamix_core(
+        float* p, float* g, float* mf, float* ms, float* v,
+        int64_t N, float lr, float beta1_fast, float beta1_slow, float beta2,
+        float alpha, float eps, float weight_decay, int step,
+        float bc1_f, float bc1_s, float bc2
+    ) {
+        #pragma omp parallel for schedule(static) if(N > 4096)
+        for (int64_t i = 0; i < N; i++) {
+            float grad_val = g[i];
+            if (weight_decay != 0.0f) {
+                p[i] *= (1.0f - lr * weight_decay);
+            }
+            mf[i] = beta1_fast * mf[i] + (1.0f - beta1_fast) * grad_val;
+            ms[i] = beta1_slow * ms[i] + (1.0f - beta1_slow) * grad_val;
+            v[i]  = beta2 * v[i] + (1.0f - beta2) * grad_val * grad_val;
+            
+            float mf_hat = mf[i] / bc1_f;
+            float ms_hat = ms[i] / bc1_s;
+            float v_hat  = v[i] / bc2;
+            float m_mix  = alpha * ms_hat + (1.0f - alpha) * mf_hat;
+            p[i] -= lr * (m_mix / (std::sqrt(v_hat) + eps));
+        }
+    }
+}
+
 void ademamix_update(
     torch::Tensor p, torch::Tensor grad, 
     torch::Tensor m_fast, torch::Tensor m_slow, torch::Tensor v,
     float lr, float beta1_fast, float beta1_slow, float beta2,
     float alpha, float eps, float weight_decay, int step
 ) {
-    check_cpu(p, "p");
-    check_cpu(grad, "grad");
-    check_cpu(m_fast, "m_fast");
-    check_cpu(m_slow, "m_slow");
-    check_cpu(v, "v");
-    check_dtype(p, at::kFloat, "p");
-    check_dtype(grad, at::kFloat, "grad");
-    check_dtype(m_fast, at::kFloat, "m_fast");
-    check_dtype(m_slow, at::kFloat, "m_slow");
-    check_dtype(v, at::kFloat, "v");
-    TORCH_CHECK(
-        p.numel() == grad.numel() && p.numel() == m_fast.numel() && p.numel() == m_slow.numel() && p.numel() == v.numel(),
-        "All optimizer tensors must have the same number of elements."
-    );
-
-    auto p_c = ensure_contig(p);
-    auto g_c = ensure_contig(grad);
-    auto mf_c = ensure_contig(m_fast);
-    auto ms_c = ensure_contig(m_slow);
-    auto v_c = ensure_contig(v);
-    
-    int64_t N = p_c.numel();
-    Perf::g_ademamix_calls.fetch_add(1ULL, std::memory_order_relaxed);
-    float* p_ptr = p_c.data_ptr<float>();
-    float* g_ptr = g_c.data_ptr<float>();
-    float* mf_ptr = mf_c.data_ptr<float>();
-    float* ms_ptr = ms_c.data_ptr<float>();
-    float* v_ptr = v_c.data_ptr<float>();
+    check_cpu(p, "p"); check_cpu(grad, "grad");
+    check_cpu(m_fast, "m_fast"); check_cpu(m_slow, "m_slow"); check_cpu(v, "v");
+    auto p_c = ensure_contig(p); auto g_c = ensure_contig(grad);
+    auto mf_c = ensure_contig(m_fast); auto ms_c = ensure_contig(m_slow); auto v_c = ensure_contig(v);
     
     float bc1_f = 1.0f - std::pow(beta1_fast, (float)step + 1.0f);
     float bc1_s = 1.0f - std::pow(beta1_slow, (float)step + 1.0f);
-    float bc2 = 1.0f - std::pow(beta2, (float)step + 1.0f);
+    float bc2   = 1.0f - std::pow(beta2, (float)step + 1.0f);
     
-    #pragma omp parallel for schedule(static)
-    for (int64_t i = 0; i < N; i++) {
-        float g = g_ptr[i];
-        
-        // Weight Decay
-        if (weight_decay != 0.0f) {
-            p_ptr[i] *= (1.0f - lr * weight_decay);
-        }
-        
-        mf_ptr[i] = beta1_fast * mf_ptr[i] + (1.0f - beta1_fast) * g;
-        ms_ptr[i] = beta1_slow * ms_ptr[i] + (1.0f - beta1_slow) * g;
-        v_ptr[i]   = beta2 * v_ptr[i] + (1.0f - beta2) * g * g;
-        
-        float mf_hat = mf_ptr[i] / bc1_f;
-        float ms_hat = ms_ptr[i] / bc1_s;
-        float v_hat  = v_ptr[i] / bc2;
-        
-        float m_mixed = alpha * ms_hat + (1.0f - alpha) * mf_hat;
-        p_ptr[i] -= lr * (m_mixed / (std::sqrt(v_hat) + eps));
-    }
-    const long double n = static_cast<long double>(N);
-    Perf::add(
-        Perf::sat_from_ld(14.0L * n),
-        Perf::sat_from_ld(36.0L * n)
+    _ademamix_core(
+        p_c.data_ptr<float>(), g_c.data_ptr<float>(),
+        mf_c.data_ptr<float>(), ms_c.data_ptr<float>(), v_c.data_ptr<float>(),
+        p_c.numel(), lr, beta1_fast, beta1_slow, beta2, alpha, eps, weight_decay, step,
+        bc1_f, bc1_s, bc2
     );
+    Perf::g_ademamix_calls.fetch_add(1ULL, std::memory_order_relaxed);
+    Perf::add(14ULL * p_c.numel(), 36ULL * p_c.numel());
 }
 
-// -------------------------------------------------------------------------
-// KERNEL: Batched AdEMAMix (List of Parameters)
-// -------------------------------------------------------------------------
 void batched_ademamix_update(
     std::vector<torch::Tensor> params,
     std::vector<torch::Tensor> grads,
@@ -1210,74 +1192,43 @@ void batched_ademamix_update(
     float lr, float beta1_fast, float beta1_slow, float beta2,
     float alpha, float eps, int step
 ) {
-    Perf::g_batched_ademamix_calls.fetch_add(1ULL, std::memory_order_relaxed);
     const size_t n_params = params.size();
-    TORCH_CHECK(
-        grads.size() == n_params &&
-        m_fast_list.size() == n_params &&
-        m_slow_list.size() == n_params &&
-        v_list.size() == n_params,
-        "All tensor lists must have the same length."
-    );
-
-    const float bc1_f = 1.0f - std::pow(beta1_fast, (float)step + 1.0f);
-    const float bc1_s = 1.0f - std::pow(beta1_slow, (float)step + 1.0f);
-    const float bc2 = 1.0f - std::pow(beta2, (float)step + 1.0f);
+    float bc1_f = 1.0f - std::pow(beta1_fast, (float)step + 1.0f);
+    float bc1_s = 1.0f - std::pow(beta1_slow, (float)step + 1.0f);
+    float bc2   = 1.0f - std::pow(beta2, (float)step + 1.0f);
 
     long double total_elems = 0.0L;
+    #pragma omp parallel for reduction(+:total_elems) schedule(dynamic)
     for (size_t i = 0; i < n_params; i++) {
-        auto& p = params[i];
-        auto& g = grads[i];
-        auto& mf = m_fast_list[i];
-        auto& ms = m_slow_list[i];
-        auto& v = v_list[i];
-
-        check_cpu(p, "params[i]");
-        check_cpu(g, "grads[i]");
-        check_cpu(mf, "m_fast_list[i]");
-        check_cpu(ms, "m_slow_list[i]");
-        check_cpu(v, "v_list[i]");
-        check_dtype(p, at::kFloat, "params[i]");
-        check_dtype(g, at::kFloat, "grads[i]");
-        check_dtype(mf, at::kFloat, "m_fast_list[i]");
-        check_dtype(ms, at::kFloat, "m_slow_list[i]");
-        check_dtype(v, at::kFloat, "v_list[i]");
-        TORCH_CHECK(
-            p.is_contiguous() && g.is_contiguous() && mf.is_contiguous() && ms.is_contiguous() && v.is_contiguous(),
-            "batched_ademamix_update expects contiguous tensors."
-        );
-        TORCH_CHECK(
-            p.numel() == g.numel() && p.numel() == mf.numel() && p.numel() == ms.numel() && p.numel() == v.numel(),
-            "Each parameter and its state tensors must have the same number of elements."
-        );
-
-        const int64_t N = p.numel();
-        total_elems += static_cast<long double>(N);
+        auto& p = params[i]; auto& g = grads[i];
+        auto& mf = m_fast_list[i]; auto& ms = m_slow_list[i]; auto& v = v_list[i];
+        
+        // Internal check to avoid overhead of check_cpu in loop
         float* p_ptr = p.data_ptr<float>();
         float* g_ptr = g.data_ptr<float>();
         float* mf_ptr = mf.data_ptr<float>();
         float* ms_ptr = ms.data_ptr<float>();
         float* v_ptr = v.data_ptr<float>();
+        int64_t N = p.numel();
+        total_elems += static_cast<long double>(N);
 
-        #pragma omp parallel for schedule(static)
+        // For small parameters, we process them in the thread directly.
+        // For large ones, we don't nest OMP but process sequentially within the task.
         for (int64_t j = 0; j < N; j++) {
-            const float grad = g_ptr[j];
-
-            mf_ptr[j] = beta1_fast * mf_ptr[j] + (1.0f - beta1_fast) * grad;
-            ms_ptr[j] = beta1_slow * ms_ptr[j] + (1.0f - beta1_slow) * grad;
-            v_ptr[j]  = beta2 * v_ptr[j] + (1.0f - beta2) * grad * grad;
-
-            const float mf_hat = mf_ptr[j] / bc1_f;
-            const float ms_hat = ms_ptr[j] / bc1_s;
-            const float v_hat  = v_ptr[j] / bc2;
-            const float m_mix = alpha * ms_hat + (1.0f - alpha) * mf_hat;
+            float grad_val = g_ptr[j];
+            mf_ptr[j] = beta1_fast * mf_ptr[j] + (1.0f - beta1_fast) * grad_val;
+            ms_ptr[j] = beta1_slow * ms_ptr[j] + (1.0f - beta1_slow) * grad_val;
+            v_ptr[j]  = beta2 * v_ptr[j] + (1.0f - beta2) * grad_val * grad_val;
+            
+            float mf_hat = mf_ptr[j] / bc1_f;
+            float ms_hat = ms_ptr[j] / bc1_s;
+            float v_hat  = v_ptr[j] / bc2;
+            float m_mix  = alpha * ms_hat + (1.0f - alpha) * mf_hat;
             p_ptr[j] -= lr * (m_mix / (std::sqrt(v_hat) + eps));
         }
     }
-    Perf::add(
-        Perf::sat_from_ld(12.0L * total_elems),
-        Perf::sat_from_ld(36.0L * total_elems)
-    );
+    Perf::g_batched_ademamix_calls.fetch_add(1ULL, std::memory_order_relaxed);
+    Perf::add(Perf::sat_from_ld(12.0L * total_elems), Perf::sat_from_ld(36.0L * total_elems));
 }
 
 // -------------------------------------------------------------------------

@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from organism import Config
 
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple, List
 
 def _masked_ema_update(current: torch.Tensor, new_value: torch.Tensor, gamma: float, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
     """Performs an Exponential Moving Average update, optionally with a mask."""
@@ -97,6 +97,27 @@ class LearningBrain(nn.Module):
         rate = self.update_rates[level_idx]
         return (1.0 - rate) * H_old + rate * H_new
 
+    def calculate_metabolic_losses(self, H, H_prev=None):
+        """Calculates metabolic energy, cost, and surprise losses via C++ kernel."""
+        from organism import _cpp_try
+        H_c = H.contiguous()
+        H_prev_t = H_prev.contiguous() if H_prev is not None else torch.empty(0, device=H.device, dtype=H_c.dtype)
+        
+        return _cpp_try(
+            'survival_losses_io',
+            H_c,
+            H_prev_t,
+            [],
+            torch.empty(0, device=H.device),
+            tensors=(H_c, H_prev_t)
+        )
+
+    def calculate_myelin_cost(self, model):
+        """Calculates energy penalty for insulated (myelinated) pathways."""
+        if not hasattr(model, 'myelin_sheaths') or not hasattr(model.governor, 'usage'):
+            return torch.tensor(0.0, device=self.device)
+        return torch.sum(model.myelin_sheaths * model.governor.usage) * Config.METABOLIC_TAX_RATE
+
     def forward_step(self, model, inp, targets, H, L_teacher=None, thermal_penalty: float = 0.0):
         out, H_next, cost_step, gate = model(inp, H, learning_brain=self)
         
@@ -115,8 +136,8 @@ class LearningBrain(nn.Module):
         if thermal_penalty > 0:
             dynamic_energy_weight *= (1.0 + thermal_penalty)
 
-        loss_stability, loss_energy, loss_coherence = model.metabolism.calculate_losses(H_next, gate=gate, H_prev=H)
-        loss_myelin = model.metabolism.calculate_myelin_cost(model)
+        loss_stability, loss_energy, loss_coherence = self.calculate_metabolic_losses(H_next, H_prev=H)
+        loss_myelin = self.calculate_myelin_cost(model)
         
         omega = getattr(model, 'omega', 0.0)
         combined_stability = loss_stability + Config.COHERENCE_WEIGHT * loss_coherence + loss_myelin

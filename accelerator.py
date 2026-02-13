@@ -44,10 +44,40 @@ class Accelerator:
     def __init__(self, loader=None, strict=True):
         self._loader = loader
         self.strict = bool(strict)
+        self._dispatch_cache = {}
+        self._cached_loader = None
 
     @property
     def loader(self):
-        return get_cpp_loader() if self._loader is None else self._loader
+        if self._loader is not None:
+            return self._loader
+        if self._cached_loader is None:
+            self._cached_loader = get_cpp_loader()
+        return self._cached_loader
+
+    def _get_op(self, op_name, dev_type):
+        cache_key = (op_name, dev_type)
+        if cache_key in self._dispatch_cache:
+            return self._dispatch_cache[cache_key]
+        
+        mod = self.loader
+        if mod is None:
+            return None
+            
+        op = None
+        # Try specialized first: op_name_cuda, op_name_cpu
+        special_name = f"{op_name}_{dev_type}"
+        if hasattr(mod, special_name):
+            op = getattr(mod, special_name)
+        elif hasattr(mod, op_name):
+            # Check if generic op supports the device
+            if dev_type == "cpu":
+                op = getattr(mod, op_name)
+            elif hasattr(mod, "is_cuda_optimized") and mod.is_cuda_optimized():
+                op = getattr(mod, op_name)
+        
+        self._dispatch_cache[cache_key] = op
+        return op
 
     def ready(self, op_name=None, *tensors):
         # Backward compatibility: allow ready(*tensors) call style.
@@ -99,16 +129,21 @@ class Accelerator:
         return [op for op in op_names if not hasattr(mod, op)]
 
     def call(self, op_name, *args, tensors=None):
-        mod = self.loader
         probe_tensors = args if tensors is None else tensors
-        if mod is None:
-            if self.strict:
-                raise RuntimeError(f"C++ loader not available; required op '{op_name}'.")
-            return None
-        if not hasattr(mod, op_name):
-            if self.strict:
-                raise RuntimeError(f"C++ op '{op_name}' is unavailable in loaded extension.")
-            return None
+        dev_type = "cpu"
+        for t in probe_tensors:
+            if isinstance(t, torch.Tensor):
+                dev_type = t.device.type
+                break
+        
+        op = self._get_op(op_name, dev_type)
+        if op is not None:
+            try:
+                return op(*args)
+            except Exception as exc:
+                if self.strict:
+                    raise RuntimeError(f"C++ op '{op_name}' failed on '{dev_type}': {exc}") from exc
+                return None
         if not self.ready(op_name, *probe_tensors):
             if self.strict:
                 # Detect device type for better error message
