@@ -1243,18 +1243,6 @@ class RRATrainer:
             loss_info['L_task'] = float(loss_info.get('L_task', float('nan')))
             loss_info['L_teacher'] = float(loss_info.get('L_teacher', float('nan')))
             if not math.isfinite(L_total_val):
-                self._recover_from_nonfinite_omega(reason="omega_mes_total_loss")
-                return None
-        else:
-            # Global Backprop: Centralized Orchestration
-            # We use learning_step which handles backward() and optimizer.step()
-            results = self.learning_brain.learning_step(
-                self.model, inp, yb, H, self.optimizer, L_teacher=L_teacher, omega=self.model.omega
-            )
-            L_total_val = float(results['total_loss'])
-            H_next = results['H_next']
-            loss_info['L_task'] = results.get('loss_task', float('nan'))
-            if L_teacher is not None and hasattr(L_teacher, 'item'):
                 loss_info['L_teacher'] = L_teacher.item()
             if not math.isfinite(L_total_val):
                 self._recover_from_nonfinite_omega(reason="omega_global_total_loss")
