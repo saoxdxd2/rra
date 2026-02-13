@@ -132,15 +132,11 @@ class Governor(nn.Module):
         self.health = 1.0
         self.best_loss = float('inf')
         self.mutation_config = MutationConfig()
-        
-        # We store genes as simple attributes for speed, but they wrap the multi-allele logic
-        # Legacy Genome used BrainGene objects; here we'll use a simplified version.
         self._init_genes()
         
         if device: self.to(device)
 
     def _init_genes(self):
-        # (name, baseline, min, max)
         gene_schemes = {
             'bdnf': (0.5, 0.1, 2.0), 'creb': (0.5, 0.0, 1.0),
             'drd2': (0.5, 0.1, 0.9), 'fkbp5': (0.3, 0.1, 5.0),
@@ -150,19 +146,16 @@ class Governor(nn.Module):
             'focus_y': (0.5, 0.0, 1.0), 'focus_z': (0.5, 0.0, 1.0),
             'focus_sharpness': (0.5, 0.05, 1.5), 'temporal_trace_bias': (0.5, 0.0, 1.0),
         }
-        self.genes = {}
         for name, (base, mi, ma) in gene_schemes.items():
-            # Store alleles as buffers for state_dict compatibility
             self.register_buffer(f'gene_{name}_alleles', torch.tensor([base, base], dtype=torch.float32))
-            self.register_buffer(f'gene_{name}_meta', torch.tensor([mi, ma, 1.0], dtype=torch.float32)) # min, max, methylation
+            self.register_buffer(f'gene_{name}_meta', torch.tensor([mi, ma, 1.0], dtype=torch.float32))
 
     def get_expression(self, name):
         if f'gene_{name}_alleles' not in self._buffers: return 0.5
         alleles = self._buffers[f'gene_{name}_alleles']
         meta = self._buffers[f'gene_{name}_meta']
         expr = alleles.mean().item() * meta[2].item()
-        if name == 'fkbp5': return min(expr, 3.0)
-        return expr
+        return min(expr, 3.0) if name == 'fkbp5' else expr
 
     @property
     def bdnf(self): return self.get_expression('bdnf')
@@ -194,8 +187,7 @@ class Governor(nn.Module):
     def update_metabolism(self, H, H_prev=None, bdnf_gamma=None):
         H_c = H.contiguous()
         H_prev_t = H_prev.contiguous() if H_prev is not None else torch.empty(0, device=H.device, dtype=H_c.dtype)
-        if bdnf_gamma is not None:
-            self.config_scalars[0] = float(bdnf_gamma)
+        if bdnf_gamma is not None: self.config_scalars[0] = float(bdnf_gamma)
         out = _cpp_try('survival_update_io', H_c, self.usage, [H_prev_t], self.config_scalars[:3], tensors=(H_c, self.usage, H_prev_t, self.config_scalars))
         if out is not None: self.usage = out
             
@@ -206,9 +198,8 @@ class Governor(nn.Module):
 
     def build_curve_chain(self, total_nodes: int, length: int, hint: int = 0) -> List[int]:
         total = max(1, int(total_nodes))
-        start = int((self.curve_trajectory * max(0, total - 1) + (self.generation * 1) + int(hint)) % total)
-        trajectory = max(0.0, min(1.0, self.curve_trajectory))
-        step = max(1, int(round(1 + trajectory * 5)))
+        start = self.next_curve_anchor(total, hint=hint)
+        step = max(1, int(round(1 + self.curve_trajectory * 5)))
         jump_bias = max(0.0, min(1.0, self.wormhole_jump_bias))
         chain = []
         cursor = start
@@ -219,6 +210,36 @@ class Governor(nn.Module):
             else:
                 cursor = int((cursor + step) % total)
         return chain
+
+    def next_curve_anchor(self, total_nodes: int, hint: int = 0) -> int:
+        total = max(1, int(total_nodes))
+        base = int(round(self.curve_trajectory * max(0, total - 1)))
+        return int((base + (self.generation * 1) + int(hint)) % total)
+
+    def evolutionary_step(self, model, metrics):
+        val_loss = metrics.get('val_loss', 100.0)
+        thermal_penalty = metrics.get('thermal_penalty', 0.0)
+        eff_loss = val_loss + self.mutation_config.thermal_penalty_weight * thermal_penalty
+        if eff_loss < self.best_loss:
+            self.best_loss = eff_loss
+            self.health = min(1.0, self.health * 1.05)
+            return True
+        self.health = max(0.1, self.health * 0.98)
+        if self.health < 0.5:
+            self._execute_mutation(metrics)
+            if hasattr(model, 'update_phenotype_from_governor'): model.update_phenotype_from_governor()
+            return True
+        return False
+
+    def _execute_mutation(self, metrics):
+        self.generation += 1
+        target = self.rng.choice(list(self.GENE_ROLES.values()))
+        intensity = self.mutation_config.max_intensity * self.health
+        delta = (self.rng.random() * 2 - 1) * intensity
+        alleles = self._buffers[f'gene_{target}_alleles']
+        meta = self._buffers[f'gene_{target}_meta']
+        idx = self.rng.randint(0, 1)
+        alleles[idx] = torch.clamp(alleles[idx] + delta, meta[0], meta[1])
 
     def forward(self, x):
         features = self.shared(x)
