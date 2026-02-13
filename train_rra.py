@@ -40,8 +40,7 @@ if os.name == 'nt':
     except Exception as e:
         pass
 
-from organism import CognitiveOrganism, init_state, cpp_loader
-from config import Config
+from organism import CognitiveOrganism, init_state, cpp_loader, Config
 from learning_brain import LearningBrain
 
 # --- INTEGRATED OPTIMIZER SUITE ---

@@ -2,8 +2,7 @@ import torch
 import torch.nn.functional as F
 import os
 import time
-from config import Config
-from organism import CognitiveOrganism, init_state
+from organism import CognitiveOrganism, init_state, Config
 
 # Constants
 VOCAB_SIZE = 256 # Byte-level

@@ -48,7 +48,32 @@ def _cpp_try(op_name, *args, tensors=None):
 # 3. parallel_scan_optimized: RANK 3 (MEDIUM WASTE)
 #    Why: Large memory footprints during cumsum.
 # --------------------------------------------------
-from config import Config
+# ---------------------------
+# NIS CONFIGURATION INITIALIZATION
+# ---------------------------
+_YAML_PATH = 'conf/config.yaml'
+if os.path.exists(_YAML_PATH):
+    with open(_YAML_PATH, 'r') as f:
+        _CONF_DATA = yaml.safe_load(f)
+else:
+    _CONF_DATA = {}
+
+if cpp_loader and hasattr(cpp_loader, 'init_nis_config'):
+    cpp_loader.init_nis_config(_CONF_DATA)
+
+# Expose NIS_Config as the authoritative Config
+Config = getattr(cpp_loader, 'NIS_Config', SimpleNamespace(**{
+    'L': 32, 'R': 8, 'WORKING_DIM': 512, 'C': 4,
+    'DEVICE': torch.device('cpu'),
+    'HALT_THRESHOLD': 0.9,
+    'H_CYCLES': 2, 'L_CYCLES': 4
+}))
+
+# Handle Python-only constants (not in ISA)
+if not hasattr(Config, 'DEVICE'):
+    Config.DEVICE = torch.device('cpu')
+if not hasattr(Config, 'MES_ENABLED'):
+    Config.MES_ENABLED = _CONF_DATA.get('model', {}).get('mes_enabled', True)
 
 L = Config.L
 R = Config.R

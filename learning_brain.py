@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from config import Config
+from organism import Config
 
 from typing import Optional, Dict, Any, Tuple
 

@@ -2224,46 +2224,89 @@ std::vector<at::Tensor> _fused_cognitive_cycle_impl(
 }
 
 // Wrapper for organism.py compatibility
+/**
+ * NIS Token Interpreter Core
+ * Executes instructions from the latent instruction stack using AVX-512.
+ */
+inline void nis_execute_instruction(
+    __m512& signal,
+    __m512& state,
+    uint8_t opcode,
+    float scale_const = NIS_SCALE_CONSTANT
+) {
+    switch(opcode) {
+        case NIS_OP_ADD:
+            signal = _mm512_add_ps(signal, state);
+            break;
+        case NIS_OP_SCALE:
+            signal = _mm512_mul_ps(signal, _mm512_set1_ps(scale_const));
+            break;
+        case NIS_OP_GATE: {
+            __mmask16 mask = _mm512_cmp_ps_mask(signal, _mm512_setzero_ps(), _CMP_GT_OS);
+            signal = _mm512_mask_blend_ps(mask, _mm512_setzero_ps(), signal);
+            break;
+        }
+        case NIS_OP_REFLECT: {
+            // Shadow Brain Reflection: bitwise inversion/negation
+            signal = _mm512_sub_ps(_mm512_setzero_ps(), signal);
+            break;
+        }
+        default:
+            break;
+    }
+}
+
 std::vector<at::Tensor> forward_stack(
     at::Tensor x, at::Tensor H,
     at::Tensor delays, at::Tensor tables, at::Tensor conns,
     at::Tensor decays, at::Tensor hw, at::Tensor hb,
-    int64_t dummy_0, // Maps to '0' passed by organism
+    int64_t dummy_0,
     double lif_decay,
     double lif_threshold,
     double halt_threshold,
-    int64_t steps // Maps to 'L_cycles'
+    int64_t steps
 ) {
-    at::Tensor x_in = x;
-    if (x.dim() == 5) {
-        // Python path uses [B, T, R, D, C]; fused kernel expects [B, T, D*C].
-        int64_t B = x.size(0);
-        int64_t T = x.size(1);
-        int64_t D = x.size(3);
-        int64_t C = x.size(4);
-        x_in = x.mean(2).reshape({B, T, D * C}).contiguous();
-    } else {
-        TORCH_CHECK(x.dim() == 3, "x must be [B,T,D] or [B,T,R,D,C] for forward_stack.");
-        x_in = x.contiguous();
+    const int64_t B = x.size(0);
+    const int64_t T = x.size(1);
+    const int64_t D = NIS_WORKING_DIM;
+    const int64_t L = NIS_L;
+    const int64_t R = NIS_R;
+    const int64_t C = NIS_C;
+
+    auto x_c = ensure_contig(x);
+    auto h_c = ensure_contig(H);
+    float* x_ptr = x_c.data_ptr<float>();
+    float* h_ptr = h_c.data_ptr<float>();
+
+    // Zero-Copy Workspace Pointer (Simplified)
+    // In a full implementation, we'd use the Morton curve to jump.
+    #pragma omp parallel for collapse(2)
+    for (int64_t b = 0; b < B; b++) {
+        for (int64_t t = 0; t < T; t++) {
+            float* x_bt = x_ptr + (b * T + t) * D * C;
+            float* h_bt = h_ptr + (b * L + 0) * R * D * C; // Start at layer 0
+
+            for (int64_t s = 0; s < steps; s++) {
+                // Interpretation Step: First 16 floats of each reasoning window = Opcodes
+                for (int64_t i = 0; i < D * C; i += NIS_SIMD_WIDTH) {
+                    __m512 signal = _mm512_loadu_ps(x_bt + i);
+                    __m512 state = _mm512_loadu_ps(h_bt + i);
+
+                    // Decode Opcode from MSB of the signal token (simplification)
+                    uint8_t opcode = static_cast<uint8_t>(x_bt[i] > 0.5f ? NIS_OP_ADD : NIS_OP_SCALE);
+                    
+                    nis_execute_instruction(signal, state, opcode);
+                    
+                    _mm512_storeu_ps(x_bt + i, signal);
+                }
+                
+                // Morton JMP Simulation: Increment pointer along the "BIOS" curve
+                h_bt += (R * D * C / L); // Step through layers
+            }
+        }
     }
 
-    // Create default mask of ones [L, R] on same device/dtype as x
-    // impl expects mask to be indexable as m_ptr[l*R + r]
-    // H is [B, L, R, D, C]
-    int64_t L = H.size(1);
-    int64_t R = H.size(2);
-    auto mask = torch::ones({L, R}, x_in.options());
-
-    // Call implementation
-    // We pass steps as H_cycles, and 1 as L_cycles -> total = steps * 1
-    return _fused_cognitive_cycle_impl(
-        x_in, H, mask,
-        delays, tables, conns,
-        decays, hw, hb,
-        steps, 1, 
-        lif_decay, lif_threshold, halt_threshold,
-        at::Tensor() // H_out empty
-    );
+    return {x_c, h_c};
 }
 
 // -------------------------------------------------------------------------
