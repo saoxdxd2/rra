@@ -282,3 +282,11 @@ class MortonBuffer:
             order = torch.argsort(score)
             original = original[order]
         return original
+
+    def curve_segment_morton(self, start: int, length: int, **kwargs) -> torch.Tensor:
+        """
+        Returns a curve segment encoded in Morton row indices.
+        Used for O(1) Manifold addressing without kernel-side inverse mapping.
+        """
+        original = self.curve_segment_original(start=start, length=length, **kwargs)
+        return self.original_to_morton(original)

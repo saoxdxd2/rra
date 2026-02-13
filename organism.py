@@ -954,13 +954,7 @@ class CognitiveOrganism(BaseCognitiveModule):
                 print(">>> LGH int8 manifold mode enabled (RAM_INT8_INFER=true).")
         if not self.exec_cfg.use_forward_stack:
             raise RuntimeError("USE_FORWARD_STACK must be enabled; no Python reasoning fallback path exists.")
-        print(
-            f">>> EpisodicMemory hybrid mode active: "
-            f"hot_cap={self.episodic_memory.hot.capacity}, "
-            f"cold_cap={self.episodic_memory.cold.capacity}, "
-            f"cold_dense={self.episodic_memory.cold.dense_mode}, "
-            f"fallback={self.episodic_cfg.hybrid_fallback_threshold:.2f}"
-        )
+        print(">>> LGH-Manifold Consolidated Memory Active.")
 
     def _init_manifold(self):
         self._lgh_shape3d = (self.L, self.R, self.lgh_cfg.morton_depth)
@@ -1653,6 +1647,68 @@ class CognitiveOrganism(BaseCognitiveModule):
             return p, p.size(0), p.size(1)
 
         raise ValueError(f"Unsupported last dimension for x: {x.size(-1)} (expected 8 or {self.d_s1 * self.C}).")
+
+    def _run_lgh_cycle(self, p_brain, H, gate, B, T, h_cycles, l_cycles, dyn_threshold, p_s1=None):
+        if not (self.cfg_lgh_enabled and hasattr(cpp_loader, 'geometric_manifold_forward_avx512')):
+            return False, None, None, None
+
+        manifold = self._lgh_morton_manifold()
+        if manifold is None or manifold.numel() == 0:
+            return False, None, None, None
+
+        # Prep Curve Indices
+        if hasattr(self.genome, 'next_curve_anchor') or hasattr(self.genome, 'build_curve_chain'):
+             self.update_phenotype_from_genome() # Refresh curves if genome-driven
+
+        idx_c = self._lgh_curve_indices.contiguous()
+        pidx_c = self._lgh_prefetch_curve_indices.contiguous()
+        trace_c = self._lgh_synaptic_trace.contiguous()
+        mdna_c = self._lgh_mdna_mask.contiguous()
+        if gate.dim() == 4 and gate.size(0) == self.L and gate.size(1) == self.R:
+            gate_cpp = gate.squeeze() # [L, R, 1, 1] -> [L, R]
+        elif gate.dim() == 4:
+            gate_cpp = gate.mean(dim=(0, 1)) # [B, T, L, R] -> [L, R]
+        elif gate.dim() == 2 and gate.size(0) == self.L and gate.size(1) == self.R:
+            gate_cpp = gate
+        elif gate.dim() == 2:
+            gate_cpp = gate.reshape(self.L, self.R)
+        else:
+            gate_cpp = gate.view(-1).mean().expand(self.L, self.R)
+        gate_c = gate_cpp.float().contiguous()
+        p_brain_c = p_brain.float().contiguous()
+        H_c = H.contiguous()
+
+        step = int(self.step_counter.item()) if hasattr(self, 'step_counter') else 0
+        
+        if self._lgh_use_int8:
+            q_manifold, q_scale = self._quantize_lgh_manifold(bits=8)
+            z_lgh, H_next, halt_probs = cpp_loader.geometric_manifold_forward_avx512_int8(
+                p_brain_c, H_c, gate_c, q_manifold, q_scale, idx_c, pidx_c, mdna_c, trace_c,
+                step, int(h_cycles), int(l_cycles), float(dyn_threshold),
+                int(self.lgh_cfg.prefetch_distance),
+                float(self.exec_cfg.thermal_penalty if hasattr(self.exec_cfg, 'thermal_penalty') else 0.0), # fallback
+                float(self.lgh_cfg.low_entropy_fold_threshold),
+                int(self.lgh_cfg.wave_radius),
+                float(self.lgh_cfg.wave_decay),
+                float(self.lgh_cfg.trace_decay),
+                float(self.lgh_cfg.trace_gain),
+                int(self.lgh_cfg.temporal_bins)
+            )
+        else:
+            z_lgh, H_next, halt_probs = cpp_loader.geometric_manifold_forward_avx512(
+                p_brain_c, H_c, gate_c, manifold, idx_c, pidx_c, mdna_c, trace_c,
+                step, int(h_cycles), int(l_cycles), float(dyn_threshold),
+                int(self.lgh_cfg.prefetch_distance),
+                float(self.exec_cfg.thermal_penalty if hasattr(self.exec_cfg, 'thermal_penalty') else 0.0),
+                float(self.lgh_cfg.low_entropy_fold_threshold),
+                int(self.lgh_cfg.wave_radius),
+                float(self.lgh_cfg.wave_decay),
+                float(self.lgh_cfg.trace_decay),
+                float(self.lgh_cfg.trace_gain),
+                int(self.lgh_cfg.temporal_bins)
+            )
+        
+        return True, z_lgh, H_next, halt_probs
 
     def _run_fused_cycle(self, p_brain, H, gate, B, T, h_cycles, l_cycles, dyn_threshold):
         if not (

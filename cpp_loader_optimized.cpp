@@ -2662,6 +2662,7 @@ std::vector<at::Tensor> geometric_manifold_forward_avx512(
     const float trace_decay_f = lgh_trace_decay_param(trace_decay);
     const float trace_gain_f = lgh_trace_gain_param(trace_gain);
     const int64_t t_bins = runtime_bins;
+    const int64_t dt = base_phase;
 
     Perf::g_lgh_calls.fetch_add(1ULL, std::memory_order_relaxed);
     const uint64_t tsc_start = __rdtsc();
@@ -2918,7 +2919,6 @@ std::vector<at::Tensor> geometric_manifold_forward_avx512_int8(
     check_cpu(manifold_scale, "manifold_scale");
     check_cpu(curve_indices, "curve_indices");
     check_cpu(prefetch_curve_indices, "prefetch_curve_indices");
-    check_cpu(morton_inverse_order, "morton_inverse_order");
     check_cpu(mdna_mask, "mdna_mask");
     check_cpu(synaptic_trace, "synaptic_trace");
     check_dim(p_brain, 3, "p_brain");
@@ -2928,7 +2928,6 @@ std::vector<at::Tensor> geometric_manifold_forward_avx512_int8(
     check_dim(manifold_scale, 1, "manifold_scale");
     check_dim(curve_indices, 1, "curve_indices");
     check_dim(prefetch_curve_indices, 1, "prefetch_curve_indices");
-    check_dim(morton_inverse_order, 1, "morton_inverse_order");
     check_dim(mdna_mask, 2, "mdna_mask");
     check_dim(synaptic_trace, 1, "synaptic_trace");
     check_dtype(p_brain, at::kFloat, "p_brain");
@@ -3005,6 +3004,7 @@ std::vector<at::Tensor> geometric_manifold_forward_avx512_int8(
     const float trace_decay_f = lgh_trace_decay_param(trace_decay);
     const float trace_gain_f = lgh_trace_gain_param(trace_gain);
     const int64_t t_bins = runtime_bins;
+    const int64_t dt = base_phase;
 
     Perf::g_lgh_calls.fetch_add(1ULL, std::memory_order_relaxed);
     const uint64_t tsc_start = __rdtsc();
