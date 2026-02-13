@@ -62,18 +62,144 @@ if cpp_loader and hasattr(cpp_loader, 'init_nis_config'):
     cpp_loader.init_nis_config(_CONF_DATA)
 
 # Expose NIS_Config as the authoritative Config
-Config = getattr(cpp_loader, 'NIS_Config', SimpleNamespace(**{
-    'L': 32, 'R': 8, 'WORKING_DIM': 512, 'C': 4,
-    'DEVICE': torch.device('cpu'),
-    'HALT_THRESHOLD': 0.9,
-    'H_CYCLES': 2, 'L_CYCLES': 4
-}))
+Config = getattr(cpp_loader, 'NIS_Config', SimpleNamespace())
 
-# Handle Python-only constants (not in ISA)
-if not hasattr(Config, 'DEVICE'):
-    Config.DEVICE = torch.device('cpu')
-if not hasattr(Config, 'MES_ENABLED'):
-    Config.MES_ENABLED = _CONF_DATA.get('model', {}).get('mes_enabled', True)
+# Helper to safely populate Config from YAML or defaults
+def _map_config(cfg_obj, data):
+    model = data.get('model', {})
+    train = data.get('training', {})
+    runtime = data.get('runtime', {})
+    survival = data.get('survival', {})
+    learning = data.get('learning', {})
+
+    # Model
+    cfg_obj.L = getattr(cfg_obj, 'L', model.get('L', 32))
+    cfg_obj.R = getattr(cfg_obj, 'R', model.get('R', 8))
+    cfg_obj.WORKING_DIM = getattr(cfg_obj, 'WORKING_DIM', model.get('working_dim', 512))
+    cfg_obj.C = getattr(cfg_obj, 'C', model.get('C', 4))
+    cfg_obj.MEMORY_DEPTH = getattr(cfg_obj, 'MEMORY_DEPTH', model.get('memory_depth', 5))
+    cfg_obj.H_CYCLES = model.get('H_cycles', 2)
+    cfg_obj.L_CYCLES = model.get('L_cycles', 4)
+    cfg_obj.RMS_NORM_EPS = float(model.get('rms_norm_eps', 1e-5))
+    cfg_obj.ROPE_THETA = float(model.get('rope_theta', 10000.0))
+    cfg_obj.HALT_THRESHOLD = 0.9
+    
+    # Training
+    cfg_obj.BATCH_SIZE = getattr(cfg_obj, 'BATCH_SIZE', train.get('batch_size', 64))
+    cfg_obj.SEQ_LEN = getattr(cfg_obj, 'SEQ_LEN', train.get('seq_len', 512))
+    cfg_obj.LEARNING_RATE = getattr(cfg_obj, 'LEARNING_RATE', float(train.get('lr', 1e-4)))
+    cfg_obj.EPOCHS = train.get('epochs', 10)
+    cfg_obj.TRAIN_SAMPLES_PER_EPOCH = train.get('train_samples_per_epoch', None)
+    cfg_obj.VAL_SAMPLES_PER_EPOCH = train.get('val_samples_per_epoch', None)
+    cfg_obj.SEED = runtime.get('seed', 1337)
+    
+    # Optimizer (AdEMAMix)
+    cfg_obj.ADEMAMIX_BETA1_FAST = train.get('beta1_fast', 0.9)
+    cfg_obj.ADEMAMIX_BETA1_SLOW = train.get('beta1_slow', 0.9999)
+    cfg_obj.ADEMAMIX_BETA2 = train.get('beta2', 0.999)
+    cfg_obj.WEIGHT_DECAY = train.get('weight_decay', 0.0)
+    cfg_obj.USE_SIGN_SGD = bool(train.get('use_sign_sgd', False))
+    cfg_obj.AGC_CLIP_FACTOR = 0.1
+    
+    # Learning & Pressure
+    cfg_obj.WARM_UP_STEPS = float(learning.get('warm_up_steps', 2000))
+    cfg_obj.DYNAMIC_ENERGY_SCALE = 0.5
+    cfg_obj.COHERENCE_WEIGHT = 0.01
+    cfg_obj.SURVIVAL_WEIGHT = 1.5
+    cfg_obj.OMEGA_STEP = 0.05
+    
+    # Cache & LGH
+    cfg_obj.CACHE_HASH_BITS = int(model.get('cache_hash_bits', 20))
+    cfg_obj.NEURAL_CACHE_ENABLED = bool(model.get('neural_cache_enabled', False))
+    cfg_obj.LGH_ENABLED = bool(model.get('lgh_enabled', True))
+    cfg_obj.LGH_REPLACE_FORWARD_STACK = bool(model.get('lgh_replace_forward_stack', True))
+    cfg_obj.LGH_CURVE_LENGTH = int(model.get('lgh_curve_length', 96))
+    cfg_obj.LGH_MORTON_DEPTH = int(model.get('lgh_morton_depth', 1))
+    cfg_obj.LGH_PREFETCH_DISTANCE = int(model.get('lgh_prefetch_distance', 2))
+    cfg_obj.LGH_ALIGN_MULTIPLE = int(model.get('lgh_align_multiple', 64))
+    cfg_obj.LGH_TEMPORAL_BINS = int(model.get('lgh_temporal_bins', 16))
+    cfg_obj.LGH_TRACE_DECAY = float(model.get('lgh_trace_decay', 0.90))
+    cfg_obj.LGH_TRACE_GAIN = float(model.get('lgh_trace_gain', 0.20))
+    cfg_obj.LGH_FOCUS_STRENGTH = float(model.get('lgh_focus_strength', 0.35))
+    cfg_obj.LGH_FOCUS_SHARPNESS = float(model.get('lgh_focus_sharpness', 2.0))
+    
+    # Initialization
+    cfg_obj.INIT_SCALE = float(model.get('init_scale', 0.05))
+    cfg_obj.DECAY_INIT_OFFSET = float(model.get('decay_init_offset', 2.0))
+    cfg_obj.DECAY_INIT_SCALE = float(model.get('decay_init_scale', 0.1))
+    cfg_obj.DELAY_INIT_STD = float(model.get('delay_init_std', 0.5))
+    cfg_obj.DELAY_MIN = float(model.get('delay_min', 0.1))
+    cfg_obj.DELAY_MAX = float(model.get('delay_max', 20.0))
+    cfg_obj.RAM_INIT_SCALE = float(model.get('ram_init_scale', 0.1))
+    cfg_obj.DELREC_INIT_MAX = float(model.get('delrec_init_max', 5.0))
+    
+    # HPC (Hierarchical Predictive Coding)
+    cfg_obj.HPC_ENABLED = bool(model.get('hpc_enabled', True))
+    cfg_obj.HPC_HIDDEN = int(model.get('hpc_hidden', 256))
+    cfg_obj.HPC_TARGET_ERROR = float(model.get('hpc_target_error', 0.05))
+    cfg_obj.HPC_FOLD_ALPHA = float(model.get('hpc_fold_alpha', 0.25))
+    cfg_obj.HPC_HALT_GAIN = float(model.get('hpc_halt_gain', 0.35))
+    cfg_obj.HPC_SURPRISE_GATE = bool(model.get('hpc_surprise_gate', True))
+    cfg_obj.HPC_SURPRISE_THRESHOLD = float(model.get('hpc_surprise_threshold', 0.20))
+    cfg_obj.HPC_SURPRISE_MIN_SCALE = float(model.get('hpc_surprise_min_scale', 0.35))
+    cfg_obj.HPC_SURPRISE_SKIP_ENABLED = bool(model.get('hpc_surprise_skip_enabled', True))
+    cfg_obj.HPC_TEMPORAL_GATE_ENABLED = bool(model.get('hpc_temporal_gate_enabled', True))
+    cfg_obj.HPC_TEMPORAL_GATE_THRESHOLD = float(model.get('hpc_temporal_gate_threshold', 0.08))
+    
+    # LIF Neuron
+    cfg_obj.LIF_DECAY = float(model.get('lif_decay', 0.9))
+    cfg_obj.LIF_THRESHOLD = float(model.get('lif_threshold', 1.0))
+    cfg_obj.H_CYCLE_THRESHOLD = int(model.get('h_cycle_threshold', 2))
+    
+    # MES & Metabolic
+    cfg_obj.GLOBAL_BACKPROP = model.get('global_backprop', False)
+    cfg_obj.LOCAL_LR_RATIO = float(model.get('local_lr_ratio', 0.5))
+    cfg_obj.MES_LOCAL_L1 = float(train.get('mes_local_l1', 0.01))
+    cfg_obj.SURPRISE_REWIRE_THRESHOLD = 0.8
+    cfg_obj.DISSONANCE_PENALTY = 0.1
+    
+    # Survival & Costs
+    cfg_obj.SURVIVAL_GAMMA = float(survival.get('gamma', 0.01))
+    cfg_obj.SURVIVAL_UPDATE_EVERY = int(survival.get('update_every', 50))
+    cfg_obj.TARGET_SPARSITY = float(survival.get('target_sparsity', 0.9))
+    cfg_obj.LAMBDA_COST = float(survival.get('lambda_cost', 0.01))
+    cfg_obj.LAMBDA_STABILITY = float(survival.get('lambda_stability', 0.01))
+    cfg_obj.LAMBDA_ENERGY = float(survival.get('lambda_energy', 0.01))
+    cfg_obj.PARAM_COST_SCALE = 1e-6
+    cfg_obj.MEMORY_COST_SCALE = 1e-4
+    cfg_obj.FAST_PATH_COST = 0.001
+    
+    # Runtime & Device Configuration
+    cfg_obj.TORCH_NUM_THREADS = int(runtime.get('torch_num_threads', 0))
+    cfg_obj.TORCH_INTEROP_THREADS = int(runtime.get('torch_interop_threads', 0))
+    cfg_obj.CPP_OMP_THREADS = int(runtime.get('cpp_omp_threads', 0))
+    
+    cfg_obj.AUDIT_PERIOD_STEPS = int(model.get('audit_period_steps', 25))
+    cfg_obj.AUDIT_RANDOM_PROB = float(model.get('audit_random_prob', 0.01))
+    cfg_obj.HPC_MONITOR_EVERY = int(model.get('hpc_monitor_every', 1))
+
+    cfg_obj.STRICT_CPU_ONLY = runtime.get('strict_cpu_only', True)
+    cfg_obj.RUNTIME_DEVICE = str(runtime.get('device', 'auto')).lower()
+    
+    if cfg_obj.STRICT_CPU_ONLY:
+        cfg_obj.DEVICE = torch.device('cpu')
+    else:
+        if cfg_obj.RUNTIME_DEVICE in ('cpu', 'cuda'):
+            if cfg_obj.RUNTIME_DEVICE == 'cuda' and not torch.cuda.is_available():
+                cfg_obj.DEVICE = torch.device('cpu')
+            else:
+                cfg_obj.DEVICE = torch.device(cfg_obj.RUNTIME_DEVICE)
+        else: # 'auto'
+            if torch.cuda.is_available():
+                cfg_obj.DEVICE = torch.device('cuda')
+            else:
+                cfg_obj.DEVICE = torch.device('cpu')
+
+    cfg_obj.MES_ENABLED = model.get('mes_enabled', True)
+    cfg_obj.VIRTUAL_LAB_ENABLED = runtime.get('virtual_lab_enabled', False)
+    cfg_obj.PREFLIGHT_ENABLED = runtime.get('preflight_enabled', True)
+
+_map_config(Config, _CONF_DATA)
 
 L = Config.L
 R = Config.R
