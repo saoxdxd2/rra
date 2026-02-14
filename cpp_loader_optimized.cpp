@@ -2079,6 +2079,269 @@ std::vector<at::Tensor> fused_cognitive_cycle_ultra(
 }
 
 // -------------------------------------------------------------------------
+// KERNEL: Phenotype Derivation (Governor Genes -> Runtime Controls)
+// -------------------------------------------------------------------------
+torch::Tensor phenotype_from_genes_io(
+    torch::Tensor genes,    // [>=4] {bdnf, creb, drd2, fkbp5, ...}
+    torch::Tensor context   // [>=9] {base_lambda, base_focus_strength, base_focus_sharpness, omega, tps, phase, base_lr, base_trace_gain, base_act_threshold}
+) {
+    check_cpu(genes, "genes");
+    check_cpu(context, "context");
+    check_dim(genes, 1, "genes");
+    check_dim(context, 1, "context");
+    check_dtype(genes, at::kFloat, "genes");
+    check_dtype(context, at::kFloat, "context");
+
+    auto g_c = ensure_contig(genes);
+    auto c_c = ensure_contig(context);
+    TORCH_CHECK(g_c.numel() >= 4, "phenotype_from_genes_io expects at least 4 gene values.");
+    TORCH_CHECK(c_c.numel() >= 9, "phenotype_from_genes_io expects 9 context values.");
+
+    const float* g_ptr = g_c.data_ptr<float>();
+    const float* c_ptr = c_c.data_ptr<float>();
+
+    const auto clampf = [](float v, float lo, float hi) -> float {
+        return std::max(lo, std::min(hi, v));
+    };
+
+    const float bdnf = clampf(g_ptr[0], 0.0f, 1.0f);
+    const float creb = clampf(g_ptr[1], 0.0f, 1.0f);
+    const float drd2 = clampf(g_ptr[2], 0.0f, 1.0f);
+    const float fkbp5 = clampf(g_ptr[3], 0.0f, 1.0f);
+
+    const float base_lambda = std::max(1e-6f, c_ptr[0]);
+    const float base_focus_strength = std::max(0.0f, c_ptr[1]);
+    const float base_focus_sharpness = std::max(0.0f, c_ptr[2]);
+    const float omega = clampf(c_ptr[3], 0.0f, 1.0f);
+    const float tps_pressure = std::max(0.0f, c_ptr[4]);
+    const float phase = c_ptr[5];
+    const float base_lr = std::max(1e-7f, c_ptr[6]);
+    const float base_trace_gain = std::max(0.0f, c_ptr[7]);
+    const float base_act_threshold = clampf(c_ptr[8], 0.1f, 0.99f);
+
+    const float stress = std::max(0.0f, fkbp5 - bdnf);
+    const float recovery = std::max(0.0f, bdnf - fkbp5);
+
+    // Explicit gene->phenotype mapping (fkbp5 increases sparsity pressure).
+    const float lambda_mul = 0.65f + (1.10f * fkbp5) + (0.30f * stress) - (0.20f * bdnf);
+    const float lambda_sparsity = clampf(base_lambda * lambda_mul, base_lambda * 0.25f, (base_lambda * 4.0f) + 1e-6f);
+
+    const float focus_x = std::tanh(((creb - 0.5f) * 2.2f) + (0.25f * (omega - 0.5f)) + (0.05f * tps_pressure));
+    const float focus_y = std::tanh(((drd2 - 0.5f) * 2.2f) - (0.03f * tps_pressure) + (0.10f * std::sin(phase * 0.10f)));
+    const float focus_z = std::tanh(((recovery - stress) * 1.8f) + (0.15f * std::cos(phase * 0.07f)));
+
+    const float focus_strength = clampf(
+        base_focus_strength * (0.45f + (0.75f * creb) + (0.35f * bdnf) - (0.25f * fkbp5)),
+        0.02f,
+        2.5f
+    );
+    const float focus_sharpness = clampf(
+        base_focus_sharpness * (0.50f + (0.80f * drd2) + (0.25f * creb) - (0.35f * fkbp5) + (0.10f * omega)),
+        0.25f,
+        8.0f
+    );
+    const float trace_gain = clampf(
+        base_trace_gain * (0.60f + (0.50f * bdnf) + (0.25f * creb) - (0.20f * fkbp5)),
+        0.0f,
+        4.0f
+    );
+    const float act_threshold = clampf(
+        base_act_threshold + (0.12f * stress) - (0.08f * bdnf) + (0.02f * tps_pressure),
+        0.20f,
+        0.98f
+    );
+    const float suggested_lr = clampf(
+        base_lr * (0.35f + (1.15f * bdnf) + (0.20f * creb) - (0.45f * fkbp5)),
+        1e-7f,
+        1.0f
+    );
+
+    auto out = torch::empty({10}, c_c.options());
+    float* out_ptr = out.data_ptr<float>();
+    out_ptr[0] = lambda_sparsity;
+    out_ptr[1] = focus_x;
+    out_ptr[2] = focus_y;
+    out_ptr[3] = focus_z;
+    out_ptr[4] = focus_strength;
+    out_ptr[5] = focus_sharpness;
+    out_ptr[6] = trace_gain;
+    out_ptr[7] = act_threshold;
+    out_ptr[8] = suggested_lr;
+    out_ptr[9] = RuntimeABI::PHENOTYPE_ABI_VERSION;
+    return out;
+}
+
+// -------------------------------------------------------------------------
+// KERNEL: Geometric Manifold Recall (Dynamic Focus + Trace)
+// -------------------------------------------------------------------------
+torch::Tensor geometric_manifold_recall_dynamic_avx512(
+    torch::Tensor p_brain,          // [B, T, M] or [B, M]
+    torch::Tensor manifold,         // [N, M] (int8 or float)
+    torch::Tensor scales,           // [N] (float) if int8, else empty
+    torch::Tensor curve_indices,    // [S] (long)
+    torch::Tensor synaptic_trace,   // [N] optional (float)
+    float focus_x,
+    float focus_y,
+    float focus_z,
+    float focus_strength,
+    float focus_sharpness,
+    int64_t phase,
+    float tps_pressure
+) {
+    check_cpu(p_brain, "p_brain");
+    check_cpu(manifold, "manifold");
+    check_cpu(curve_indices, "curve_indices");
+    check_dim(curve_indices, 1, "curve_indices");
+    check_dtype(curve_indices, at::kLong, "curve_indices");
+
+    auto p_c = ensure_contig(p_brain);
+    auto m_c = ensure_contig(manifold);
+    auto idx_c = ensure_contig(curve_indices);
+
+    const int64_t M = p_c.size(-1);
+    const int64_t N = m_c.size(0);
+    const int64_t S = idx_c.numel();
+    bool is_int8 = (m_c.scalar_type() == at::kByte || m_c.scalar_type() == at::kChar);
+    TORCH_CHECK(
+        is_int8 || m_c.scalar_type() == at::kFloat,
+        "manifold must be float32 or int8/uint8 for dynamic recall."
+    );
+
+    auto options = p_c.options();
+    at::Tensor recall = torch::zeros({1, 1, M}, options);
+    float* out_ptr = recall.data_ptr<float>();
+    if (N <= 0 || S <= 0 || M <= 0) {
+        return recall;
+    }
+
+    const float* scale_ptr = nullptr;
+    if (is_int8) {
+        TORCH_CHECK(scales.defined() && scales.numel() == N, "dquant scales required for int8 manifold");
+        scale_ptr = scales.data_ptr<float>();
+    }
+
+    at::Tensor trace_c;
+    float* trace_ptr = nullptr;
+    if (synaptic_trace.defined() && synaptic_trace.numel() > 0) {
+        check_cpu(synaptic_trace, "synaptic_trace");
+        check_dim(synaptic_trace, 1, "synaptic_trace");
+        check_dtype(synaptic_trace, at::kFloat, "synaptic_trace");
+        TORCH_CHECK(synaptic_trace.numel() == N, "synaptic_trace must have length N.");
+        trace_c = ensure_contig(synaptic_trace);
+        trace_ptr = trace_c.data_ptr<float>();
+    }
+
+    const auto clampf = [](float v, float lo, float hi) -> float {
+        return std::max(lo, std::min(hi, v));
+    };
+    const auto wrap_idx = [N](int64_t idx) -> int64_t {
+        if (N <= 0) {
+            return 0;
+        }
+        idx %= N;
+        if (idx < 0) {
+            idx += N;
+        }
+        return idx;
+    };
+
+    // Query-aware drift from current latent state.
+    const float* p_ptr = p_c.data_ptr<float>();
+    const int64_t q_rows = std::max<int64_t>(1, p_c.numel() / std::max<int64_t>(1, M));
+    double q0 = 0.0;
+    double q1 = 0.0;
+    double q2 = 0.0;
+    for (int64_t i = 0; i < q_rows; i++) {
+        const int64_t base = i * M;
+        q0 += p_ptr[base];
+        q1 += p_ptr[base + ((M > 1) ? 1 : 0)];
+        q2 += p_ptr[base + ((M > 2) ? 2 : 0)];
+    }
+    q0 /= static_cast<double>(q_rows);
+    q1 /= static_cast<double>(q_rows);
+    q2 /= static_cast<double>(q_rows);
+    const float q_mix = std::tanh(static_cast<float>(q0 + (0.5 * q1) + (0.25 * q2)));
+
+    const float fx = clampf(focus_x, -1.0f, 1.0f);
+    const float fy = clampf(focus_y, -1.0f, 1.0f);
+    const float fz = clampf(focus_z, -1.0f, 1.0f);
+    const float f_strength = clampf(focus_strength, 0.02f, 4.0f);
+    const float f_sharp = clampf(focus_sharpness, 0.25f, 10.0f);
+    const float tps = std::max(0.0f, tps_pressure);
+
+    const int64_t center = wrap_idx(static_cast<int64_t>(std::llround((0.5f * (fx + 1.0f)) * static_cast<float>(std::max<int64_t>(1, N - 1)))));
+    const int64_t phase_shift = static_cast<int64_t>(std::llround((fz * 0.18f + std::sin(0.03125f * static_cast<float>(phase)) * 0.05f) * static_cast<float>(N)));
+    const int64_t query_shift = static_cast<int64_t>(std::llround((q_mix * 0.12f + std::min(4.0f, tps) * 0.01f) * static_cast<float>(N)));
+    const int64_t focus_offset = center + phase_shift + query_shift;
+
+    const int64_t* idx_ptr = idx_c.data_ptr<int64_t>();
+    std::vector<float> accumulator(M, 0.0f);
+    float weight_sum = 0.0f;
+
+    for (int64_t s = 0; s < S; s++) {
+        const float rel = (S > 1) ? ((2.0f * static_cast<float>(s) / static_cast<float>(S - 1)) - 1.0f) : 0.0f;
+        const int64_t curvature = static_cast<int64_t>(std::llround(rel * fy * 0.35f * static_cast<float>(N)));
+        const int64_t row_idx = wrap_idx(idx_ptr[s] + focus_offset + curvature);
+
+        const float taper = std::max(0.25f, 1.0f - 0.65f * std::abs(rel));
+        float coeff = f_strength * (1.0f + 0.35f * q_mix) * taper;
+        if (trace_ptr != nullptr) {
+            const float tr = std::max(0.0f, trace_ptr[row_idx]);
+            const float fatigue = 1.0f / (1.0f + tr);
+            coeff *= fatigue;
+            trace_ptr[row_idx] = std::min(2.0f, tr * 0.975f + std::abs(coeff) * 0.025f);
+        }
+        coeff = std::max(1e-4f, coeff);
+        weight_sum += coeff;
+
+        if (is_int8) {
+            const int8_t* m_row = reinterpret_cast<const int8_t*>(m_c.data_ptr()) + (row_idx * M);
+            const float row_scale = scale_ptr[row_idx];
+            for (int64_t i = 0; i < M; i += 16) {
+                const int rem = static_cast<int>(M - i);
+                if (rem >= 16) {
+                    __m128i b = _mm_loadu_si128(reinterpret_cast<const __m128i*>(m_row + i));
+                    __m512i i32 = _mm512_cvtepi8_epi32(b);
+                    __m512 f = _mm512_cvtepi32_ps(i32);
+                    __m512 sc = _mm512_set1_ps(row_scale * coeff);
+                    __m512 val = _mm512_mul_ps(f, sc);
+                    __m512 acc = _mm512_loadu_ps(accumulator.data() + i);
+                    acc = _mm512_add_ps(acc, val);
+                    _mm512_storeu_ps(accumulator.data() + i, acc);
+                } else {
+                    for (int k = 0; k < rem; k++) {
+                        accumulator[i + k] += static_cast<float>(m_row[i + k]) * row_scale * coeff;
+                    }
+                }
+            }
+        } else {
+            const float* m_row = m_c.data_ptr<float>() + (row_idx * M);
+            for (int64_t i = 0; i < M; i += 16) {
+                const int rem = static_cast<int>(M - i);
+                if (rem >= 16) {
+                    __m512 val = _mm512_loadu_ps(m_row + i);
+                    __m512 sc = _mm512_set1_ps(coeff);
+                    __m512 scaled = _mm512_mul_ps(val, sc);
+                    __m512 acc = _mm512_loadu_ps(accumulator.data() + i);
+                    acc = _mm512_add_ps(acc, scaled);
+                    _mm512_storeu_ps(accumulator.data() + i, acc);
+                } else {
+                    for (int k = 0; k < rem; k++) {
+                        accumulator[i + k] += m_row[i + k] * coeff;
+                    }
+                }
+            }
+        }
+    }
+
+    const float inv = (weight_sum > 1e-6f) ? (f_sharp / weight_sum) : 0.0f;
+    for (int64_t i = 0; i < M; i++) {
+        out_ptr[i] = accumulator[i] * inv;
+    }
+    return recall;
+}
+
+// -------------------------------------------------------------------------
 // KERNEL: Geometric Manifold Recall (AVX-512 Optimized)
 // -------------------------------------------------------------------------
 torch::Tensor geometric_manifold_recall_avx512(
@@ -2180,6 +2443,12 @@ std::vector<at::Tensor> full_forward_inference(
     std::vector<at::Tensor> p, // Pre-packed weights
     at::Tensor s               // Scalars
 ) {
+    TORCH_CHECK(s.numel() >= RuntimeABI::FWD_SCALARS_MIN,
+        "full_forward_inference requires at least ", RuntimeABI::FWD_SCALARS_MIN,
+        " scalar controls, got ", s.numel(), ".");
+    TORCH_CHECK(p.size() >= 22,
+        "full_forward_inference expects at least 22 packed params, got ", p.size(), ".");
+
     // Unpack Scalars
     const int64_t B = x.size(0);
     const int64_t T = x.size(1);
@@ -2196,7 +2465,24 @@ std::vector<at::Tensor> full_forward_inference(
     const float cost_scale = s[10].item<float>();
     const float keep_ratio = s[11].item<float>();
     const int phase = (int)s[12].item<float>();
-    const float act_threshold = (s.numel() > 13) ? s[13].item<float>() : 0.8f;
+    const float act_threshold = s[13].item<float>();
+    const float focus_x = s[14].item<float>();
+    const float focus_y = s[15].item<float>();
+    const float focus_z = s[16].item<float>();
+    const float focus_strength = s[17].item<float>();
+    const float focus_sharpness = s[18].item<float>();
+    const float omega = s[19].item<float>();
+    const float tps_pressure = s[20].item<float>();
+    const float abi_version = s[21].item<float>();
+    TORCH_CHECK(
+        std::abs(abi_version - RuntimeABI::PHENOTYPE_ABI_VERSION) < 1e-5f,
+        "Forward scalar ABI mismatch. Expected ",
+        RuntimeABI::PHENOTYPE_ABI_VERSION,
+        " got ",
+        abi_version,
+        "."
+    );
+    (void)omega;
 
     Perf::g_full_forward_calls.fetch_add(1ULL, std::memory_order_relaxed);
 
@@ -2219,7 +2505,20 @@ std::vector<at::Tensor> full_forward_inference(
     bool recall_skipped_l_cycles = false;
     at::Tensor p_mod = p_lat;
     if (p[18].numel() > 0) {
-        at::Tensor lgh_ctx = geometric_manifold_recall_avx512(p_mod, p[18], at::Tensor(), p[19], 2.0f);
+        at::Tensor lgh_ctx = geometric_manifold_recall_dynamic_avx512(
+            p_mod,
+            p[18],
+            at::Tensor(),
+            p[19],
+            p[21],
+            focus_x,
+            focus_y,
+            focus_z,
+            focus_strength,
+            focus_sharpness,
+            static_cast<int64_t>(phase),
+            tps_pressure
+        );
         
         // Speculative ACT: If recall is extremely strong (sharp manifold hit), we skip System 2 deep cycles
         float recall_strength = lgh_ctx.abs().mean().item<float>();
@@ -3690,6 +3989,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("survival_update_io", &survival_update_io);
     m.def("survival_mask_io", &survival_mask_io);
     m.def("survival_losses_io", &survival_losses_io);
+    m.def("phenotype_from_genes_io", &phenotype_from_genes_io);
     m.def("unified_dispatch_io", &unified_dispatch_io);
     m.def("configure_hpc", &configure_hpc);
     m.def("get_hpc_error_ema", &get_hpc_error_ema);
@@ -3796,6 +4096,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.attr("EPSILON") = NIS::EPSILON;
     m.attr("CONFUSION_NORM") = NIS::CONFUSION_NORM;
     m.attr("SURVIVAL_WEIGHT") = NIS::SURVIVAL_WEIGHT;
+    m.attr("PHENOTYPE_ABI_VERSION") = RuntimeABI::PHENOTYPE_ABI_VERSION;
+    m.attr("FWD_SCALARS_MIN") = RuntimeABI::FWD_SCALARS_MIN;
     m.attr("OP_ADD") = NIS::OP_ADD;
     m.attr("OP_SCALE") = NIS::OP_SCALE;
     m.attr("OP_GATE") = NIS::OP_GATE;
@@ -3825,6 +4127,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("geometric_manifold_recall_avx512", [](torch::Tensor p, torch::Tensor m, torch::Tensor s, torch::Tensor c, float f) {
         return geometric_manifold_recall_avx512(p, m, s, c, f);
     });
+    m.def("geometric_manifold_recall_dynamic_avx512", &geometric_manifold_recall_dynamic_avx512);
     m.attr("EVENT_DRIVEN_ENABLED") = (bool)NIS::EVENT_DRIVEN_ENABLED;
 
     m.attr("CACHE_HASH_BITS") = NIS::CACHE_HASH_BITS;

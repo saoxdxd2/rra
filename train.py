@@ -258,6 +258,7 @@ def run_preflight_checks(model: CognitiveOrganism, learning_brain: LearningBrain
         "mes_super_step_io",
         "survival_losses_io",
         "quantized_matmul",
+        "phenotype_from_genes_io",
     )
     missing = [op for op in required_ops if not hasattr(cpp_loader, op)]
     if missing:
