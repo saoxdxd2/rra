@@ -1932,6 +1932,44 @@ class CognitiveOrganism(BaseCognitiveModule):
                 d = p_curve[:, -1, :].abs().mean()
             return float(torch.nan_to_num(d, nan=1.0, posinf=1.0, neginf=0.0).item())
 
+    def _lgh_manifold_recall(self, p_brain):
+        """High-speed Holographic Recall from the Geometric Manifold (AVX-512)."""
+        # Feature flag check
+        if self.lgh_manifold_morton is None or not bool(Config.LGH_ENABLED):
+            return torch.zeros_like(p_brain)
+        
+        # Use quantized manifold for speed if available
+        q_manifold, q_scales = self._quantize_lgh_manifold(bits=8)
+        
+        # If quantization failed or not ready, fallback to raw float32 (slower but correct)
+        use_int8 = (q_manifold is not None)
+        manifold = q_manifold if use_int8 else self.lgh_manifold_morton
+        scales = q_scales if use_int8 else torch.empty(0, device=self.device)
+        
+        # Focus parameters
+        focus_sharpness = float(getattr(Config, 'LGH_FOCUS_SHARPNESS', 2.0))
+        
+        if accelerator.cpp_has('geometric_manifold_forward_avx512', p_brain):
+            # C++ Fast Path
+            recall = accelerator.accelerate(
+                'geometric_manifold_forward_avx512',
+                p_brain,
+                manifold,
+                scales,
+                self._lgh_curve_indices,
+                focus_sharpness,
+                tensors=(p_brain,)
+            )
+            return recall
+        else:
+            # Python Slow Path (Fallback)
+            indices = self._lgh_curve_indices.long()
+            if use_int8:
+                raw = manifold[indices].float() * scales[indices].unsqueeze(-1)
+            else:
+                raw = manifold[indices]
+            return raw.mean(dim=0).expand_as(p_brain) * focus_sharpness
+
     def _imprint_to_manifold(self, keys, values, importance):
         """Imprint patterns into the LGH-Manifold trajectory for O(1) density retrieval."""
         if self.lgh_manifold_morton is None or self._lgh_curve_indices.numel() == 0:
@@ -2059,6 +2097,13 @@ class CognitiveOrganism(BaseCognitiveModule):
         # - High FKBP5: Amplifies prediction error (Stress)
         p = (1.0 - gaba) * p + fkbp5 * error
         
+        # --- PHASE 3: GEOMETRIC MANIFOLD RECALL (Holographic Context) ---
+        if bool(Config.LGH_ENABLED):
+            lgh_context = self._lgh_manifold_recall(p)
+            # Add context to p with a gain factor (Config.LGH_TRACE_GAIN)
+            lgh_gain = float(getattr(Config, 'LGH_TRACE_GAIN', 0.2))
+            p = p + lgh_context * lgh_gain
+
         p_brain = self.bridge_s1_to_s2(p) # [B, T, D_S2 * C]
         p_expanded = self._expand_brain_to_levels(p_brain)
         mode = 'parallel' if T > 1 else 'recurrent'

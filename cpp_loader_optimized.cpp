@@ -2197,11 +2197,103 @@ std::vector<torch::Tensor> survival_losses_io(
     return survival_losses(x_input, state);
 }
 
-// --- THE GREAT PURGE: LEGACY FORWARD PATHS DELETED ---
-// geometric_manifold_forward_avx512 deleted
-// pulse_gated_forward deleted
-// forward_stack (legacy) deleted
-// _fused_cognitive_cycle_impl (merged) deleted
+// -------------------------------------------------------------------------
+// KERNEL: Geometric Manifold Forward (AVX-512)
+// -------------------------------------------------------------------------
+torch::Tensor geometric_manifold_forward_avx512(
+    torch::Tensor p_brain,           // [B, T, M] or [B, M]
+    torch::Tensor manifold,          // [N, M] (int8 or float)
+    torch::Tensor scales,            // [N] (float) if int8, else empty
+    torch::Tensor curve_indices,     // [S] (long) Morton indices
+    float focus_sharpness         // Scalar
+) {
+    auto p_c = ensure_contig(p_brain);
+    auto m_c = ensure_contig(manifold);
+    auto idx_c = ensure_contig(curve_indices);
+    
+    const int64_t B = p_c.size(0);
+    const int64_t M = p_c.size(-1); // Last dim is params
+    const int64_t N = m_c.size(0);
+    const int64_t S = idx_c.numel();
+    
+    bool is_int8 = (m_c.scalar_type() == at::kByte || m_c.scalar_type() == at::kChar);
+    
+    // Optimization: The curve is global (shared for all B, T).
+    // We compute the aggregated context ONCE and return a [1, 1, M] tensor.
+    // Python will handle broadcasting during the addition (p + context).
+    
+    // Output tensor [1, 1, M]
+    auto options = p_c.options();
+    at::Tensor recall = torch::zeros({1, 1, M}, options);
+    float* out_ptr = recall.data_ptr<float>();
+    
+    // Check for scales if int8
+    const float* scale_ptr = nullptr;
+    if (is_int8) {
+        TORCH_CHECK(scales.defined() && scales.numel() == N, "dquant scales required for int8 manifold");
+        scale_ptr = scales.data_ptr<float>();
+    }
+
+    const int64_t* idx_ptr = idx_c.data_ptr<int64_t>();
+    
+    // Accumulate manifold curve (Single pass)
+    // We can parallelize over M or S. Since S is small (64), parallelize M is better.
+    // Or just serial if M is small (256). 
+    // M=256 is small. S=64 is small. Total ops = 64*256 = 16k. Tiny.
+    // Keep it simple: Serial S loop, vectorized M loop.
+    
+    std::vector<float> accumulator(M, 0.0f);
+    
+    for (int64_t s = 0; s < S; s++) {
+        int64_t row_idx = idx_ptr[s];
+        if (row_idx < 0 || row_idx >= N) continue; // Boundary check
+        
+        if (is_int8) {
+            const int8_t* m_row = (const int8_t*)m_c.data_ptr() + row_idx * M;
+            float row_scale = scale_ptr[row_idx];
+            
+            for (int64_t i = 0; i < M; i += 16) {
+                 int rem = M - i;
+                 if (rem >= 16) {
+                     __m128i b = _mm_loadu_si128((const __m128i*)(m_row + i));
+                     __m512i i32 = _mm512_cvtepi8_epi32(b);
+                     __m512 f = _mm512_cvtepi32_ps(i32);
+                     __m512 sc = _mm512_set1_ps(row_scale);
+                     __m512 val = _mm512_mul_ps(f, sc);
+                     
+                     __m512 acc = _mm512_loadu_ps(accumulator.data() + i);
+                     acc = _mm512_add_ps(acc, val);
+                     _mm512_storeu_ps(accumulator.data() + i, acc);
+                 } else {
+                     for (int k=0; k<rem; k++) accumulator[i+k] += (float)m_row[i+k] * row_scale;
+                 }
+            }
+        } else {
+            const float* m_row = m_c.data_ptr<float>() + row_idx * M;
+            for (int64_t i = 0; i < M; i += 16) {
+                 int rem = M - i;
+                 if (rem >= 16) {
+                    __m512 val = _mm512_loadu_ps(m_row + i);
+                    __m512 acc = _mm512_loadu_ps(accumulator.data() + i);
+                    acc = _mm512_add_ps(acc, val);
+                    _mm512_storeu_ps(accumulator.data() + i, acc);
+                 } else {
+                     for (int k=0; k<rem; k++) accumulator[i+k] += m_row[i+k];
+                 }
+            }
+        }
+    }
+    
+    // Normalize and Write to Output
+    float norm = (S > 0) ? (1.0f / S) : 0.0f;
+    float final_scale = norm * focus_sharpness; 
+    
+    for (int64_t i=0; i<M; i++) {
+        out_ptr[i] = accumulator[i] * final_scale;
+    }
+
+    return recall;
+}
 
 // Wrapper for organism.py compatibility
 /**
@@ -3598,6 +3690,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.attr("PHASE_0_KEEP_RATIO") = NIS::PHASE_0_KEEP_RATIO;
     m.attr("DISSONANCE_CONFIDENCE_THRESHOLD") = NIS::DISSONANCE_CONFIDENCE_THRESHOLD;
     m.attr("LGH_ENABLED") = (bool)NIS::LGH_ENABLED;
+    m.def("geometric_manifold_forward_avx512", [](torch::Tensor p, torch::Tensor m, torch::Tensor s, torch::Tensor c, float f) {
+        return geometric_manifold_forward_avx512(p, m, s, c, f);
+    });
     m.attr("EVENT_DRIVEN_ENABLED") = (bool)NIS::EVENT_DRIVEN_ENABLED;
 
     m.attr("CACHE_HASH_BITS") = NIS::CACHE_HASH_BITS;
