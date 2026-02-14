@@ -194,6 +194,8 @@ namespace NIS {
     static constexpr float EPSILON                 = 1e-8f;
     static constexpr float WARM_UP_STEPS           = 2000.0f;
     static constexpr float SCALE_CONSTANT          = 0.1f;
+    static constexpr float CONFUSION_NORM          = 2.0f;  // Normalize surprise for energy scaling
+    static constexpr float SURVIVAL_WEIGHT         = 0.05f; // Base weight for metabolic losses
     static constexpr bool STRICT_CPU_ONLY         = false;
     static constexpr const char* DEVICE           = "cpu"; // Authority string
     

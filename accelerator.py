@@ -1,4 +1,3 @@
-import importlib
 import os
 from functools import lru_cache
 
@@ -44,13 +43,66 @@ def _configure_windows_dll_dirs():
 
 @lru_cache(maxsize=1)
 def _load_cpp_loader():
+    import sys
+    import importlib.util
+    import importlib.machinery
+    
+    root = os.path.dirname(os.path.abspath(__file__))
+    # Force project root to front of sys.path
+    if root not in sys.path:
+        sys.path.insert(0, root)
+        
     _configure_windows_dll_dirs()
-    for module_name in ("cpp_loader", "cpp_loader_optimized"):
-        try:
-            return importlib.import_module(module_name)
-        except ImportError:
-            continue
-    return None
+    
+    # Enforce local extension loading only.
+    suffixes = list(importlib.machinery.EXTENSION_SUFFIXES)
+    for extra in (".cp312-win_amd64.pyd", ".pyd", ".so"):
+        if extra not in suffixes:
+            suffixes.append(extra)
+
+    attempted_files = []
+    load_failures = []
+
+    for name in ("cpp_loader", "cpp_loader_optimized"):
+        for suffix in suffixes:
+            pyd_path = os.path.join(root, f"{name}{suffix}")
+            if not os.path.exists(pyd_path):
+                continue
+            attempted_files.append(pyd_path)
+            try:
+                loader = importlib.machinery.ExtensionFileLoader("cpp_loader", pyd_path)
+                spec = importlib.util.spec_from_loader("cpp_loader", loader)
+                if spec is None or spec.loader is None:
+                    raise RuntimeError("importlib returned an invalid extension spec.")
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+                print(f">>> C++ LOADER ENFORCED LOCAL: {pyd_path}")
+                return mod
+            except Exception as e:
+                load_failures.append(f"{pyd_path}: {type(e).__name__}: {e}")
+
+    if not attempted_files:
+        expected = ", ".join([f"cpp_loader{sx}" for sx in suffixes[:6]])
+        message = (
+            "C++ loader startup failed: no local extension binary found. "
+            f"Expected files in '{root}', for example: {expected}."
+        )
+        print(f">>> C++ LOADER ERROR: {message}")
+        raise RuntimeError(message)
+
+    max_errors = 8
+    failure_details = "\n".join(load_failures[:max_errors])
+    overflow = len(load_failures) - max_errors
+    if overflow > 0:
+        failure_details = f"{failure_details}\n... ({overflow} more load errors omitted)"
+
+    message = (
+        "C++ loader startup failed: local extension binaries were found but all load attempts failed.\n"
+        f"Attempted files ({len(attempted_files)}): {attempted_files}\n"
+        f"Load errors:\n{failure_details}"
+    )
+    print(f">>> C++ LOADER ERROR: {message}")
+    raise RuntimeError(message)
 
 
 def get_cpp_loader():
@@ -80,8 +132,6 @@ class Accelerator:
             return self._dispatch_cache[cache_key]
         
         mod = self.loader
-        if mod is None:
-            return None
             
         op = None
         # Try specialized first: op_name_cuda, op_name_cpu
@@ -105,8 +155,6 @@ class Accelerator:
             op_name = None
 
         mod = self.loader
-        if mod is None:
-            return False
         
         if not tensors:
             return True
@@ -124,7 +172,7 @@ class Accelerator:
             specialized_name = f"{op_name}_{dev_type}"
             if hasattr(mod, specialized_name):
                 return True
-            # Fallback to base name check
+            # Base op-name check when no device-specialized symbol exists.
             if not hasattr(mod, op_name):
                 return False
 
@@ -143,8 +191,6 @@ class Accelerator:
 
     def missing_ops(self, op_names):
         mod = self.loader
-        if mod is None:
-            return list(op_names)
         return [op for op in op_names if not hasattr(mod, op)]
 
     def call(self, op_name, *args, tensors=None):
@@ -160,27 +206,34 @@ class Accelerator:
         op = self._get_op(op_name, dev_type)
         if op is not None:
             try:
+                # STRUCT LATCHING: Check if we are calling the unified dispatcher
+                if op_name == "unified_dispatch_io":
+                    # Expected args: (x, state, params, scalars, cmd)
+                    # New signature expect: ( [x, state, scalars, ...params], cmd )
+                    if len(args) == 5:
+                        x, state, params, scalars, cmd = args
+                        ctx = [x, state, scalars] + list(params)
+                        return op(ctx, int(cmd))
+                
                 return op(*args)
             except Exception as exc:
-                if self.strict:
-                    raise RuntimeError(f"C++ op '{op_name}' failed on '{dev_type}': {exc}") from exc
-                return None
+                raise RuntimeError(
+                    f"C++ op '{op_name}' failed on device '{dev_type}'. "
+                    f"args={len(args)} strict={self.strict} error={type(exc).__name__}: {exc}"
+                ) from exc
 
-        if self.strict:
-            if self.loader is None:
-                raise RuntimeError(f"C++ loader not available; required op '{op_name}'.")
-            raise RuntimeError(f"C++ op '{op_name}' is unavailable or unsupported on device '{dev_type}'.")
-        return None
+        raise RuntimeError(
+            f"C++ op '{op_name}' is unavailable or unsupported on device '{dev_type}'. "
+            "No Python fallback path is allowed."
+        )
 
     def configure(self, **kwargs):
         mod = self.loader
-        if mod is None:
-            if self.strict:
-                raise RuntimeError("C++ loader not available for configure().")
-            return
         for name, value in kwargs.items():
             if hasattr(mod, name):
                 getattr(mod, name)(*value if isinstance(value, tuple) else value)
+            else:
+                raise RuntimeError(f"C++ configure target '{name}' is missing from loader.")
 
 
 _DEFAULT_ACCEL = Accelerator()

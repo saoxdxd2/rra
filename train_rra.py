@@ -38,9 +38,14 @@ if os.name == 'nt':
                 # we'll keep it False by default and let user override via ENV if needed.
                 torch._inductor.config.cpp.openmp = os.environ.get("USE_OPENMP", "False").lower() == "true"
     except Exception as e:
-        pass
+        msg = (
+            "Windows JIT compiler configuration failed. "
+            f"Exception={type(e).__name__}: {e}"
+        )
+        print(f">>> RUNTIME CONFIG ERROR: {msg}")
+        raise RuntimeError(msg) from e
 
-from organism import CognitiveOrganism, init_state, cpp_loader, Config
+from org import CognitiveOrganism, init_state, cpp_loader, Config
 from learning_brain import LearningBrain
 
 # --- INTEGRATED OPTIMIZER SUITE ---
@@ -110,8 +115,10 @@ def configure_runtime_threading():
     interop_threads = runtime_cfg.interop_threads
     try:
         torch.set_flush_denormal(True)
-    except Exception:
-        pass
+    except Exception as e:
+        msg = f"torch.set_flush_denormal(True) failed with {type(e).__name__}: {e}"
+        logger.error(f">>> Runtime Threading Error: {msg}")
+        raise RuntimeError(msg) from e
 
     if omp_threads > 0:
         os.environ['OMP_NUM_THREADS'] = str(omp_threads)
@@ -164,7 +171,7 @@ def run_preflight_checks(model, device):
     if cpp_loader is None:
         raise RuntimeError("cpp_loader extension is required for this project.")
     required_ops = (
-        'forward_stack_io', 'mes_super_step_io', 'survival_losses_io',
+        'unified_dispatch_io', 'mes_super_step_io', 'survival_losses_io',
         'survival_mask_io', 'survival_update_io', 'quantized_matmul', 'ademamix_update'
     )
     missing = [op for op in required_ops if not hasattr(cpp_loader, op)]
@@ -172,9 +179,9 @@ def run_preflight_checks(model, device):
         raise RuntimeError(f"Missing required cpp_loader ops: {', '.join(missing)}")
     if bool(getattr(Config, 'LGH_ENABLED', False)) and bool(getattr(Config, 'LGH_REPLACE_FORWARD_STACK', False)):
         if not hasattr(cpp_loader, 'geometric_manifold_forward_avx512'):
-            logger.warning(
-                ">>> LGH is enabled in config, but C++ op 'geometric_manifold_forward_avx512' is missing. "
-                "Falling back to forward_stack_io path."
+            raise RuntimeError(
+                "LGH is enabled but required C++ op 'geometric_manifold_forward_avx512' is missing. "
+                "Fallback to unified_dispatch_io-only reasoning is disabled for LGH mode."
             )
 
     if isinstance(device, torch.device) and device.type != 'cpu':
@@ -284,8 +291,11 @@ class ThermalWatchdog(threading.Thread):
                 freq = psutil.cpu_freq()
                 if freq is not None and getattr(freq, 'current', None) is not None:
                     freq_ghz = max(0.0, float(freq.current) / 1000.0)
-            except Exception:
-                freq_ghz = 0.0
+            except Exception as e:
+                self.running = False
+                raise RuntimeError(
+                    f"ThermalWatchdog failed to read cpu_freq: {type(e).__name__}: {e}"
+                ) from e
 
             try:
                 temps = psutil.sensors_temperatures(fahrenheit=False)
@@ -297,8 +307,11 @@ class ThermalWatchdog(threading.Thread):
                                 vals.append(float(e.current))
                     if vals:
                         temp_c = max(vals)
-            except Exception:
-                temp_c = None
+            except Exception as e:
+                self.running = False
+                raise RuntimeError(
+                    f"ThermalWatchdog failed to read sensors_temperatures: {type(e).__name__}: {e}"
+                ) from e
 
             with self._lock:
                 self.current_freq_ghz = freq_ghz
@@ -606,7 +619,7 @@ def create_dataloaders(data_dir, batch_size, seq_len, val_split=0.1):
         )
         return train_dl, val_dl
 
-    # Fallback to Distilled Data
+    # Strict dataset source check
     stream_file = os.path.join(data_dir, "distilled_data_stream.pt")
     if os.path.exists(stream_file):
         raise RuntimeError(
@@ -689,19 +702,27 @@ class RRATrainer:
             sample_every_s=self.cfg.thermal_sample_every_s,
         )
         self.thermal_watchdog.start()
-        if cpp_loader is not None and hasattr(cpp_loader, 'get_perf_counters'):
-            try:
-                snap = cpp_loader.get_perf_counters()
-                if isinstance(snap, dict):
-                    self._perf_prev = dict(snap)
-            except Exception:
-                self._perf_prev = {}
+        if cpp_loader is None or (not hasattr(cpp_loader, 'get_perf_counters')):
+            raise RuntimeError("Perf counters are required, but cpp_loader.get_perf_counters is unavailable.")
+        snap = cpp_loader.get_perf_counters()
+        if not isinstance(snap, dict):
+            raise RuntimeError(
+                f"cpp_loader.get_perf_counters returned invalid type: {type(snap).__name__}. Expected dict."
+            )
+        self._perf_prev = dict(snap)
         if hasattr(self.model.governor, 'policy'):
             try:
                 self.model.governor.policy.config.simd_penalty_weight = float(self.cfg.simd_cycle_penalty_weight)
                 self.model.governor.policy.config.simd_starvation_threshold = float(self.cfg.simd_starvation_threshold)
-            except Exception:
-                pass
+            except Exception as e:
+                msg = (
+                    "Failed to configure governor SIMD policy values "
+                    f"(simd_penalty_weight={self.cfg.simd_cycle_penalty_weight}, "
+                    f"simd_starvation_threshold={self.cfg.simd_starvation_threshold}). "
+                    f"Exception={type(e).__name__}: {e}"
+                )
+                logger.error(f">>> Runtime Policy Error: {msg}")
+                raise RuntimeError(msg) from e
 
         # Create Once, Reuse Forever: Persistent Hidden State Buffer
         self.register_h_buffer(self.cfg.batch_size)
@@ -822,12 +843,16 @@ class RRATrainer:
             'simd_cycles_per_pulse': 0.0,
             'simd_temporal_folds': 0.0,
         }
-        if cpp_loader is None or (not hasattr(cpp_loader, 'get_perf_counters')):
-            return metrics
+        if cpp_loader is None:
+            raise RuntimeError("SIMD metrics require cpp_loader, but cpp_loader is unavailable.")
+        if not hasattr(cpp_loader, 'get_perf_counters'):
+            raise RuntimeError("SIMD metrics require cpp_loader.get_perf_counters, but it is missing.")
         try:
             snap = cpp_loader.get_perf_counters()
             if not isinstance(snap, dict):
-                return metrics
+                raise RuntimeError(
+                    f"cpp_loader.get_perf_counters returned {type(snap).__name__}; expected dict."
+                )
             prev = self._perf_prev if isinstance(self._perf_prev, dict) else {}
             cyc_now = int(snap.get('lgh_tsc_cycles', 0))
             pulse_now = int(snap.get('lgh_pulse_ops', 0))
@@ -844,8 +869,10 @@ class RRATrainer:
             metrics['simd_cycles_per_pulse'] = float(cpp_val)
             metrics['simd_temporal_folds'] = float(d_fold)
             self._perf_prev = dict(snap)
-        except Exception:
-            return metrics
+        except Exception as e:
+            raise RuntimeError(
+                f"SIMD perf metric update failed: {type(e).__name__}: {e}"
+            ) from e
         return metrics
 
     @staticmethod
@@ -1695,24 +1722,33 @@ class RRATrainer:
 
     def _perf_reset(self):
         if cpp_loader is None:
-            return
+            raise RuntimeError("cpp_loader is unavailable; perf counter reset requires C++ extension.")
         try:
             if hasattr(cpp_loader, 'set_perf_counters_enabled'):
                 cpp_loader.set_perf_counters_enabled(True)
             if hasattr(cpp_loader, 'reset_perf_counters'):
                 cpp_loader.reset_perf_counters()
         except Exception as e:
-            logger.warning(f">>> Perf counter reset failed: {e}")
+            msg = f"Perf counter reset failed with {type(e).__name__}: {e}"
+            logger.error(f">>> Perf Error: {msg}")
+            raise RuntimeError(msg) from e
 
     def _perf_snapshot(self):
-        if cpp_loader is None or (not hasattr(cpp_loader, 'get_perf_counters')):
-            return {}
+        if cpp_loader is None:
+            raise RuntimeError("cpp_loader is unavailable; perf snapshot requires C++ extension.")
+        if not hasattr(cpp_loader, 'get_perf_counters'):
+            raise RuntimeError("cpp_loader.get_perf_counters is missing; perf snapshot cannot proceed.")
         try:
             snap = cpp_loader.get_perf_counters()
-            return dict(snap) if isinstance(snap, dict) else {}
+            if not isinstance(snap, dict):
+                raise RuntimeError(
+                    f"cpp_loader.get_perf_counters returned {type(snap).__name__}; expected dict."
+                )
+            return dict(snap)
         except Exception as e:
-            logger.warning(f">>> Perf counter snapshot failed: {e}")
-            return {}
+            msg = f"Perf counter snapshot failed with {type(e).__name__}: {e}"
+            logger.error(f">>> Perf Error: {msg}")
+            raise RuntimeError(msg) from e
 
     def _snapshot_for_ablation(self):
         model_state = {}
@@ -1752,17 +1788,27 @@ class RRATrainer:
                     continue
             loadable[k] = v
         if dropped_shape:
-            preview = "; ".join([f"{k}: {old}->{new}" for k, old, new in dropped_shape[:6]])
-            extra = "" if len(dropped_shape) <= 6 else f" (+{len(dropped_shape) - 6} more)"
-            logger.warning(
-                f">>> Ablation restore: dropped {len(dropped_shape)} shape-mismatched state keys. "
-                f"{preview}{extra}"
+            preview = "; ".join([f"{k}: {old}->{new}" for k, old, new in dropped_shape[:8]])
+            extra = "" if len(dropped_shape) <= 8 else f" (+{len(dropped_shape) - 8} more)"
+            raise RuntimeError(
+                "Ablation restore found shape-mismatched model state keys and fallback loading is disabled. "
+                f"count={len(dropped_shape)} details={preview}{extra}"
             )
-        self.model.load_state_dict(loadable, strict=False)
+        missing_keys = [k for k in current_state.keys() if k not in loadable]
+        if missing_keys:
+            preview = ", ".join(missing_keys[:12])
+            extra = "" if len(missing_keys) <= 12 else f" (+{len(missing_keys) - 12} more)"
+            raise RuntimeError(
+                "Ablation restore missing required model state keys. "
+                f"count={len(missing_keys)} keys={preview}{extra}"
+            )
+        self.model.load_state_dict(loadable, strict=True)
         try:
             self.optimizer.load_state_dict(snapshot['optimizer_state'])
         except Exception as e:
-            logger.warning(f">>> Ablation restore: optimizer state reload failed ({e}). Using fresh optimizer state.")
+            raise RuntimeError(
+                f"Ablation restore optimizer state reload failed: {type(e).__name__}: {e}"
+            ) from e
         self.global_step = int(snapshot.get('global_step', self.global_step))
         self.model.current_phase = int(snapshot.get('current_phase', self.model.current_phase))
         self.model.omega = float(snapshot.get('omega', self.model.omega))
@@ -1851,8 +1897,9 @@ class RRATrainer:
             quality = 1.0 / max(val_loss, 1e-8)
             qpf = quality / max(1.0, float(total_flops))
             if total_flops <= 0:
-                # Fallback metric if counters are unavailable.
-                qpf = quality / elapsed
+                raise RuntimeError(
+                    "Ablation quality_per_flop requires valid C++ perf counters; total_flops<=0 indicates missing data."
+                )
 
             result = {
                 'name': variant_name,
@@ -1926,14 +1973,9 @@ class RRATrainer:
             self.cleanup_old_checkpoints(os.path.dirname(path))
                 
         except Exception as e:
-            logger.error(f"FAILED TO SAVE CHECKPOINT to {path}: {e}")
-            # Try emergency backup to current directory
-            try:
-                emergency_path = f"emergency_ckpt_step_{self.global_step}.pt"
-                torch.save(self.model.state_dict(), emergency_path)
-                logger.warning(f"Saved emergency checkpoint to {emergency_path}")
-            except:
-                logger.error("Emergency save also failed. Disk likely full.")
+            msg = f"FAILED TO SAVE CHECKPOINT to {path}: {type(e).__name__}: {e}"
+            logger.error(msg)
+            raise RuntimeError(msg) from e
 
     def cleanup_old_checkpoints(self, checkpoint_dir, keep_best=True):
         """
@@ -1953,8 +1995,8 @@ class RRATrainer:
                     try:
                         epoch_num = int(f.split('_')[-1].replace('.pt', ''))
                         epoch_files.append((epoch_num, f))
-                    except ValueError:
-                        pass
+                    except ValueError as ve:
+                        logger.warning(f"Cleanup: Skipping malformed checkpoint filename '{f}': {ve}")
             
             # Sort by epoch number (ascending)
             epoch_files.sort(key=lambda x: x[0])
@@ -1972,48 +2014,66 @@ class RRATrainer:
                         logger.warning(f"Cleanup: Failed to delete {fname}: {e}")
                         
         except Exception as e:
-            logger.warning(f"Checkpoint cleanup failed: {e}")
+            msg = f"Checkpoint cleanup failed: {type(e).__name__}: {e}"
+            logger.error(msg)
+            raise RuntimeError(msg) from e
 
     def load_checkpoint(self, path):
-        if not os.path.exists(path): return False
+        if not os.path.exists(path):
+            return False
         try:
             ckpt = torch.load(path, map_location=self.device)
-            
-            # Sanitization: Remove quantization keys (w_q, scale_w) if they exist
-            # These are transient buffers that cause "Unexpected key" errors if model is fresh
-            state_dict = ckpt['model_state_dict']
-            keys_to_remove = [k for k in state_dict.keys() if 'w_q' in k or 'scale_w' in k]
-            if keys_to_remove:
-                logger.info(f"Checkpoint Sanitizer: Removing {len(keys_to_remove)} quantization keys (w_q/scale_w)")
-                for k in keys_to_remove:
-                    del state_dict[k]
+            if 'model_state_dict' not in ckpt:
+                raise RuntimeError("Checkpoint missing required key 'model_state_dict'.")
+            if 'optimizer_state_dict' not in ckpt:
+                raise RuntimeError("Checkpoint missing required key 'optimizer_state_dict'.")
 
-            # Shape sanitizer: skip keys whose tensor shapes no longer match current architecture.
+            state_dict = ckpt['model_state_dict']
+            if not isinstance(state_dict, dict):
+                raise RuntimeError(
+                    f"Checkpoint key 'model_state_dict' has invalid type {type(state_dict).__name__}; expected dict."
+                )
+
+            deprecated_quant_keys = [k for k in state_dict.keys() if ('w_q' in k or 'scale_w' in k)]
+            if deprecated_quant_keys:
+                preview = ", ".join(deprecated_quant_keys[:12])
+                extra = "" if len(deprecated_quant_keys) <= 12 else f" (+{len(deprecated_quant_keys) - 12} more)"
+                raise RuntimeError(
+                    "Checkpoint contains deprecated quantization keys; compatibility fallback is disabled. "
+                    f"keys={preview}{extra}"
+                )
+
             model_state = self.model.state_dict()
             shape_mismatch_keys = []
-            for k in list(state_dict.keys()):
+            for k in state_dict.keys():
                 if k in model_state:
                     v = state_dict[k]
                     mv = model_state[k]
                     if isinstance(v, torch.Tensor) and isinstance(mv, torch.Tensor) and tuple(v.shape) != tuple(mv.shape):
                         shape_mismatch_keys.append((k, tuple(v.shape), tuple(mv.shape)))
-                        del state_dict[k]
             if shape_mismatch_keys:
                 preview = "; ".join([f"{k}: {old}->{new}" for k, old, new in shape_mismatch_keys[:8]])
                 extra = "" if len(shape_mismatch_keys) <= 8 else f" (+{len(shape_mismatch_keys) - 8} more)"
-                logger.warning(
-                    f">>> Checkpoint Sanitizer: Dropping {len(shape_mismatch_keys)} shape-mismatched keys. "
-                    f"{preview}{extra}"
+                raise RuntimeError(
+                    "Checkpoint tensor shape mismatch detected; fallback loading is disabled. "
+                    f"count={len(shape_mismatch_keys)} details={preview}{extra}"
                 )
-            
-            self.model.load_state_dict(state_dict, strict=False) # tolerate missing legacy keys
-            
-            # Try to restore optimizer state - may fail if model architecture changed
-            try:
-                self.optimizer.load_state_dict(ckpt['optimizer_state_dict'])
-            except ValueError as opt_err:
-                logger.warning(f">>> Optimizer state incompatible (architecture changed): {opt_err}")
-                logger.warning(">>> Continuing with fresh optimizer state. Previous momentum will be lost.")
+
+            missing_keys = [k for k in model_state.keys() if k not in state_dict]
+            unexpected_keys = [k for k in state_dict.keys() if k not in model_state]
+            if missing_keys or unexpected_keys:
+                missing_preview = ", ".join(missing_keys[:8]) if missing_keys else "none"
+                unexpected_preview = ", ".join(unexpected_keys[:8]) if unexpected_keys else "none"
+                missing_extra = "" if len(missing_keys) <= 8 else f" (+{len(missing_keys) - 8} more)"
+                unexpected_extra = "" if len(unexpected_keys) <= 8 else f" (+{len(unexpected_keys) - 8} more)"
+                raise RuntimeError(
+                    "Checkpoint key-set mismatch; partial/legacy fallback loading is disabled. "
+                    f"missing={len(missing_keys)} [{missing_preview}{missing_extra}] "
+                    f"unexpected={len(unexpected_keys)} [{unexpected_preview}{unexpected_extra}]"
+                )
+
+            self.model.load_state_dict(state_dict, strict=True)
+            self.optimizer.load_state_dict(ckpt['optimizer_state_dict'])
             self.model.current_phase = ckpt.get('current_phase', 0)
             self.model.omega = ckpt.get('omega', 0.0) # FIX: Load Omega state
             self.global_step = ckpt.get('global_step', 0)
@@ -2024,10 +2084,10 @@ class RRATrainer:
             if 'rng_state' in ckpt:
                 torch.set_rng_state(ckpt['rng_state'].cpu())
             return True
-        except RuntimeError as e:
-            print(f"\n>>> WARNING: Checkpoint Incompatible (Architecture Changed). Error: {e}")
-            print(">>> Starting with fresh weights for the new architecture.")
-            return False
+        except Exception as e:
+            msg = f"Checkpoint load failed for '{path}': {type(e).__name__}: {e}"
+            logger.error(msg)
+            raise RuntimeError(msg) from e
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train the RRA model.")
@@ -2181,12 +2241,8 @@ def main():
     # input_dim: Bytes (dataset.vocab_size) -> d_s1
     model = CognitiveOrganism(
         input_dim=(Config.WORKING_DIM // 8) * Config.C, 
-        L=Config.L, 
-        R=Config.R, 
-        d_s1=(Config.WORKING_DIM // 8), 
-        d_s2=Config.WORKING_DIM,
         vocab_size=train_loader.dataset.vocab_size,
-        output_dim=train_loader.dataset.vocab_size,
+        output_dim=8,
         device=DEVICE
     )
     

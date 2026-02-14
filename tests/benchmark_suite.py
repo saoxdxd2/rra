@@ -1,10 +1,8 @@
 import torch
-import torch.nn as nn
 import time
 import numpy as np
 import accelerator
-from organism import CognitiveOrganism
-import math
+from org import CognitiveOrganism, Config
 
 def benchmark_kernel(name, fn, args, iterations=100, warmup=10):
     # Warmup
@@ -65,8 +63,8 @@ def run_benchmarks():
     
     # 4. End-to-End Organism Forward Pass
     # The ultimate test of the reasoning core
-    L, R, C = 4, 8, 4
-    model = CognitiveOrganism(input_dim=8, L=L, R=R, device=device)
+    L, R, C = int(Config.L), int(Config.R), int(Config.C)
+    model = CognitiveOrganism(input_dim=8, device=device)
     x = torch.randn(32, 16, 8, device=device) # B=32, T=16
     
     t_avg = benchmark_kernel("organism_forward", model.forward, (x, None))

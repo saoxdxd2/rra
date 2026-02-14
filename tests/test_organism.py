@@ -1,14 +1,12 @@
 import torch
 import unittest
-import accelerator
-from organism import CognitiveOrganism
-import math
+from org import CognitiveOrganism, Config
 
 class TestCognitiveOrganism(unittest.TestCase):
     def setUp(self):
         self.B = 2
-        self.L = 2
-        self.R = 4
+        self.L = int(Config.L)
+        self.R = int(Config.R)
         self.input_dim = 8
         # Use small dimensions for fast testing
         self.device = torch.device('cpu')
@@ -17,8 +15,6 @@ class TestCognitiveOrganism(unittest.TestCase):
     def test_organism_initialization(self):
         model = CognitiveOrganism(
             input_dim=self.input_dim,
-            L=self.L,
-            R=self.R,
             device=self.device
         )
         self.assertTrue(isinstance(model, torch.nn.Module))
@@ -26,8 +22,6 @@ class TestCognitiveOrganism(unittest.TestCase):
     def test_organism_forward_basic(self):
         model = CognitiveOrganism(
             input_dim=self.input_dim,
-            L=self.L,
-            R=self.R,
             device=self.device
         )
         

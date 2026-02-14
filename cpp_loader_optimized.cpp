@@ -197,6 +197,7 @@ namespace Perf {
     static std::atomic<uint64_t> g_lgh_tsc_cycles{0};
     static std::atomic<uint64_t> g_lgh_pulse_ops{0};
     static std::atomic<uint64_t> g_lgh_temporal_folds{0};
+    static std::atomic<uint64_t> g_full_forward_calls{0};
 
     inline uint64_t sat_from_ld(long double v) {
         if (!(v > 0.0L)) {
@@ -1835,11 +1836,16 @@ std::vector<at::Tensor> forward_stack_io(
     std::vector<at::Tensor> params,
     at::Tensor scalars
 ) {
-    const int64_t B = x_input.size(0);
-    const int64_t T = x_input.size(1);
-    TORCH_CHECK(params.size() >= 6, "forward_stack_io expects at least 6 params.");
-    // --- LEGACY FORWARD STACK RESTORED FOR STABILITY ---
-    return { torch::zeros({B, T, params[2].size(2)}, x_input.options()) }; 
+    TORCH_CHECK(
+        false,
+        "forward_stack_io legacy stub was removed. "
+        "Use unified_dispatch_io with CMD_FORWARD_STACK (0) instead. "
+        "Details: x_input shape=", x_input.sizes(),
+        ", H_state shape=", H_state.sizes(),
+        ", params=", params.size(),
+        ", scalars shape=", scalars.sizes()
+    );
+    return {};
 }
 
 // --- FORWARD DECLARATIONS ---
@@ -1858,7 +1864,8 @@ enum CognitiveCmd {
     CMD_SURVIVAL_UPDATE = 3,
     CMD_SURVIVAL_MASK = 4,
     CMD_FUSED_CYCLE_ULTRA = 5,
-    CMD_FUSED_STEP = 6
+    CMD_FUSED_STEP = 6,
+    CMD_FULL_FORWARD = 7
 };
 
 std::vector<at::Tensor> fused_cognitive_step(
@@ -2004,7 +2011,7 @@ std::vector<at::Tensor> fused_cognitive_step(
         if (global_max_delta < 1e-6f) break;
     }
     
-    // Final copy for organism.py output compatibility
+    // Final copy for Python model output compatibility (org.py).
     #pragma omp parallel for schedule(static)
     for (int b = 0; b < (int)B; b++) {
         for (int r = 0; r < (int)R; r++) {
@@ -2066,13 +2073,219 @@ std::vector<at::Tensor> fused_cognitive_cycle_ultra(
     return {y_seq, h_iter, new_usage};
 }
 
+// -------------------------------------------------------------------------
+// KERNEL: Geometric Manifold Recall (AVX-512 Optimized)
+// -------------------------------------------------------------------------
+torch::Tensor geometric_manifold_recall_avx512(
+    torch::Tensor p_brain,           // [B, T, M] or [B, M]
+    torch::Tensor manifold,          // [N, M] (int8 or float)
+    torch::Tensor scales,            // [N] (float) if int8, else empty
+    torch::Tensor curve_indices,     // [S] (long) Morton indices
+    float focus_sharpness         // Scalar
+) {
+    auto p_c = ensure_contig(p_brain);
+    auto m_c = ensure_contig(manifold);
+    auto idx_c = ensure_contig(curve_indices);
+    
+    const int64_t B = p_c.size(0);
+    const int64_t M = p_c.size(-1); // Last dim is params
+    const int64_t N = m_c.size(0);
+    const int64_t S = idx_c.numel();
+    
+    bool is_int8 = (m_c.scalar_type() == at::kByte || m_c.scalar_type() == at::kChar);
+    
+    // Optimization: The curve is global (shared for all B, T).
+    // We compute the aggregated context ONCE and return a [1, 1, M] tensor.
+    // Python will handle broadcasting during the addition (p + context).
+    
+    // Output tensor [1, 1, M]
+    auto options = p_c.options();
+    at::Tensor recall = torch::zeros({1, 1, M}, options);
+    float* out_ptr = recall.data_ptr<float>();
+    
+    // Check for scales if int8
+    const float* scale_ptr = nullptr;
+    if (is_int8) {
+        TORCH_CHECK(scales.defined() && scales.numel() == N, "dquant scales required for int8 manifold");
+        scale_ptr = scales.data_ptr<float>();
+    }
+
+    const int64_t* idx_ptr = idx_c.data_ptr<int64_t>();
+    
+    // Accumulate manifold curve (Single pass)
+    std::vector<float> accumulator(M, 0.0f);
+    
+    for (int64_t s = 0; s < S; s++) {
+        int64_t row_idx = idx_ptr[s];
+        if (row_idx < 0 || row_idx >= N) continue; // Boundary check
+        
+        if (is_int8) {
+            const int8_t* m_row = (const int8_t*)m_c.data_ptr() + row_idx * M;
+            float row_scale = scale_ptr[row_idx];
+            
+            for (int64_t i = 0; i < M; i += 16) {
+                 int rem = M - i;
+                 if (rem >= 16) {
+                     __m128i b = _mm_loadu_si128((const __m128i*)(m_row + i));
+                     __m512i i32 = _mm512_cvtepi8_epi32(b);
+                     __m512 f = _mm512_cvtepi32_ps(i32);
+                     __m512 sc = _mm512_set1_ps(row_scale);
+                     __m512 val = _mm512_mul_ps(f, sc);
+                     
+                     __m512 acc = _mm512_loadu_ps(accumulator.data() + i);
+                     acc = _mm512_add_ps(acc, val);
+                     _mm512_storeu_ps(accumulator.data() + i, acc);
+                 } else {
+                     for (int k=0; k<rem; k++) accumulator[i+k] += (float)m_row[i+k] * row_scale;
+                 }
+            }
+        } else {
+            const float* m_row = m_c.data_ptr<float>() + row_idx * M;
+            for (int64_t i = 0; i < M; i += 16) {
+                 int rem = M - i;
+                 if (rem >= 16) {
+                    __m512 val = _mm512_loadu_ps(m_row + i);
+                    __m512 acc = _mm512_loadu_ps(accumulator.data() + i);
+                    acc = _mm512_add_ps(acc, val);
+                    _mm512_storeu_ps(accumulator.data() + i, acc);
+                 } else {
+                     for (int k=0; k<rem; k++) accumulator[i+k] += m_row[i+k];
+                 }
+            }
+        }
+    }
+    
+    // Normalize and Write to Output
+    float norm = (S > 0) ? (1.0f / S) : 0.0f;
+    float final_scale = norm * focus_sharpness; 
+    
+    for (int64_t i=0; i<M; i++) {
+        out_ptr[i] = accumulator[i] * final_scale;
+    }
+
+    return recall;
+}
+
+// -------------------------------------------------------------------------
+// KERNEL: NIS Full Forward Fusion (Inference Fast Path)
+// -------------------------------------------------------------------------
+std::vector<at::Tensor> full_forward_inference(
+    at::Tensor x,              // [B, T, 8] (bits)
+    at::Tensor H,              // [B, L, R, D, C]
+    std::vector<at::Tensor> p, // Pre-packed weights
+    at::Tensor s               // Scalars
+) {
+    // Unpack Scalars
+    const int64_t B = x.size(0);
+    const int64_t T = x.size(1);
+    const int64_t L = (int64_t)s[0].item<float>();
+    const int64_t R = (int64_t)s[1].item<float>();
+    const int64_t d_s1 = (int64_t)s[2].item<float>();
+    const int64_t d_s2 = (int64_t)s[3].item<float>();
+    const int64_t C = (int64_t)s[4].item<float>();
+    const float lif_decay = s[5].item<float>();
+    const float lif_threshold = s[6].item<float>();
+    const float halt_threshold = s[7].item<float>();
+    const float lambda_sparsity = s[8].item<float>();
+    const float trace_gain = s[9].item<float>();
+    const float cost_scale = s[10].item<float>();
+    const float keep_ratio = s[11].item<float>();
+    const int phase = (int)s[12].item<float>();
+    const float act_threshold = (s.numel() > 13) ? s[13].item<float>() : 0.8f;
+
+    Perf::g_full_forward_calls.fetch_add(1ULL, std::memory_order_relaxed);
+
+    // 1. Bit -> Latent Projection
+    at::Tensor p_lat;
+    {
+        at::Tensor x_flat = x.reshape({-1, x.size(-1)});
+        if (p[0].dtype() == at::kChar) {
+            p_lat = quantized_matmul(x_flat, p[0], p[1], p[2]);
+        } else {
+            p_lat = at::linear(x_flat, p[0], (p[2].numel() > 0 ? p[2] : at::Tensor()));
+        }
+        p_lat = p_lat.reshape({B, T, d_s1 * C});
+    }
+
+    // 2. State Prep
+    at::Tensor H_state = (H.size(0) != B) ? H.expand({B, L, R, NIS::WORKING_DIM, C}).contiguous() : ensure_contig(H);
+
+    // 3. LGH Manifold Recall + ACT (Adaptive Computation Time)
+    bool recall_skipped_l_cycles = false;
+    at::Tensor p_mod = p_lat;
+    if (p[18].numel() > 0) {
+        at::Tensor lgh_ctx = geometric_manifold_recall_avx512(p_mod, p[18], at::Tensor(), p[19], 2.0f);
+        
+        // Speculative ACT: If recall is extremely strong (sharp manifold hit), we skip System 2 deep cycles
+        float recall_strength = lgh_ctx.abs().mean().item<float>();
+        if (recall_strength > act_threshold) {
+             recall_skipped_l_cycles = true;
+             Perf::g_lgh_temporal_folds.fetch_add(1ULL, std::memory_order_relaxed); // Re-purpose counter for ACT skips
+        }
+        p_mod = p_mod + lgh_ctx * trace_gain;
+    }
+
+    // 4. S1 -> S2 Bridge
+    at::Tensor p_brain;
+    {
+        at::Tensor x_in = p_mod.reshape({-1, p_mod.size(-1)});
+        p_brain = (p[7].dtype() == at::kChar) ? quantized_matmul(x_in, p[7], p[8], at::Tensor()) : at::linear(x_in, p[7], at::Tensor());
+        p_brain = p_brain.reshape({B, T, d_s2 * C});
+    }
+
+    // 5. Gate Calculation
+    at::Tensor gate;
+    float metabolic_cost = 0.0f;
+    {
+        at::Tensor usage = p[20];
+        if (usage.numel() > 0) {
+            gate = (phase == 0) ? (usage >= std::get<0>(usage.view(-1).topk(std::max<int64_t>(1, (int64_t)(usage.numel() * keep_ratio)))).min().item<float>()).to(at::kFloat).view({1, L, R, 1, 1})
+                                : survival_mask(usage, torch::ones_like(usage), lambda_sparsity, 0.0f, 0.1f).view({1, L, R, 1, 1});
+            metabolic_cost = gate.sum().item<float>() * cost_scale;
+        } else {
+            gate = torch::ones({1, L, R, 1, 1}, H_state.options());
+            metabolic_cost = (float)(L * R) * cost_scale;
+        }
+    }
+
+    // 6. Cognitive Cycle (Conditioned ACT)
+    int64_t effective_l_cycles = recall_skipped_l_cycles ? 0 : NIS::L_CYCLES;
+    
+    std::vector<at::Tensor> cycle_out = fused_cognitive_cycle_ultra(
+        p_brain, H_state, gate,
+        p[9], p[10], p[11], p[12], p[13], p[14],
+        NIS::H_CYCLES, effective_l_cycles,
+        lif_decay, lif_threshold, halt_threshold,
+        at::Tensor(), at::Tensor(), 0.0f, false, at::Tensor(), at::Tensor(), at::Tensor(), at::Tensor()
+    );
+    
+    at::Tensor y_seq = cycle_out[0];
+    at::Tensor H_next = cycle_out[1];
+
+    // 7. Readout (RMS + Linear)
+    at::Tensor y_flat = rms_norm(y_seq.flatten(2), NIS::RMS_NORM_EPS);
+    at::Tensor logits;
+    {
+        at::Tensor x_in = y_flat.reshape({-1, y_flat.size(-1)});
+        logits = (p[15].dtype() == at::kChar) ? quantized_matmul(x_in, p[15], p[16], p[17]) : at::linear(x_in, p[15], (p[17].numel() > 0 ? p[17] : at::Tensor()));
+        logits = logits.reshape({B, T, -1});
+    }
+
+    return {logits, H_next, torch::tensor({metabolic_cost}, H_state.options()), gate};
+}
+
+
 std::vector<at::Tensor> unified_dispatch_io(
-    at::Tensor x,
-    at::Tensor state,
-    std::vector<at::Tensor> params,
-    at::Tensor scalars,
+    std::vector<at::Tensor> ctx,
     int64_t cmd
 ) {
+    // UNIFIED STRUCT LATCHING: ctx[0]=x, ctx[1]=state, ctx[2]=scalars, ctx[3:]=params
+    at::Tensor x = ctx[0];
+    at::Tensor state = ctx[1];
+    at::Tensor scalars = ctx[2];
+    std::vector<at::Tensor> params;
+    for (size_t i = 3; i < ctx.size(); ++i) params.push_back(ctx[i]);
+
     switch (cmd) {
         case CMD_FUSED_CYCLE_ULTRA: {
             bool survival = (scalars.size(0) > 6 && scalars[6].item<float>() > 0.5f);
@@ -2113,6 +2326,8 @@ std::vector<at::Tensor> unified_dispatch_io(
         case CMD_SURVIVAL_LOSSES: return survival_losses_io(x, state, params, scalars);
         case CMD_SURVIVAL_UPDATE: return std::vector<at::Tensor>{ survival_update_io(x, state, params, scalars) };
         case CMD_SURVIVAL_MASK: return std::vector<at::Tensor>{ survival_mask_io(x, state, params, scalars) };
+        case CMD_FULL_FORWARD:
+            return full_forward_inference(x, state, params, scalars);
         default:
             TORCH_CHECK(false, "Unknown Unified Command: ", cmd);
     }
@@ -2200,102 +2415,9 @@ std::vector<torch::Tensor> survival_losses_io(
 // -------------------------------------------------------------------------
 // KERNEL: Geometric Manifold Forward (AVX-512)
 // -------------------------------------------------------------------------
-torch::Tensor geometric_manifold_forward_avx512(
-    torch::Tensor p_brain,           // [B, T, M] or [B, M]
-    torch::Tensor manifold,          // [N, M] (int8 or float)
-    torch::Tensor scales,            // [N] (float) if int8, else empty
-    torch::Tensor curve_indices,     // [S] (long) Morton indices
-    float focus_sharpness         // Scalar
-) {
-    auto p_c = ensure_contig(p_brain);
-    auto m_c = ensure_contig(manifold);
-    auto idx_c = ensure_contig(curve_indices);
-    
-    const int64_t B = p_c.size(0);
-    const int64_t M = p_c.size(-1); // Last dim is params
-    const int64_t N = m_c.size(0);
-    const int64_t S = idx_c.numel();
-    
-    bool is_int8 = (m_c.scalar_type() == at::kByte || m_c.scalar_type() == at::kChar);
-    
-    // Optimization: The curve is global (shared for all B, T).
-    // We compute the aggregated context ONCE and return a [1, 1, M] tensor.
-    // Python will handle broadcasting during the addition (p + context).
-    
-    // Output tensor [1, 1, M]
-    auto options = p_c.options();
-    at::Tensor recall = torch::zeros({1, 1, M}, options);
-    float* out_ptr = recall.data_ptr<float>();
-    
-    // Check for scales if int8
-    const float* scale_ptr = nullptr;
-    if (is_int8) {
-        TORCH_CHECK(scales.defined() && scales.numel() == N, "dquant scales required for int8 manifold");
-        scale_ptr = scales.data_ptr<float>();
-    }
 
-    const int64_t* idx_ptr = idx_c.data_ptr<int64_t>();
-    
-    // Accumulate manifold curve (Single pass)
-    // We can parallelize over M or S. Since S is small (64), parallelize M is better.
-    // Or just serial if M is small (256). 
-    // M=256 is small. S=64 is small. Total ops = 64*256 = 16k. Tiny.
-    // Keep it simple: Serial S loop, vectorized M loop.
-    
-    std::vector<float> accumulator(M, 0.0f);
-    
-    for (int64_t s = 0; s < S; s++) {
-        int64_t row_idx = idx_ptr[s];
-        if (row_idx < 0 || row_idx >= N) continue; // Boundary check
-        
-        if (is_int8) {
-            const int8_t* m_row = (const int8_t*)m_c.data_ptr() + row_idx * M;
-            float row_scale = scale_ptr[row_idx];
-            
-            for (int64_t i = 0; i < M; i += 16) {
-                 int rem = M - i;
-                 if (rem >= 16) {
-                     __m128i b = _mm_loadu_si128((const __m128i*)(m_row + i));
-                     __m512i i32 = _mm512_cvtepi8_epi32(b);
-                     __m512 f = _mm512_cvtepi32_ps(i32);
-                     __m512 sc = _mm512_set1_ps(row_scale);
-                     __m512 val = _mm512_mul_ps(f, sc);
-                     
-                     __m512 acc = _mm512_loadu_ps(accumulator.data() + i);
-                     acc = _mm512_add_ps(acc, val);
-                     _mm512_storeu_ps(accumulator.data() + i, acc);
-                 } else {
-                     for (int k=0; k<rem; k++) accumulator[i+k] += (float)m_row[i+k] * row_scale;
-                 }
-            }
-        } else {
-            const float* m_row = m_c.data_ptr<float>() + row_idx * M;
-            for (int64_t i = 0; i < M; i += 16) {
-                 int rem = M - i;
-                 if (rem >= 16) {
-                    __m512 val = _mm512_loadu_ps(m_row + i);
-                    __m512 acc = _mm512_loadu_ps(accumulator.data() + i);
-                    acc = _mm512_add_ps(acc, val);
-                    _mm512_storeu_ps(accumulator.data() + i, acc);
-                 } else {
-                     for (int k=0; k<rem; k++) accumulator[i+k] += m_row[i+k];
-                 }
-            }
-        }
-    }
-    
-    // Normalize and Write to Output
-    float norm = (S > 0) ? (1.0f / S) : 0.0f;
-    float final_scale = norm * focus_sharpness; 
-    
-    for (int64_t i=0; i<M; i++) {
-        out_ptr[i] = accumulator[i] * final_scale;
-    }
 
-    return recall;
-}
-
-// Wrapper for organism.py compatibility
+// Wrapper for org.py compatibility
 /**
  * NIS Token Interpreter Core
  * Executes instructions from the latent instruction stack using AVX-512.
@@ -3667,13 +3789,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.attr("SPARSITY_THRESHOLD") = NIS::SPARSITY_THRESHOLD;
     m.attr("MAX_LOG_ENTRIES") = NIS::MAX_LOG_ENTRIES;
     m.attr("EPSILON") = NIS::EPSILON;
+    m.attr("CONFUSION_NORM") = NIS::CONFUSION_NORM;
+    m.attr("SURVIVAL_WEIGHT") = NIS::SURVIVAL_WEIGHT;
     m.attr("OP_ADD") = NIS::OP_ADD;
     m.attr("OP_SCALE") = NIS::OP_SCALE;
     m.attr("OP_GATE") = NIS::OP_GATE;
     m.attr("OP_REFLECT") = NIS::OP_REFLECT;
     m.attr("OP_JMP") = NIS::OP_JMP;
 
-    m.def("make_morton_order", &make_morton_order);
+
 
     m.attr("STRICT_CPU_ONLY") = (bool)NIS::STRICT_CPU_ONLY;
     m.attr("DEVICE") = NIS::DEVICE;
@@ -3691,7 +3815,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.attr("DISSONANCE_CONFIDENCE_THRESHOLD") = NIS::DISSONANCE_CONFIDENCE_THRESHOLD;
     m.attr("LGH_ENABLED") = (bool)NIS::LGH_ENABLED;
     m.def("geometric_manifold_forward_avx512", [](torch::Tensor p, torch::Tensor m, torch::Tensor s, torch::Tensor c, float f) {
-        return geometric_manifold_forward_avx512(p, m, s, c, f);
+        return geometric_manifold_recall_avx512(p, m, s, c, f);
+    });
+    m.def("geometric_manifold_recall_avx512", [](torch::Tensor p, torch::Tensor m, torch::Tensor s, torch::Tensor c, float f) {
+        return geometric_manifold_recall_avx512(p, m, s, c, f);
     });
     m.attr("EVENT_DRIVEN_ENABLED") = (bool)NIS::EVENT_DRIVEN_ENABLED;
 
@@ -3766,6 +3893,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.attr("REFLEX_DROPOUT_RATE") = NIS::REFLEX_DROPOUT_RATE;
     m.attr("GLOBAL_PULSE_EVERY") = NIS::GLOBAL_PULSE_EVERY;
     m.attr("GLOBAL_PULSE_WEIGHT") = NIS::GLOBAL_PULSE_WEIGHT;
-    m.attr("EVENT_DRIVEN_ENABLED") = (bool)NIS::EVENT_DRIVEN_ENABLED;
+
 
 }

@@ -15,8 +15,10 @@ def is_cuda_available():
             return False
         # Optional: check if NVCC is in path
         return True
-    except:
-        return False
+    except Exception as e:
+        raise RuntimeError(
+            f"CUDA capability probe failed in setup_optimized.py: {type(e).__name__}: {e}"
+        ) from e
 
 cuda_available = is_cuda_available()
 extra_compile_args = {'cxx': []}
