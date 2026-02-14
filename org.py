@@ -23,6 +23,16 @@ if DEVICE.type != "cpu":
     DEVICE = torch.device("cpu")
 
 
+def _require_config_attr(name: str):
+    if not hasattr(Config, name):
+        raise RuntimeError(f"Missing required C++ Config attribute: {name}")
+    return getattr(Config, name)
+
+
+PHENOTYPE_ABI_VERSION = float(_require_config_attr("PHENOTYPE_ABI_VERSION"))
+FWD_SCALARS_MIN = int(_require_config_attr("FWD_SCALARS_MIN"))
+
+
 def init_state(
     L: int,
     R: int,
@@ -215,11 +225,6 @@ class RotaryEmbedding(nn.Module):
         return torch.cos(phase), torch.sin(phase)
 
 
-class _TitansMemory:
-    def reset_memory(self):
-        return None
-
-
 class CognitiveOrganism(nn.Module):
     def __init__(
         self,
@@ -266,8 +271,21 @@ class CognitiveOrganism(nn.Module):
         self.output_dim = 8
         self.current_phase = 0
         self.omega = 0.0
-        self.suggested_lr = float(getattr(Config, "LEARNING_RATE", 1e-4))
-        self.lambda_sparsity = float(getattr(Config, "LAMBDA_STABILITY", 0.01))
+        self._base_lr = float(_require_config_attr("LEARNING_RATE"))
+        self._base_lambda_sparsity = float(_require_config_attr("LAMBDA_STABILITY"))
+        self._base_focus_strength = float(_require_config_attr("LGH_FOCUS_STRENGTH"))
+        self._base_focus_sharpness = float(_require_config_attr("LGH_FOCUS_SHARPNESS"))
+        self._base_trace_gain = float(_require_config_attr("LGH_TRACE_GAIN"))
+        self._base_act_threshold = 0.8
+        self.suggested_lr = self._base_lr
+        self.lambda_sparsity = self._base_lambda_sparsity
+        self.focus_x = 0.0
+        self.focus_y = 0.0
+        self.focus_z = 0.0
+        self.focus_strength = self._base_focus_strength
+        self.focus_sharpness = self._base_focus_sharpness
+        self.trace_gain = self._base_trace_gain
+        self.act_threshold = self._base_act_threshold
         self.mask_sparsity_bias = 0.0
         self.H_cycles = int(getattr(Config, "H_CYCLES", 1))
         self.L_cycles = int(getattr(Config, "L_CYCLES", 1))
@@ -276,7 +294,6 @@ class CognitiveOrganism(nn.Module):
         self._params_dirty = True
         self._preflight_ready = False
         self._fwd_params = None
-        self._fwd_scalars = None
 
         self.bit_to_latent = VNNILinear(8, self.d_s1 * self.C, bias=True, device=self.device)
         self.bridge_s1_to_s2 = VNNILinear(self.d_s1 * self.C, self.d_s2 * self.C, bias=False, device=self.device)
@@ -294,7 +311,6 @@ class CognitiveOrganism(nn.Module):
 
         self.virtual_lab = VirtualLab(enabled=bool(getattr(Config, "VIRTUAL_LAB_ENABLED", False)))
         self.governor = Governor(self.L, self.R, input_dim=self.d_s2 * self.C, device=self.device)
-        self.titans_memory = _TitansMemory()
         self.register_buffer("myelin_sheaths", torch.ones(self.L, self.R, dtype=torch.float32, device=self.device))
         self.register_buffer("step_counter", torch.zeros((), dtype=torch.long, device=self.device))
 
@@ -306,9 +322,11 @@ class CognitiveOrganism(nn.Module):
             )
             curve_len = int(min(max(1, getattr(Config, "LGH_CURVE_LENGTH", 64)), n3 * bins))
             self.register_buffer("_lgh_curve_indices", torch.arange(curve_len, dtype=torch.long, device=self.device))
+            self.register_buffer("_lgh_synaptic_trace", torch.zeros(n3 * bins, dtype=torch.float32, device=self.device))
         else:
             self.lgh_manifold_morton = None
             self.register_buffer("_lgh_curve_indices", torch.empty(0, dtype=torch.long, device=self.device))
+            self.register_buffer("_lgh_synaptic_trace", torch.empty(0, dtype=torch.float32, device=self.device))
 
         self.register_buffer(
             "H_buffer",
@@ -369,6 +387,7 @@ class CognitiveOrganism(nn.Module):
 
         lgh_m = self.lgh_manifold_morton if self.lgh_manifold_morton is not None else torch.empty(0, device=self.device)
         lgh_idx = self._lgh_curve_indices if self._lgh_curve_indices.numel() > 0 else torch.empty(0, dtype=torch.long, device=self.device)
+        lgh_trace = self._lgh_synaptic_trace if self._lgh_synaptic_trace.numel() > 0 else torch.empty(0, dtype=torch.float32, device=self.device)
 
         self._fwd_params = [
             bp_w, bp_s, bp_b,
@@ -382,62 +401,106 @@ class CognitiveOrganism(nn.Module):
             self._stacked_halt_w.view(self.L, -1),
             self._stacked_halt_b.view(self.L),
             ro_w, ro_s, ro_b,
-            lgh_m, lgh_idx, self.governor.usage,
+            lgh_m, lgh_idx, self.governor.usage, lgh_trace,
         ]
-        self._fwd_scalars = torch.tensor(
+        self._params_dirty = False
+
+    def _refresh_phenotype_controls(self):
+        if not _ACCEL.has("phenotype_from_genes_io"):
+            raise RuntimeError("Missing required C++ op 'phenotype_from_genes_io'.")
+
+        genes = self.governor.get_all_expressions().to(dtype=torch.float32, device="cpu").contiguous()
+        context = torch.tensor(
             [
-                float(self.L), float(self.R), float(self.d_s1), float(self.d_s2), float(self.C),
-                float(getattr(Config, "LIF_DECAY", 0.95)),
-                float(getattr(Config, "LIF_THRESHOLD", 0.5)),
-                float(getattr(Config, "HALT_THRESHOLD", 0.5)),
-                float(self.lambda_sparsity),
-                float(getattr(Config, "LGH_TRACE_GAIN", 0.2)),
-                float(getattr(Config, "PARAM_COST_SCALE", 0.01)),
-                float(getattr(Config, "PHASE_0_KEEP_RATIO", 0.5)),
+                float(self._base_lambda_sparsity),
+                float(self._base_focus_strength),
+                float(self._base_focus_sharpness),
+                float(self.omega),
+                float(self._get_tps_pressure()),
                 float(self.current_phase),
-                0.8,
+                float(self._base_lr),
+                float(self._base_trace_gain),
+                float(self._base_act_threshold),
             ],
             dtype=torch.float32,
             device="cpu",
         )
-        self._params_dirty = False
+        controls = _ACCEL.call(
+            "phenotype_from_genes_io",
+            genes,
+            context,
+            tensors=(genes, context),
+        )
+        if not isinstance(controls, torch.Tensor):
+            raise RuntimeError(
+                "phenotype_from_genes_io returned invalid output type: "
+                f"{type(controls).__name__}."
+            )
+        controls = controls.to(dtype=torch.float32, device="cpu").contiguous()
+        if controls.numel() < 10:
+            raise RuntimeError(
+                "phenotype_from_genes_io returned insufficient controls. "
+                f"expected>=10 got={controls.numel()}."
+            )
+        if not torch.isfinite(controls).all():
+            raise RuntimeError("phenotype_from_genes_io returned non-finite phenotype controls.")
+
+        self.lambda_sparsity = float(controls[0].item())
+        self.focus_x = float(controls[1].item())
+        self.focus_y = float(controls[2].item())
+        self.focus_z = float(controls[3].item())
+        self.focus_strength = float(controls[4].item())
+        self.focus_sharpness = float(controls[5].item())
+        self.trace_gain = float(controls[6].item())
+        self.act_threshold = float(controls[7].item())
+        self.suggested_lr = float(controls[8].item())
+        abi_val = float(controls[9].item())
+        if abs(abi_val - PHENOTYPE_ABI_VERSION) > 1e-5:
+            raise RuntimeError(
+                "phenotype_from_genes_io ABI mismatch: "
+                f"expected={PHENOTYPE_ABI_VERSION:.6f} got={abi_val:.6f}."
+            )
+
+    def _build_forward_scalars(self):
+        scalars = torch.tensor(
+            [
+                float(self.L),
+                float(self.R),
+                float(self.d_s1),
+                float(self.d_s2),
+                float(self.C),
+                float(getattr(Config, "LIF_DECAY", 0.95)),
+                float(getattr(Config, "LIF_THRESHOLD", 0.5)),
+                float(getattr(Config, "HALT_THRESHOLD", 0.5)),
+                float(self.lambda_sparsity),
+                float(self.trace_gain),
+                float(getattr(Config, "PARAM_COST_SCALE", 0.01)),
+                float(getattr(Config, "PHASE_0_KEEP_RATIO", 0.5)),
+                float(self.current_phase),
+                float(self.act_threshold),
+                float(self.focus_x),
+                float(self.focus_y),
+                float(self.focus_z),
+                float(self.focus_strength),
+                float(self.focus_sharpness),
+                float(self.omega),
+                float(self._get_tps_pressure()),
+                float(PHENOTYPE_ABI_VERSION),
+            ],
+            dtype=torch.float32,
+            device="cpu",
+        )
+        if scalars.numel() != FWD_SCALARS_MIN:
+            raise RuntimeError(
+                "Forward scalar ABI mismatch in org.py. "
+                f"expected={FWD_SCALARS_MIN} got={scalars.numel()}."
+            )
+        return scalars
 
     def update_phenotype(self):
-        self.suggested_lr = float(getattr(Config, "LEARNING_RATE", self.suggested_lr))
-        self._pack_forward_params()
-
-    def _compute_dyn_halt_threshold(self, tps_pressure: Optional[float] = None):
-        base = float(getattr(Config, "HALT_THRESHOLD", 0.5))
-        if tps_pressure is None:
-            return base
-        return float(max(0.05, min(0.99, base + 0.05 * float(tps_pressure))))
-
-    def _dynamic_cycle_counts(self):
-        return max(1, int(self.H_cycles)), max(1, int(self.L_cycles))
-
-    def _lgh_manifold_recall(self, p_brain: torch.Tensor):
-        if self.lgh_manifold_morton is None or self._lgh_curve_indices.numel() == 0:
-            return torch.zeros_like(p_brain)
-        if not _ACCEL.has("geometric_manifold_forward_avx512", p_brain):
-            raise RuntimeError("Missing required C++ op 'geometric_manifold_forward_avx512'.")
-        return _ACCEL.call(
-            "geometric_manifold_forward_avx512",
-            p_brain,
-            self.lgh_manifold_morton,
-            torch.empty(0, device=self.device),
-            self._lgh_curve_indices,
-            float(getattr(Config, "LGH_FOCUS_SHARPNESS", 2.0)),
-            tensors=(p_brain, self.lgh_manifold_morton, self._lgh_curve_indices),
-        )
-
-    def _quantize_lgh_manifold(self, bits: int = 8, *args, **kwargs):
-        if self.lgh_manifold_morton is None or self.lgh_manifold_morton.numel() == 0:
-            return None, None
-        qmax = 127.0 if int(bits) >= 8 else 7.0
-        absmax = self.lgh_manifold_morton.abs().amax(dim=1).clamp_min(1e-8)
-        scale = absmax / qmax
-        q = torch.round(self.lgh_manifold_morton / scale.unsqueeze(-1)).clamp(-qmax, qmax).to(torch.int8).contiguous()
-        return q, scale.contiguous()
+        self._refresh_phenotype_controls()
+        if self._params_dirty or self._fwd_params is None:
+            self._pack_forward_params()
 
     def _preflight_fast_path(self):
         x = torch.zeros(1, 4, 8, dtype=torch.float32, device=self.device)
@@ -530,10 +593,10 @@ class CognitiveOrganism(nn.Module):
         x_bits = self._to_bits(x)
         B = x_bits.size(0)
         H_state = self._prepare_state(H, B)
-        if self._params_dirty or self._fwd_params is None or self._fwd_scalars is None:
+        if self._params_dirty or self._fwd_params is None:
             self._pack_forward_params()
-        scalars = self._fwd_scalars.clone()
-        scalars[12] = float(self.current_phase)
+        self._refresh_phenotype_controls()
+        scalars = self._build_forward_scalars()
 
         logits, H_next, cost, gate = _ACCEL.call(
             "unified_dispatch_io",

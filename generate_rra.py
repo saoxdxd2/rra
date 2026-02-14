@@ -18,13 +18,16 @@ def load_master_checkpoint(model, path="checkpoints/latest.pt"):
         if 'model_state_dict' not in ckpt:
             raise RuntimeError("Checkpoint missing required key 'model_state_dict'.")
         
-        # Sanitization (Same as train_rra.py just in case)
+        # Strict checkpoint compatibility: no key sanitization fallback.
         state_dict = ckpt['model_state_dict']
         keys_to_remove = [k for k in state_dict.keys() if 'w_q' in k or 'scale_w' in k]
         if keys_to_remove:
-            print(f"Sanitizer: Removed {len(keys_to_remove)} quantization keys.")
-            for k in keys_to_remove:
-                del state_dict[k]
+            preview = ", ".join(keys_to_remove[:8])
+            extra = "" if len(keys_to_remove) <= 8 else f" (+{len(keys_to_remove) - 8} more)"
+            raise RuntimeError(
+                "Checkpoint contains deprecated quantization keys; strict inference loading rejects fallback sanitization. "
+                f"keys={preview}{extra}"
+            )
 
         model_state = model.state_dict()
         missing_keys = [k for k in model_state.keys() if k not in state_dict]

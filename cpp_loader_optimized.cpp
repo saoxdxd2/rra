@@ -26,6 +26,11 @@ namespace Config {
     constexpr float MAX_RELu = 10.0f; // Clip value
 }
 
+namespace RuntimeABI {
+    constexpr float PHENOTYPE_ABI_VERSION = 2.0f;
+    constexpr int64_t FWD_SCALARS_MIN = 22;
+}
+
 namespace py = pybind11;
 
 // =========================================================================

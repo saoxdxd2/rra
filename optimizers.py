@@ -50,8 +50,8 @@ class AdEMAMix(optim.Optimizer):
     - C++ acceleration via cpp_loader_optimized
     """
     def __init__(self, params, lr=1e-4, beta1_fast=0.9, beta1_slow=0.9999, beta2=0.999, eps=1e-8, weight_decay=0.0, alpha=5.0, sign_sgd=False):
-        # Note: alpha=5.0 is default "Mix" factor. 
-        # In train_rra.py, 'omega' was passed to step(), overriding alpha.
+        # Note: alpha=5.0 is default "Mix" factor.
+        # In the training pipeline, 'omega' can be passed to step(), overriding alpha.
         # We store alpha in defaults for non-step-specified usage.
         defaults = dict(lr=lr, beta1_fast=beta1_fast, beta1_slow=beta1_slow, beta2=beta2, eps=eps, weight_decay=weight_decay, alpha=alpha, sign_sgd=sign_sgd)
         super().__init__(params, defaults)
