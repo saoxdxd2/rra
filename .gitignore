@@ -1,0 +1,26 @@
+tmp*/
+
+# Build artifacts
+build/
+build-native/
+dist/
+DeepSeek-OCR-2-Safetensors/
+*.egg-info/
+*.obj
+*.exe
+*.pdb
+*.ilk
+*.bin
+*.o
+*.a
+# Data and Checkpoints
+checkpoints/
+logs/
+dataset.txt
+distilled_data_stream.pt
+enwik8
+*.pt
+*.tmp
+*.txt
+!CMakeLists.txt
+!README.md
