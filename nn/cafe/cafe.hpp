@@ -46,6 +46,10 @@ public:
     // 1D Optimal Transport (CDF Matching) for \mu mass
     void apply_optimal_transport(float total_mass);
 
+    // Tensor Marshalling for Spectral Geometrics
+    s4m::Tensor to_tensor() const;
+    void apply_delta(const s4m::Tensor& delta);
+
     std::vector<FieldChunk>& get_chunks() { return chunks_; }
     const std::vector<FieldChunk>& get_chunks() const { return chunks_; }
 

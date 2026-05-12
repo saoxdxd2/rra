@@ -2,26 +2,22 @@
 
 #include "cafe/cafe.hpp"
 #include "aether/aether.hpp"
-#include "sao_core.hpp"
+#include "../include/nis_engine.hpp"
 #include <vector>
 #include <memory>
+#include <array>
 
 namespace s4m {
 
 class HybridBlock {
 public:
-    HybridBlock(size_t num_chunks, size_t num_nis_planes);
+    HybridBlock(size_t num_chunks);
 
     // Forward pass processes the entire CAFE field through one layer of depth.
-    void forward();
+    void forward(core::NISEngine& nis_engine);
 
     // The continuous PDE field
     cafe::CafeField cafe_field;
-
-    // The discrete NIS memory planes for this block
-    std::vector<uint64_t> nis_planes;
-
-    size_t num_planes;
     
     // AETHER Spectral Field Operator
     std::unique_ptr<rra::nn::aether::SpectralGeometricPropagator> aether_propagator;
@@ -29,7 +25,7 @@ public:
 
 class HybridEngine {
 public:
-    HybridEngine(size_t num_blocks, size_t num_chunks, size_t num_nis_planes);
+    HybridEngine(size_t num_blocks, size_t num_chunks);
 
     // Forward pass through the deep stack of HybridBlocks
     void forward();
@@ -42,8 +38,10 @@ public:
 
     // Predict the next byte from the output layer
     uint8_t predict() const;
+    std::array<float, 256> get_logits() const;
 
     std::vector<HybridBlock> blocks;
+    core::NISEngine global_memory;
 };
 
 } // namespace s4m

@@ -122,7 +122,7 @@ void run_launcher(ThreadedMultiFileDataset& dataset) {
         const size_t NUM_CHUNKS = 16; // 16 chunks * 32 vec * 16 floats = context capacity
         const size_t NUM_PLANES = 512; // 512-bit attractor memory
         
-        HybridEngine engine(NUM_BLOCKS, NUM_CHUNKS, NUM_PLANES);
+        HybridEngine engine(NUM_BLOCKS, NUM_CHUNKS);
 
         float bpc_ema = 8.0f, accuracy_ema = 0.0f;
         uint64_t processed = 0;
@@ -143,26 +143,50 @@ void run_launcher(ThreadedMultiFileDataset& dataset) {
             // 2. Forward Pass (Continuous -> Discrete -> Spectral AETHER)
             engine.forward();
 
-            // 3. Unified Prediction
-            uint8_t predicted_byte = engine.predict();
-            float p_act = static_cast<float>(predicted_byte) / 255.0f;
-            if (p_act == 0.0f) p_act = 1e-8f;
+            // 3. Unified Prediction (CrossEntropy)
+            auto logits = engine.get_logits();
             
-            // 4. Backward Pass / Optimal Transport Error Feedback
-            float target_val = static_cast<float>(target) / 255.0f;
-            float error = std::abs(p_act - target_val);
-            energy_gradients.back() = error; // Inject error into the last chunk
+            // Softmax
+            float max_logit = -1e9f;
+            for (int i = 0; i < 256; ++i) {
+                if (logits[i] > max_logit) max_logit = logits[i];
+            }
+            
+            float sum_exp = 0.0f;
+            std::array<float, 256> probs;
+            for (int i = 0; i < 256; ++i) {
+                probs[i] = std::exp(logits[i] - max_logit);
+                sum_exp += probs[i];
+            }
+            
+            uint8_t predicted_byte = 0;
+            float max_prob = -1.0f;
+            for (int i = 0; i < 256; ++i) {
+                probs[i] /= sum_exp;
+                if (probs[i] > max_prob) {
+                    max_prob = probs[i];
+                    predicted_byte = static_cast<uint8_t>(i);
+                }
+            }
+            
+            float target_prob = probs[target];
+            if (target_prob == 0.0f) target_prob = 1e-8f;
+            float loss = -std::log(target_prob);
+            
+            // 4. Backward Pass / Energy Shaping
+            // We use the cross entropy loss magnitude as the global error signal for the last chunk
+            energy_gradients.back() = loss;
             engine.backward(energy_gradients);
 
-            bpc_ema = bpc_ema * 0.995f + (-std::log2f(p_act)) * 0.005f;
+            bpc_ema = bpc_ema * 0.995f + (-std::log2f(target_prob)) * 0.005f;
             accuracy_ema = accuracy_ema * 0.99f + ((predicted_byte == target) ? 0.01f : 0.0f);
 
             if (processed % 4096 == 0) { 
                 auto now = std::chrono::high_resolution_clock::now();
                 float fps = 4096.0f / std::chrono::duration<float>(now - start_time).count();
                 start_time = now;
-                std::printf("\r[TMUL] BPC: %.3f | Acc: %5.2f%% | Speed: %5.0f iter/s ",
-                            bpc_ema, accuracy_ema * 100.0f, fps);
+                std::printf("\r[TMUL] Loss: %.3f | BPC: %.3f | Acc: %5.2f%% | MemBank: %zu | Speed: %5.0f iter/s ",
+                            loss, bpc_ema, accuracy_ema * 100.0f, engine.global_memory.get_memory_size(), fps);
                 std::fflush(stdout);
             }
             processed += 64;

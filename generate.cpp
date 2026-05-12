@@ -17,7 +17,7 @@ int main(int argc, char** argv) {
     const size_t NUM_CHUNKS = 64; 
     const size_t NUM_PLANES = 512; 
 
-    HybridEngine engine(NUM_BLOCKS, NUM_CHUNKS, NUM_PLANES);
+    HybridEngine engine(NUM_BLOCKS, NUM_CHUNKS);
 
     std::string prompt = argv[1];
     int length = (argc > 2) ? std::stoi(argv[2]) : 100;
