@@ -35,14 +35,11 @@ public:
     Dataset(const std::string& directory) {
         if (!std::filesystem::exists(directory)) throw std::runtime_error("Dataset path not found.");
         if (std::filesystem::is_directory(directory)) {
-            for (const auto& entry : std::filesystem::recursive_directory_iterator(directory)) {
+            for (const auto& entry : std::filesystem::recursive_directory_iterator(directory))
                 if (entry.is_regular_file() && entry.path().extension() == ".txt") load_file(entry.path().string());
-            }
-        } else {
-            load_file(directory);
-        }
+        } else load_file(directory);
+        if (files_.empty()) throw std::runtime_error("No files found.");
     }
-
     ~Dataset() {
         for (auto& f : files_) {
 #ifdef _WIN32
@@ -55,7 +52,6 @@ public:
 #endif
         }
     }
-
     void load_file(const std::string& filepath) {
         FileEntry f; f.path = filepath;
 #ifdef _WIN32
@@ -69,13 +65,27 @@ public:
         f.fd = open(filepath.c_str(), O_RDONLY); struct stat sb; fstat(f.fd, &sb); f.size = static_cast<size_t>(sb.st_size);
         f.data_ptr = static_cast<const uint8_t*>(mmap(NULL, f.size, PROT_READ, MAP_PRIVATE, f.fd, 0));
 #endif
-        files_.push_back(f); 
-        total_size_ += f.size;
+        files_.push_back(f); total_size_ += f.size;
     }
+    size_t current_file_idx = 0, current_pos = 0;
 
-    size_t size() const { return total_size_; }
-    
-    // Simplistic flat data accessor for demonstration
+    bool fetch_batch(const uint8_t*& out_ptr, size_t batch_size, uint8_t& out_target) {
+        const auto* f = &files_[current_file_idx];
+        if (current_pos + batch_size >= f->size) {
+            current_file_idx = (current_file_idx + 1) % files_.size();
+            current_pos = 0;
+            f = &files_[current_file_idx];
+            out_ptr = f->data_ptr;
+            out_target = f->data_ptr[batch_size];
+            current_pos = 64; 
+            return true;
+        }
+        out_ptr = f->data_ptr + current_pos;
+        out_target = f->data_ptr[current_pos + batch_size];
+        current_pos += 64; 
+        return false;
+    }
+    size_t total_size() const { return total_size_; }
     const uint8_t* data(size_t index = 0) const { 
         if (files_.empty()) return nullptr;
         return files_[0].data_ptr; 

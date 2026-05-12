@@ -3,8 +3,8 @@
 #endif
 
 #include "nn/hybrid_engine.hpp"
-#include "core_math.hpp"
-#include "byte_field.hpp"
+#include "include/core_math.hpp"
+#include "include/byte_field.hpp"
 #include <iostream>
 #include <fstream>
 #include <vector>
@@ -13,6 +13,7 @@
 #include <format>
 #include <numeric>
 #include <algorithm>
+#include <cmath>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -90,21 +91,33 @@ int main(int argc, char** argv) {
 
     auto start_time = std::chrono::high_resolution_clock::now();
 
-    while (cursor + 64 <= total_size) {
+    while (cursor + 64 < total_size) {
         // High-Throughput CAFE-NIS Ingest pass
         engine.ingest(data + cursor, 64);
         engine.forward();
 
-        uint8_t predicted = engine.predict();
-        uint8_t actual = data[cursor];
-        
-        float p = static_cast<float>(predicted) / 255.0f;
-        p = std::max(1e-8f, p);
+        uint8_t target = data[cursor + 64];
 
-        for (int b_idx = 0; b_idx < 64 && (cursor + b_idx) < total_size; ++b_idx) {
-            bpc_sum += static_cast<double>(-std::log2f(p));
-            bpc_count++;
+        auto logits = engine.get_logits();
+        float max_logit = -1e9f;
+        for (int i = 0; i < 256; ++i) {
+            if (logits[i] > max_logit) max_logit = logits[i];
         }
+        
+        float sum_exp = 0.0f;
+        std::array<float, 256> probs;
+        for (int i = 0; i < 256; ++i) {
+            probs[i] = std::exp(logits[i] - max_logit);
+            sum_exp += probs[i];
+        }
+        for (int i = 0; i < 256; ++i) probs[i] /= sum_exp;
+        
+        float p = probs[target];
+        if (p == 0.0f) p = 1e-8f;
+
+        bpc_sum += static_cast<double>(-std::log2f(p));
+        bpc_count++;
+        
         bpc_ema = bpc_ema * 0.99f + static_cast<float>(-std::log2f(p)) * 0.01f;
 
         if (batch_count % 100 == 0) {

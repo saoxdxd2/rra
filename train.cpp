@@ -1,5 +1,7 @@
 #include "nn/hybrid_engine.hpp"
 #include "include/core_math.hpp"
+#include "include/dataset.hpp"
+#include "include/manifold_ipc.hpp"
 #include <iostream>
 #include <fstream>
 #include <thread>
@@ -25,81 +27,6 @@ using namespace s4m;
 using namespace s4m::core;
 namespace fs = std::filesystem;
 
-// ---------------------------------------------------------------------------
-// High-Throughput Memory Mapped Dataset
-// ---------------------------------------------------------------------------
-class ThreadedMultiFileDataset {
-private:
-    struct FileEntry {
-        std::string path;
-        size_t size;
-        const uint8_t* data_ptr = nullptr;
-#ifdef _WIN32
-        HANDLE hFile = INVALID_HANDLE_VALUE;
-        HANDLE hMap  = NULL;
-#else
-        int fd = -1;
-#endif
-    };
-    std::vector<FileEntry> files_;
-    size_t total_size_ = 0;
-public:
-    ThreadedMultiFileDataset(const std::string& directory) {
-        if (!fs::exists(directory)) throw std::runtime_error("Dataset path not found.");
-        if (fs::is_directory(directory)) {
-            for (const auto& entry : fs::recursive_directory_iterator(directory))
-                if (entry.is_regular_file() && entry.path().extension() == ".txt") load_file(entry.path().string());
-        } else load_file(directory);
-        if (files_.empty()) throw std::runtime_error("No files found.");
-    }
-    ~ThreadedMultiFileDataset() {
-        for (auto& f : files_) {
-#ifdef _WIN32
-            if (f.data_ptr) UnmapViewOfFile(f.data_ptr);
-            if (f.hMap) CloseHandle(f.hMap);
-            if (f.hFile != INVALID_HANDLE_VALUE) CloseHandle(f.hFile);
-#else
-            if (f.data_ptr && f.data_ptr != MAP_FAILED) munmap(const_cast<uint8_t*>(f.data_ptr), f.size);
-            if (f.fd != -1) close(f.fd);
-#endif
-        }
-    }
-    void load_file(const std::string& filepath) {
-        FileEntry f; f.path = filepath;
-#ifdef _WIN32
-        f.hFile = CreateFileA(filepath.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-        if (f.hFile == INVALID_HANDLE_VALUE) return;
-        LARGE_INTEGER sz; GetFileSizeEx(f.hFile, &sz); f.size = static_cast<size_t>(sz.QuadPart);
-        if (f.size == 0) { CloseHandle(f.hFile); return; }
-        f.hMap = CreateFileMappingA(f.hFile, NULL, PAGE_READONLY, 0, 0, NULL);
-        f.data_ptr = static_cast<const uint8_t*>(MapViewOfFile(f.hMap, FILE_MAP_READ, 0, 0, 0));
-#else
-        f.fd = open(filepath.c_str(), O_RDONLY); struct stat sb; fstat(f.fd, &sb); f.size = static_cast<size_t>(sb.st_size);
-        f.data_ptr = static_cast<const uint8_t*>(mmap(NULL, f.size, PROT_READ, MAP_PRIVATE, f.fd, 0));
-#endif
-        files_.push_back(f); total_size_ += f.size;
-    }
-    size_t current_file_idx = 0, current_pos = 0;
-
-    bool fetch_batch(const uint8_t*& out_ptr, size_t batch_size, uint8_t& out_target) {
-        const auto* f = &files_[current_file_idx];
-        if (current_pos + batch_size >= f->size) {
-            current_file_idx = (current_file_idx + 1) % files_.size();
-            current_pos = 0;
-            f = &files_[current_file_idx];
-            out_ptr = f->data_ptr;
-            out_target = f->data_ptr[batch_size];
-            current_pos = 64; 
-            return true;
-        }
-        out_ptr = f->data_ptr + current_pos;
-        out_target = f->data_ptr[current_pos + batch_size];
-        current_pos += 64; 
-        return false;
-    }
-    size_t total_size() const { return total_size_; }
-};
-
 struct SimpleStopSource {
     std::atomic<bool> stop_requested{false};
     void request_stop() { stop_requested = true; }
@@ -115,11 +42,11 @@ BOOL WINAPI CtrlHandler(DWORD fdw) {
 }
 #endif
 
-void run_launcher(ThreadedMultiFileDataset& dataset) {
+void run_launcher(rra::Dataset& dataset) {
     try {
         // Dual-Vector CAFE-NIS Engine
         const size_t NUM_BLOCKS = 4;
-        const size_t NUM_CHUNKS = 16; // 16 chunks * 32 vec * 16 floats = context capacity
+        const size_t NUM_CHUNKS = 64; // 64 chunks * 32 vec * 16 floats = context capacity
         const size_t NUM_PLANES = 512; // 512-bit attractor memory
         
         HybridEngine engine(NUM_BLOCKS, NUM_CHUNKS);
@@ -128,6 +55,18 @@ void run_launcher(ThreadedMultiFileDataset& dataset) {
         uint64_t processed = 0;
 
         std::cout << "[SYNC] Dual-Vector Engine Online. Initiating Hybrid Sweep.\n";
+        
+        // Setup IPC
+        HANDLE hIpcMap = nullptr;
+        rra::gnf::ipc::ManifoldIPCData* ipc_data = nullptr;
+#ifdef _WIN32
+        hIpcMap = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, sizeof(rra::gnf::ipc::ManifoldIPCData), rra::gnf::ipc::IPC_MAP_NAME);
+        if (hIpcMap) {
+            ipc_data = static_cast<rra::gnf::ipc::ManifoldIPCData*>(MapViewOfFile(hIpcMap, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(rra::gnf::ipc::ManifoldIPCData)));
+            if (ipc_data) std::cout << "[IPC] Manifold UI link established.\n";
+        }
+#endif
+
         auto start_time = std::chrono::high_resolution_clock::now();
 
         std::vector<float> energy_gradients(NUM_CHUNKS, 0.0f);
@@ -188,9 +127,23 @@ void run_launcher(ThreadedMultiFileDataset& dataset) {
                 std::printf("\r[TMUL] Loss: %.3f | BPC: %.3f | Acc: %5.2f%% | MemBank: %zu | Speed: %5.0f iter/s ",
                             loss, bpc_ema, accuracy_ema * 100.0f, engine.global_memory.get_memory_size(), fps);
                 std::fflush(stdout);
+                
+                if (ipc_data) {
+                    ipc_data->current_ce_loss.store(loss, std::memory_order_relaxed);
+                    ipc_data->frame_counter.fetch_add(1, std::memory_order_relaxed);
+                    for(int i=0; i<256; ++i) {
+                        ipc_data->byte_coords[i].x = probs[i];
+                        ipc_data->byte_coords[i].y = static_cast<float>(i) / 255.0f;
+                    }
+                }
             }
             processed += 64;
         }
+        
+#ifdef _WIN32
+        if (ipc_data) UnmapViewOfFile(ipc_data);
+        if (hIpcMap) CloseHandle(hIpcMap);
+#endif
     } catch (const std::exception& e) { std::cerr << "[ERROR] " << e.what() << "\n"; }
 }
 
@@ -201,7 +154,7 @@ int main(int argc, char** argv) {
     SetConsoleCtrlHandler(CtrlHandler, TRUE);
 #endif
     try {
-        ThreadedMultiFileDataset ds(path);
+        rra::Dataset ds(path);
         std::thread t([&ds]() { run_launcher(ds); });
         t.join(); return 0;
     } catch (const std::exception& e) { std::cerr << "[FATAL] " << e.what() << "\n"; return 1; }
