@@ -4,7 +4,6 @@
 
 #include "nn/hybrid_engine.hpp"
 #include "include/core_math.hpp"
-#include "include/byte_field.hpp"
 #include <iostream>
 #include <fstream>
 #include <vector>

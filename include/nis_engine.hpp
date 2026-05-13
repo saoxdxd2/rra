@@ -1,7 +1,7 @@
 #pragma once
 
 #include <vector>
-#include "sao_core.hpp"
+#include "neural_types.hpp"
 
 namespace s4m::core {
 
