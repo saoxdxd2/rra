@@ -1,0 +1,274 @@
+import os
+import time
+
+try:
+    import jax
+    import jax.numpy as jnp
+    from jax import random, vmap, jit
+except ImportError:
+    print("Please install jax: !pip install jax jaxlib")
+    exit(1)
+
+print(f"JAX running on: {jax.devices()}")
+print("==================================================================")
+print("TPU v5e-1 NLP Engine (SC-V8 + Universal Plasticity + Homeostasis)")
+print("==================================================================")
+
+# ==============================================================================
+# 1. FROZEN UNIVERSAL PLASTICITY MLP (369 Parameters from TPU Discovery)
+# ==============================================================================
+# This is the EXACT MLP discovered through massive TPU evolution.
+# Input: [trace_v_pre, trace_v_post, trace_Ca, reward] -> Output: delta_w
+
+W1 = jnp.array([
+    [-0.3629184365272522, 0.22264432907104492, -0.48989230394363403, 0.2930605411529541, -0.14317190647125244, -0.21407383680343628, -0.3447994589805603, 0.2492944449186325, -0.27117830514907837, -0.2981727123260498, 0.032600998878479004, 0.09715521335601807, 0.31673604249954224, 0.20882076025009155, 0.37666988372802734, 0.4512891173362732],
+    [0.43994444608688354, -0.376049280166626, -0.27517014741897583, 0.1885174959897995, -0.38384395837783813, 0.41974425315856934, 0.0767030119895935, -0.35801684856414795, 0.5002720355987549, -0.16556048393249512, -0.20847421884536743, 0.4140074551105499, -0.4758610725402832, 0.4287518858909607, -0.09284812211990356, 0.39090389013290405],
+    [0.38936150074005127, 0.31405889987945557, -0.22750204801559448, 0.3411502242088318, -0.04046601057052612, -0.1572086215019226, 0.26763033866882324, 0.4761238396167755, 0.6014629602432251, -0.02528280019760132, 0.31671053171157837, -0.4113791584968567, -0.03021601215004921, -0.11428970098495483, 0.42147213220596313, -0.021322712302207947],
+    [-0.4248473048210144, 0.21413779258728027, -0.43471384048461914, -0.47503727674484253, -0.43394142389297485, 0.09027713537216187, -0.06775176525115967, 0.2785853147506714, 0.11079269647598267, -0.06622314453125, 0.16444909572601318, 0.2909180819988251, 0.4895424246788025, 0.31771403551101685, 0.42175447940826416, -0.17003470659255981],
+], dtype=jnp.float32)
+
+B1 = jnp.array([-0.09627240896224976, 0.04738050699234009, 0.2727903127670288, 0.3142290711402893, -0.30766481161117554, -0.007753193378448486, 0.2064623236656189, 0.30815744400024414, 0.07231497764587402, 0.12693405151367188, -0.4448511600494385, -0.3838866949081421, -0.03394967317581177, -0.48612648248672485, 0.4606032371520996, 0.3292856216430664], dtype=jnp.float32)
+
+W2 = jnp.array([
+    [0.016851156949996948, -0.20117110013961792, 0.2220742404460907, 0.08110874891281128, -0.07120338082313538, -0.0785493552684784, -0.06612232327461243, -0.06664207577705383, -0.018391907215118408, 0.034171104431152344, -0.11693534255027771, 0.15636342763900757, 0.21107381582260132, -0.006239414215087891, 0.05003628134727478, 0.14844459295272827],
+    [-0.1660679578781128, 0.15006393194198608, -0.17211678624153137, 0.12630245089530945, 0.06988435983657837, -0.19868645071983337, -0.03935819864273071, 0.07275435328483582, 0.20460575819015503, 0.09369516372680664, -0.16351762413978577, -0.1997237503528595, 0.02051982283592224, -0.07432585954666138, 0.05736386775970459, 0.15636664628982544],
+    [-0.06310248374938965, 0.0754496157169342, 0.21243026852607727, -0.17305302619934082, 0.0192490816116333, -0.008954286575317383, 0.05520334839820862, -0.1662866175174713, -0.20136603713035583, -0.24590370059013367, 0.1116454005241394, 0.07804405689239502, 0.07805266976356506, 0.06759360432624817, 0.22033092379570007, 0.24312996864318848],
+    [0.18871024250984192, 0.2184232771396637, 0.03321760892868042, -0.04426947236061096, -0.15791523456573486, -0.14747223258018494, -0.16166061162948608, -0.19939151406288147, -0.15120407938957214, 0.028048396110534668, 0.236479252576828, -0.2323136329650879, -0.0588720440864563, -0.01672804355621338, -0.19710564613342285, 0.0416640043258667],
+    [-0.21292251348495483, 0.048294633626937866, 0.19306683540344238, -0.09732988476753235, -0.05703023076057434, -0.10157737135887146, -0.05590987205505371, -0.14865753054618835, 0.1378576159477234, -0.1669645607471466, -0.061529457569122314, -0.15888500213623047, -0.16003450751304626, -0.16818368434906006, 0.23743200302124023, 0.109333336353302],
+    [0.1606968641281128, -0.19429177045822144, -0.18271726369857788, 0.14925134181976318, -0.18480876088142395, 0.21739447116851807, 0.0315973162651062, -0.2260562777519226, 0.027584224939346313, -0.1403484046459198, 0.052745521068573, 0.15663009881973267, 0.2166212499141693, 0.11584949493408203, 0.039405614137649536, 0.18628475069999695],
+    [-0.19808214902877808, 0.10931345820426941, -0.06318044662475586, 0.056831300258636475, -0.16605675220489502, -0.0025443434715270996, 0.1136624813079834, -0.23893597722053528, 0.054541438817977905, 0.009485095739364624, -0.2423439919948578, -0.04880410432815552, -0.1624646782875061, 0.189541757106781, 0.23111209273338318, -0.17189133167266846],
+    [0.17224901914596558, 0.15997859835624695, -0.05753001570701599, -0.07259681820869446, -0.007814556360244751, -0.1459670066833496, 0.21992331743240356, -0.22633317112922668, 0.2205524444580078, 0.14055639505386353, 0.01989307999610901, 0.17470616102218628, 0.21780818700790405, 0.19181063771247864, -0.12052130699157715, 0.1090465784072876],
+    [-0.1234150230884552, -0.010517030954360962, 0.1860606074333191, 0.1425911784172058, -0.03814297914505005, 0.07463780045509338, -0.23796269297599792, -0.0856080949306488, 0.07186251878738403, -0.03374972939491272, 0.03867155313491821, -0.022067546844482422, -0.13963881134986877, 0.1560477912425995, -0.003215879201889038, 0.0005006790161132812],
+    [0.1655750274658203, -0.16900011897087097, -0.20790520310401917, -0.06616410613059998, -0.033538818359375, -0.04819950461387634, -0.18783950805664062, -0.026461541652679443, -0.22085434198379517, -0.10623559355735779, 0.1341717541217804, 0.16560781002044678, -0.23045507073402405, -0.1281125545501709, 0.0875093936920166, 0.09103992581367493],
+    [-0.22010508179664612, 0.05749049782752991, 0.06368154287338257, -0.08529141545295715, -0.10067582130432129, -0.1952027678489685, 0.004292309284210205, 0.05564063787460327, -0.2403673529624939, -0.06836804747581482, -0.09800082445144653, 0.0008492767810821533, 0.06476700305938721, -0.2329983115196228, -0.20295602083206177, 0.13621202111244202],
+    [-0.03736528754234314, -0.1644621193408966, 0.07793664932250977, 0.11603790521621704, -0.13297992944717407, -0.06711447238922119, -0.08856478333473206, -0.05564197897911072, -0.019558221101760864, -0.23532938957214355, 0.16950058937072754, 0.19836395978927612, -0.09526246786117554, 0.025431782007217407, 0.20483750104904175, -0.03970184922218323],
+    [-0.013565361499786377, -0.13973090052604675, 0.044809699058532715, -0.0960911214351654, 0.06767791509628296, -0.10694694519042969, -0.04395204782485962, 0.22023668885231018, 0.06468731164932251, 0.008682847023010254, -0.07683444023132324, -0.0314556360244751, -0.008542180061340332, 0.12204700708389282, -0.15614357590675354, 0.19027161598205566],
+    [-0.009619057178497314, 0.004542529582977295, 0.15848305821418762, 0.1398983895778656, -0.1727069616317749, 0.009662538766860962, 0.14508605003356934, -0.06355825066566467, 0.2187616527080536, -0.06205904483795166, -0.17467916011810303, -0.15159446001052856, -0.11026895046234131, 0.0014290213584899902, -0.0222318172454834, -0.0901665985584259],
+    [-0.19467535614967346, 0.13933107256889343, 0.01475110650062561, 0.06523475050926208, -0.010251522064208984, 0.19934791326522827, -0.15263327956199646, -0.0020832419395446777, 0.2457883358001709, -0.013822227716445923, 0.021061748266220093, -0.1160159707069397, -0.13275521993637085, 0.046625494956970215, 0.05674457550048828, 0.19800987839698792],
+    [-0.15592962503433228, -0.2279529869556427, 0.16887113451957703, 0.23640495538711548, -0.21086034178733826, -0.009970247745513916, -0.02515140175819397, -0.07641297578811646, -0.24899587035179138, 0.037380099296569824, 0.02085617184638977, 0.1378481090068817, -0.022343188524246216, -0.21709102392196655, 0.19878742098808289, -0.08331739902496338],
+], dtype=jnp.float32)
+
+B2 = jnp.array([-0.16188499331474304, 0.02284577488899231, -0.1940387487411499, -0.15360009670257568, -0.030543535947799683, 0.21870774030685425, -0.22587144374847412, -0.01386520266532898, 0.08850681781768799, -0.0766032338142395, 0.0816902220249176, 0.0402965247631073, 0.011145144701004028, -0.16100746393203735, -0.08803930878639221, -0.01812576875090599], dtype=jnp.float32)
+
+W3 = jnp.array([[-0.1496814489364624], [0.13770869374275208], [-0.04906770586967468], [0.1996093988418579], [0.06822094321250916], [0.05445930361747742], [0.07109692692756653], [0.18540233373641968], [0.08508104085922241], [0.09746679663658142], [-0.23635584115982056], [-0.1930118203163147], [-0.14879906177520752], [0.21384695172309875], [0.19163542985916138], [0.20750340819358826]], dtype=jnp.float32)
+
+B3 = jnp.array([0.031951963901519775], dtype=jnp.float32)
+
+@jit
+def universal_plasticity(trace_v_pre, trace_v_post, trace_ca, reward):
+    """The exact 369-parameter MLP discovered by TPU evolution."""
+    x = jnp.array([trace_v_pre, trace_v_post, trace_ca, reward])
+    h1 = jnp.maximum(0.0, x @ W1 + B1)
+    h2 = jnp.maximum(0.0, h1 @ W2 + B2)
+    return (h2 @ W3 + B3)[0]
+
+# ==============================================================================
+# 2. FROZEN BIOPHYSICAL CONSTANTS (Discovered by TPU Phase 3 & 5)
+# ==============================================================================
+V_REST = -70.0
+V_THRESH = -56.5
+TAU_M = 22.0
+TAU_TRACE = 11.0       # Molecular eligibility trace decay (from docs/1.md)
+SENSORY_GAIN = 13.1159  # From TPU Phase 5
+MOTOR_DECAY_TAU = 3.7471
+GABA_VOLTAGE_DROP = -5.1202
+EXCITATORY_SCALE = 0.4809
+INHIBITORY_SCALE = 1.3955
+AMPA_VOLTAGE_JUMP = 5.0  # mV per fused vesicle (from brain_tree.hpp)
+
+# ==============================================================================
+# 3. HOLOGRAPHIC VSA ALGEBRA (TITAN ENCODING)
+# ==============================================================================
+
+@jit
+def titan_encode_512(coords):
+    """Maps continuous 4D space into a 512-bit Boolean mask (array of 16 x uint32)."""
+    x, y, z, w = coords[0], coords[1], coords[2], coords[3]
+    c = jnp.array([
+        1.0 - (x+y+z+w)*0.25,
+        x, y, z, w,
+        x*y, x*z, x*w, y*z, y*w, z*w,
+        x*y*z, x*y*w, x*z*w, y*z*w,
+        x*y*z*w
+    ], dtype=jnp.float32)
+    c = jnp.clip(c, 0.0, 1.0)
+    v_count = (c * 32.0).astype(jnp.uint32)
+    shift_amt = 32 - v_count
+    v_mask = jnp.right_shift(jnp.uint32(0xFFFFFFFF), shift_amt)
+    v_mask = jnp.where(v_count > 0, v_mask, jnp.uint32(0))
+    return v_mask
+
+@jit
+def hamming_distance(a, b):
+    xor_res = jnp.bitwise_xor(a, b)
+    xor_u8 = xor_res.view(jnp.uint8)
+    bits = jnp.unpackbits(xor_u8)
+    return jnp.sum(bits)
+
+@jit
+def match_token(consensus_u32, byte_keys):
+    xor_res = jnp.bitwise_xor(byte_keys, consensus_u32[None, :])
+    xor_u8 = xor_res.view(jnp.uint8)
+    bits = jnp.unpackbits(xor_u8, axis=1)
+    distances = jnp.sum(bits, axis=1)
+    return jnp.argmin(distances)
+
+# ==============================================================================
+# 4. NETWORK TOPOLOGY
+# ==============================================================================
+N_SENSORY = 512
+N_EXC_HIDDEN = 819
+N_INH_HIDDEN = 205
+N_MOTOR = 512
+NUM_NEURONS = N_SENSORY + N_EXC_HIDDEN + N_INH_HIDDEN + N_MOTOR  # 2048
+
+key = random.PRNGKey(42)
+key, k1, k2, k3 = random.split(key, 4)
+
+# 10% sparse connectivity (biologically realistic)
+base_topology = random.bernoulli(k1, 0.1, (NUM_NEURONS, NUM_NEURONS)).astype(jnp.float32)
+
+EXC_MASK = jnp.concatenate([jnp.ones(N_SENSORY+N_EXC_HIDDEN), jnp.zeros(N_INH_HIDDEN), jnp.ones(N_MOTOR)])
+INH_MASK = jnp.concatenate([jnp.zeros(N_SENSORY+N_EXC_HIDDEN), jnp.ones(N_INH_HIDDEN), jnp.zeros(N_MOTOR)])
+
+# Axonal delays per synapse (1ms to 15ms, from docs/1.md polychronization)
+axonal_delays = random.uniform(k2, (NUM_NEURONS,), minval=1.0, maxval=15.0)
+
+# Initialize ByteField Vocabulary Keys
+grid_coords = []
+for i in range(256):
+    fx = (i % 4) / 3.0
+    fy = ((i // 4) % 4) / 3.0
+    fz = ((i // 16) % 4) / 3.0
+    fw = ((i // 64) % 4) / 3.0
+    grid_coords.append([fx, fy, fz, fw])
+vocab_coords = jnp.array(grid_coords, dtype=jnp.float32)
+vocab_keys = vmap(titan_encode_512)(vocab_coords)
+
+# Motor Seeds for VSA decode
+motor_seeds_u32 = random.bits(k3, (N_MOTOR, 16), dtype=jnp.uint32)
+
+# ==============================================================================
+# 5. MULTI-TICK BIOLOGICAL SIMULATION WITH UNIVERSAL PLASTICITY
+# ==============================================================================
+TICKS_PER_TOKEN = 20  # 20ms per token window
+
+@jit
+def simulate_tick(tick_state, _):
+    """Single 1ms tick of the biological SNN."""
+    v, spikes, i_ext, W, trace_pre, trace_post, trace_ca, motor_ema = tick_state
+    
+    # 1. Voltage decay (Leaky Integrate)
+    v = V_REST + (v - V_REST) * jnp.exp(-1.0 / TAU_M)
+    
+    # 2. Synaptic transmission (Dale's Law)
+    exc_input = jnp.dot(spikes, W * EXC_MASK[:, None]) * AMPA_VOLTAGE_JUMP * EXCITATORY_SCALE
+    inh_input = jnp.dot(spikes, W * INH_MASK[:, None]) * GABA_VOLTAGE_DROP * INHIBITORY_SCALE
+    
+    v = v + i_ext + exc_input + inh_input
+    
+    # 3. Spike generation
+    new_spikes = jnp.where(v >= V_THRESH, 1.0, 0.0)
+    v = jnp.where(new_spikes > 0.5, V_REST - 5.0, v)
+    
+    # 4. Eligibility trace decay (tau = 11.0ms from TPU discovery)
+    trace_pre = trace_pre * jnp.exp(-1.0 / TAU_TRACE) + new_spikes
+    trace_post = trace_post * jnp.exp(-1.0 / TAU_TRACE) + new_spikes
+    trace_ca = trace_ca * jnp.exp(-1.0 / 5.3) + new_spikes * 10.0  # CALCIUM_INFLUX=10, CALCIUM_DECAY=5.3
+    
+    # 5. Motor EMA decode (MOTOR_DECAY_TAU = 3.7471ms)
+    motor_spikes = new_spikes[-N_MOTOR:]
+    avg_motor = jnp.mean(motor_spikes)
+    motor_ema = motor_ema * jnp.exp(-1.0 / MOTOR_DECAY_TAU) + avg_motor * (1.0 - jnp.exp(-1.0 / MOTOR_DECAY_TAU))
+    
+    return (v, new_spikes, i_ext, W, trace_pre, trace_post, trace_ca, motor_ema), new_spikes[-N_MOTOR:]
+
+@jit
+def process_token(state, token_idx):
+    """Full token processing: encode, simulate 20ms, decode, learn."""
+    v, spikes, W, binder_coord, trace_pre, trace_post, trace_ca, motor_ema = state
+    
+    # 1. Holographic Sensory Binding
+    target_coord = vocab_coords[token_idx]
+    binder_coord = 0.7 * binder_coord + 0.3 * target_coord
+    sensory_mask = titan_encode_512(binder_coord)
+    sensory_bits = jnp.unpackbits(sensory_mask.view(jnp.uint8)).astype(jnp.float32)
+    i_ext = jnp.concatenate([sensory_bits * SENSORY_GAIN, jnp.zeros(NUM_NEURONS - N_SENSORY)])
+    
+    # 2. Run 20 ticks of biological simulation
+    tick_init = (v, spikes, i_ext, W, trace_pre, trace_post, trace_ca, motor_ema)
+    tick_final, motor_spike_history = jax.lax.scan(simulate_tick, tick_init, jnp.arange(TICKS_PER_TOKEN))
+    v, spikes, _, W, trace_pre, trace_post, trace_ca, motor_ema = tick_final
+    
+    # 3. Motor Decode: sum spikes over 20ms window, then majority vote
+    motor_spike_sum = jnp.sum(motor_spike_history, axis=0)  # (512,)
+    threshold = jnp.float32(TICKS_PER_TOKEN) * 0.1
+    motor_active = jnp.where(motor_spike_sum > threshold, 1.0, 0.0)
+    
+    # Build consensus from motor seeds
+    seeds_u8 = motor_seeds_u32.view(jnp.uint8)
+    seed_bits = jnp.unpackbits(seeds_u8, axis=1).astype(jnp.float32)  # (512, 512)
+    weighted_bits = seed_bits * motor_active[:, None]
+    bit_counts = jnp.sum(weighted_bits, axis=0)
+    total_active = jnp.sum(motor_active) + 1e-6
+    consensus_bits = jnp.where(bit_counts > total_active / 2.0, jnp.uint8(1), jnp.uint8(0))
+    consensus_u32 = jnp.packbits(consensus_bits).view(jnp.uint32)
+    
+    pred_idx = match_token(consensus_u32, vocab_keys)
+    
+    # 4. Universal Plasticity Learning (the TPU-discovered MLP!)
+    # Compute reward: -1 if wrong, +1 if correct (dopamine signal)
+    target_mask = vocab_keys[token_idx]
+    error_dist = hamming_distance(consensus_u32, target_mask)
+    reward = jnp.where(error_dist < 64, 1.0, -1.0)  # Dopamine: correct = +1, wrong = -1
+    
+    # Apply the Universal Plasticity Law to ALL synapses
+    # delta_w = MLP(trace_v_pre, trace_v_post, trace_Ca, reward)
+    # We vectorize across all pre-post neuron pairs using outer products
+    dw = vmap(lambda tp, tpo: vmap(lambda tc: universal_plasticity(tp, tpo, tc, reward))(trace_ca))(trace_pre, trace_post)
+    
+    # Apply only to existing connections (sparse topology), respecting Dale's Law
+    W = W + dw * base_topology * EXC_MASK[:, None] * 0.1
+    W = jnp.clip(W, 0.0, 5.0)
+    
+    return (v, spikes, W, binder_coord, trace_pre, trace_post, trace_ca, motor_ema), (pred_idx, error_dist)
+
+# ==============================================================================
+# 6. TRAINING LOOP
+# ==============================================================================
+def run_nlp_training(text_sequence):
+    tokens = jnp.array([ord(c) for c in text_sequence], dtype=jnp.uint32)
+    
+    # Initialize weights with diversity (break symmetry)
+    rand_w = random.uniform(key, (NUM_NEURONS, NUM_NEURONS), minval=0.05, maxval=0.5)
+    W = base_topology * rand_w
+    
+    initial_state = (
+        jnp.full((NUM_NEURONS,), V_REST),       # Voltage
+        jnp.zeros((NUM_NEURONS,)),               # Spikes
+        W,                                        # Synaptic weights
+        jnp.array([0.5, 0.5, 0.5, 0.5]),         # Binder coordinate
+        jnp.zeros((NUM_NEURONS,)),               # trace_pre
+        jnp.zeros((NUM_NEURONS,)),               # trace_post
+        jnp.zeros((NUM_NEURONS,)),               # trace_ca
+        0.0,                                      # motor_ema
+    )
+    
+    print(f"Training on {len(text_sequence)} tokens | {TICKS_PER_TOKEN} ticks/token | Universal Plasticity active")
+    start_time = time.time()
+    
+    state = initial_state
+    for epoch in range(1, 51):
+        state, (predictions, errors) = jax.lax.scan(process_token, state, tokens)
+        if epoch % 5 == 0 or epoch == 1:
+            pred_chars = "".join([chr(int(c)) if 32 <= int(c) < 127 else '?' for c in predictions])
+            avg_err = float(jnp.mean(errors))
+            print(f"Epoch {epoch:03d} | Avg Hamming: {avg_err:6.1f}/512 | Output: {pred_chars}")
+    
+    end_time = time.time()
+    print(f"\nCompleted in {end_time - start_time:.2f}s")
+    print(f"Target: {text_sequence}")
+
+if __name__ == "__main__":
+    test_text = "HELLO WORLD, THIS IS THE RRA ENGINE SPEAKING FROM THE TPU."
+    run_nlp_training(test_text)
