@@ -6,6 +6,8 @@
 #include <unordered_map>
 #include <cstdint>
 #include <random>
+#include <string>
+#include <torch/torch.h>
 #include "language_io.hpp"
 
 namespace rra::nn::topology {
@@ -16,7 +18,7 @@ enum class NeuronType {
 };
 
 // ---------------------------------------------------------
-// Frozen Constants
+// Frozen Constants for Embodiment Engine
 // ---------------------------------------------------------
 constexpr float V_REST = -70.0f;
 constexpr float V_THRESH = -56.5f;
@@ -35,7 +37,6 @@ constexpr float SENSORY_GAIN = 13.1159f;
 constexpr float MOTOR_DECAY_TAU = 3.7471f;
 
 struct UniversalPlasticity {
-    // 369 Parameters Discovered by TPU
     static const float w1[4][16];
     static const float b1[16];
     static const float w2[16][16];
@@ -43,17 +44,21 @@ struct UniversalPlasticity {
     static const float w3[16][1];
     static const float b3[1];
 
-    static float relu(float x);
-    static float evaluate_delta_w(float v_pre, float v_post, float ca_pre, float reward);
+    static torch::Tensor w1_t;
+    static torch::Tensor b1_t;
+    static torch::Tensor w2_t;
+    static torch::Tensor b2_t;
+    static torch::Tensor w3_t;
+    static torch::Tensor b3_t;
+    static bool tensors_initialized;
+
+    static void init_tensors();
+    static torch::Tensor evaluate_delta_w_batch(const torch::Tensor& inputs);
 };
 
-// Forward Declaration
 class CorticalTissue;
 class EventDrivenNeuron;
 
-// ---------------------------------------------------------
-// Core Topology Structures
-// ---------------------------------------------------------
 struct SpikeEvent {
     float arrival_time;
     uint64_t target_neuron_id;
@@ -68,24 +73,19 @@ struct SpikeEvent {
 class EventDrivenSynapse {
 public:
     static constexpr float CALCIUM_INFLUX = 10.0f;
-    static constexpr float CALCIUM_DECAY = 5.3f; // ms
+    static constexpr float CALCIUM_DECAY = 5.3f;
     static constexpr float FUSION_RATE = 0.0001f;
-    static constexpr float VESICLE_REFILL_RATE = 0.005f; // ms
-    static constexpr float AMPA_VOLTAGE_JUMP = 5.0f; // mV per fused vesicle
+    static constexpr float VESICLE_REFILL_RATE = 0.005f;
+    static constexpr float AMPA_VOLTAGE_JUMP = 5.0f;
 
     uint64_t post_synaptic_id;
     EventDrivenNeuron* parent_neuron;
     
-    // Physical state
     float last_update_time;
     float pre_calcium_concentration;
     float vesicle_pool;
     float ampa_receptor_count;
-    
-    // Spatio-Temporal Routing
-    float axonal_delay; // Learned delay in ms
-    
-    // Eligibility Traces (Molecular Memory)
+    float axonal_delay;
     float trace_v_pre;
     float trace_ca;
 
@@ -98,13 +98,11 @@ public:
 class EventDrivenNeuron {
 public:
     uint64_t morton_code;
-    uint64_t morton_seed[8]; // 512-bit VSA Identity
+    uint64_t morton_seed[8];
     NeuronType type;
     float V_m;
     float last_update_time;
     int total_spikes;
-    
-    // Post-synaptic Eligibility Trace
     float trace_v_post;
     float last_spike_time;
 
@@ -127,28 +125,71 @@ public:
 
     void add_neuron(uint64_t morton_code, NeuronType type = NeuronType::EXCITATORY);
     void connect_neurons(uint64_t pre_id, uint64_t post_id, float delay = 2.0f);
-
-    // Forces a neuron to spike (e.g. from sensory input)
     void force_spike(uint64_t id, float time, float quanta = 100.0f);
-    
-    // Run engine up to a specific time
     void run_until(float target_time_ms);
-    
-    // The Global Dopamine Engine (Credit Assignment)
     void inject_dopamine(float reward, float time);
-
-    // Neuron accessor used by synapses during dopamine waves
     EventDrivenNeuron* get_neuron(uint64_t id);
-
-    // Weight serialization for evolutionary inheritance
     std::vector<float> get_weights() const;
     void set_weights(const std::vector<float>& w);
-
     float get_neuron_voltage(uint64_t id) const;
     int get_neuron_spikes(uint64_t id) const;
     int get_total_network_spikes() const;
-    
     float get_global_time() const { return global_time_; }
+};
+
+// =============================================================================
+// LIBTORCH-POWERED NLP RESERVOIR ENGINE
+// =============================================================================
+
+constexpr int N_S = 32;
+constexpr int N_EXC = 48;
+constexpr int N_INH = 16;
+constexpr int N_M = 32;
+constexpr int N = 128;
+constexpr int TICKS = 30;
+
+struct ReservoirGenome {
+    float sensory_gain = 5.10f;
+    float binder_alpha = 0.98f;
+    float weight_scale = 0.40f;
+    float ampa_jump = 0.32f;
+    float gaba_drop = 11.54f;
+    float lr_scale = 0.31f; 
+    float thresh_offset = 0.0f;
+    float tau_m = 32.66f;
+};
+
+class ReservoirEngine : public torch::nn::Module {
+public:
+    ReservoirEngine(const ReservoirGenome& genome = ReservoirGenome(), uint32_t seed = 42);
+
+    // High-Level Training & Prediction via Autograd
+    void train_sequence(const std::string& text, float learning_rate = 0.1f);
+    std::string predict_sequence(const std::string& text);
+    char process_token(char token);
+    void reset_state();
+
+    // Serialization using LibTorch format
+    void save_checkpoint(const std::string& filepath);
+    void load_checkpoint(const std::string& filepath);
+
+private:
+    ReservoirGenome genome_;
+    
+    // LibTorch Tensors
+    torch::Tensor W_frozen;
+    torch::Tensor sign;
+    torch::Tensor v;
+    torch::Tensor bd;
+    torch::Tensor grid;
+    
+    // Trainable parameters
+    torch::Tensor R;
+    torch::Tensor R_bias;
+    
+    void init_grid();
+    void init_topology(uint32_t seed);
+    torch::Tensor step(const torch::Tensor& target_co);
 };
 
 } // namespace rra::nn::topology
